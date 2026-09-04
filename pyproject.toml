@@ -1,0 +1,81 @@
+[project]
+name = "vidaio-next"
+version = "0.5.3"
+description = "VidAIO SN85 honest rework — verified media transformation subnet"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.7",
+    "PyYAML>=6.0",
+    "prometheus-client>=0.20",
+    "fastapi>=0.111",
+    "uvicorn>=0.30",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+# The REAL bittensor chain adapter (vidaio/chain/bittensor_adapter.py). NOT a base
+# dependency on purpose: the ~150 MB SDK tree stays out of the base/test env so the
+# full suite runs chainless, and only a deployment that runs mode: bittensor
+# installs it.  Install with:  uv pip install -e '.[chain]'
+# The two libraries are CO-PINNED (the scalecodec/cyscale split makes them break on
+# import if their versions drift).
+chain = [
+    "bittensor==10.5.0",
+    "async-substrate-interface==2.2.1",
+    "bittensor-drand==2.0.0",
+    "bittensor-wallet==4.1.1",
+]
+# The S3 object-store backend (vidaio/audit/store.py::S3Store). NOT a base
+# dependency on purpose: the whole test suite runs storage-less — S3Store's logic
+# (content-addressed keying, verify-on-read, the _FINALIZED set convention) is
+# unit-tested against a FAKE in-memory transport, and only a deployment that runs
+# backend: s3 installs boto3. Install with:  uv pip install -e '.[storage]'
+storage = [
+    "boto3>=1.34",
+    "cryptography>=44.0.0",
+]
+# Real PieAPP scoring and CPU-only auditor recomputation. Keep this optional so
+# chainless/unit-test installs stay small. The image must also pre-cache the
+# PIQ PieAPP weights; runtime downloading is not a release deployment plan.
+# Install CPU auditors with PyTorch's CPU wheel index.
+media = [
+    "torch==2.8.0",
+    "torchvision==0.23.0",
+    "piq==0.8.0",
+    "opencv-python-headless==4.12.0.88",
+]
+# Create-only Modal Sandbox runtime used by the production competition
+# orchestrator. Keep this out of the dependency-light local/unit-test install,
+# but pin it exactly: the release probe verifies every SDK surface the adapter
+# invokes before an image can ship.
+modal = [
+    "modal==1.5.4",
+]
+
+# Never let Linux media/auditor installs resolve PyPI's CUDA-bearing PyTorch
+# dependency graph.  uv takes torch and torchvision exclusively from PyTorch's
+# official CPU wheel index; every other package remains on the default index.
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["vidaio"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "--import-mode=importlib"

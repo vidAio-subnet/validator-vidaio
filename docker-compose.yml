@@ -1,0 +1,25 @@
+# VidAIO — miner quickstart compose. This file runs ONE service: the reference
+# miner, built from this tree. Validator and auditor roles run from the canonical
+# release image instead (see the README): audit identity binds the canonical
+# runtime, so start those roles with `docker run` against the pinned image digest
+# rather than a local build.
+#
+# Configuration comes from `.env` — copy .env.example and replace every value.
+
+services:
+  miner:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "scripts/service_entrypoint.py", "reference-miner"]
+    env_file: .env
+    # Exit 0 (deliberate stop / SIGTERM) => stay down; non-zero (fail_fatal /
+    # crash) => restart. Mirrors the exit-code contract (vidaio/services/base.py).
+    restart: on-failure
+    init: true
+    ports:
+      # Artifact ingress. Bound to localhost: put your TLS edge in front of it —
+      # validators require HTTPS at the exact advertised public IP/port.
+      - "127.0.0.1:8300:8300"
+      # Health + Prometheus metrics.
+      - "127.0.0.1:9106:9106"

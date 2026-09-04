@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.installed.cfg
+
+# Virtualenv
+.venv/
+venv/
+env/
+
+# Test / lint caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+/runtime-release-manifest.json
+
+# Local runtime state (SQLite DBs, run artifacts, media work dirs, logs)
+data/
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# Media / recompute scratch
+*.mp4
+*.y4m
+*.yuv
+
+# Environment-specific (never commit; may hold secrets)
+.env
+.env.*
+!.env.example
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

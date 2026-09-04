@@ -1,0 +1,21 @@
+# Keep the build context tiny and the image lean + cacheable.
+.venv/
+data/
+**/__pycache__/
+**/*.pyc
+.git/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+node_modules/
+*.log
+runtime-release-manifest.json
+# Never send operator secrets to the manifest-builder context/layer. The public
+# template is a source-identity input and remains included intentionally.
+.env
+.env.*
+*.env
+!.env.example
+!examples/competition_contenders/profiles/*.env
+# The stack's own runtime state lives on a bind-mounted volume, never in the image.
+data/compose-stack/

@@ -72,6 +72,57 @@ def _service(raw, store) -> BaselineRegistryService:
     return BaselineRegistryService(raw, metrics_port=0, store=store, now=lambda: NOW)
 
 
+@pytest.mark.parametrize("network,netuid", [("finney", 85), ("finney", 1), ("test", 548)])
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("legacy_exception", [False, True])
+@pytest.mark.parametrize("mainnet_exception", [False, True])
+def test_network_exception_policy_matrix(
+    network, netuid, enabled, legacy_exception, mainnet_exception,
+) -> None:
+    from vidaio.registry.config import production_registry_network_problems
+
+    config = RegistryConfig(
+        automatic_promotion_enabled=enabled,
+        allow_disabled_automatic_promotion_for_testnet=legacy_exception,
+        allow_disabled_automatic_promotion_for_mainnet=mainnet_exception,
+    )
+    problems = production_registry_network_problems(config, network=network, netuid=netuid)
+    if mainnet_exception:
+        permitted = network == "finney" and netuid == 85 and not enabled and legacy_exception
+    else:
+        permitted = not legacy_exception or network == "test"
+    assert bool(problems) is not permitted
+
+
+def test_mainnet_genesis_exception_serves_v0_without_watcher_and_restarts(tmp_path) -> None:
+    raw, store = _configured_world(tmp_path)
+    raw["chain"] = {"mode": "bittensor", "network": "finney", "netuid": 85}
+    raw["registry"]["allow_disabled_automatic_promotion_for_mainnet"] = True
+    assert production_registry_problems(RegistryConfig(**raw["registry"])) == []
+    for attempt in range(2):
+        service = _service(raw, store)
+        try:
+            state = service.public_state()
+            assert state["automatic_promotion"] == {
+                "enabled": False,
+                "adapter_wired": False,
+                "testnet_exception": True,
+                "status": "disabled_testnet_exception",
+            }
+            assert service._watcher is None
+        finally:
+            service.close()
+
+
+@pytest.mark.parametrize("network,netuid", [("finney", 1), ("test", 548)])
+def test_direct_service_rejects_mainnet_exception_on_other_subnets(tmp_path, network, netuid):
+    raw, store = _configured_world(tmp_path)
+    raw["chain"] = {"network": network, "netuid": netuid}
+    raw["registry"]["allow_disabled_automatic_promotion_for_mainnet"] = True
+    with pytest.raises(RegistryStartupError, match="requires finney SN85"):
+        _service(raw, store)
+
+
 def test_startup_migrates_persistent_db_and_seeds_exact_v0_pair(tmp_path) -> None:
     raw, store = _configured_world(tmp_path)
     service = _service(raw, store)

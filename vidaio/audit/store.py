@@ -1005,6 +1005,20 @@ class _TransportBackedStore(_SetConventionMixin):
                 with tempfile.TemporaryDirectory(prefix="vidaio-seal-") as tmp:
                     sealed = Path(tmp) / "holdout.aesgcm"
                     _seal_file(self._envelope, source, sealed)
+                    # Round-trip before upload: a sealed holdout that cannot be
+                    # opened is only discovered at release time otherwise, and
+                    # by then it HOLDS epoch finalization (2026-09-04 incident:
+                    # a corrupted 255MB sealed upload wedged the finalizer).
+                    verify = Path(tmp) / "holdout.verify"
+                    _unseal_file(self._envelope, sealed, verify)
+                    verify_digest, verify_size = _hash_file(verify)
+                    verify.unlink()
+                    if verify_digest != digest or verify_size != size:
+                        raise IntegrityError(
+                            f"sealed artifact {kind.value}/{digest} failed its "
+                            "pre-upload round-trip: unsealed bytes do not match "
+                            "the source"
+                        )
                     try:
                         self._t.put_file(key, sealed)
                     except WriteOnceConflictError:
@@ -1448,11 +1462,21 @@ class _RealS3Transport:
         return f"{self._prefix}/{key}" if self._prefix else key
 
     def put_bytes(self, key: str, payload: bytes) -> None:
+        import base64
+        import hashlib as _hashlib
+
         try:
             self._client.put_object(
                 Bucket=self._bucket,
                 Key=self._full(key),
                 Body=payload,
+                # The server verifies the received body against this digest and
+                # refuses to commit a corrupted transfer (BadDigest) — without
+                # it, a bit-flipped sealed object is only discovered when its
+                # release attempt HOLDS epoch finalization.
+                ContentMD5=base64.b64encode(
+                    _hashlib.md5(payload, usedforsecurity=False).digest()
+                ).decode(),
                 IfNoneMatch="*",
             )
         except Exception as exc:  # noqa: BLE001 - optional SDK error type
@@ -1466,6 +1490,13 @@ class _RealS3Transport:
         # ``upload_file`` does not expose PutObject's conditional-create contract
         # consistently across boto3 releases/providers, so use PutObject directly.
         # botocore streams this file object without loading it into memory.
+        import base64
+        import hashlib as _hashlib
+
+        md5 = _hashlib.md5(usedforsecurity=False)
+        with path.open("rb") as source:
+            while chunk := source.read(_CHUNK):
+                md5.update(chunk)
         with path.open("rb") as source:
             try:
                 self._client.put_object(
@@ -1473,6 +1504,8 @@ class _RealS3Transport:
                     Key=self._full(key),
                     Body=source,
                     ContentLength=path.stat().st_size,
+                    # Server-side transfer verification — see put_bytes.
+                    ContentMD5=base64.b64encode(md5.digest()).decode(),
                     IfNoneMatch="*",
                 )
             except Exception as exc:  # noqa: BLE001 - optional SDK error type

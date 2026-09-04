@@ -974,3 +974,30 @@ def test_s3_transport_not_configured_without_deps_or_bucket() -> None:
     store = S3Store(AuditConfig(backend="s3", allow_plaintext_holdout=True))
     with pytest.raises(NotConfiguredError):
         store.put(b"data", ArtifactKind.EPOCH_LOG)
+
+
+def test_put_file_sealed_pre_upload_round_trip_guard(tmp_path: Path) -> None:
+    """A sealed holdout that cannot be opened must never reach storage.
+
+    Regression for the 2026-09-04 incident: a corrupted sealed upload was only
+    discovered when its release attempt held epoch finalization. put_file now
+    round-trips the sealed file locally before uploading.
+    """
+
+    class CorruptingSealEnvelope(XorEnvelope):
+        def seal(self, data: bytes) -> bytes:
+            sealed = bytearray(super().seal(data))
+            sealed[len(sealed) // 2] ^= 0x01  # a single flipped bit
+            return bytes(sealed)
+
+    transport = FakeObjectTransport()
+    store = S3Store(
+        AuditConfig(backend="s3"),
+        envelope=CorruptingSealEnvelope(),
+        transport=transport,
+    )
+    source = tmp_path / "pristine.mkv"
+    source.write_bytes(b"pristine reference bytes" * 1024)
+    with pytest.raises(IntegrityError):
+        store.put_file(source, ArtifactKind.REFERENCE_ORIGINAL)
+    assert not transport.objects  # the corrupt seal was never uploaded

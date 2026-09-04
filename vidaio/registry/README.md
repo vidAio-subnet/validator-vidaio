@@ -65,6 +65,27 @@ compared with its configured SHA-256 identity.
 
 ## Version-zero provisioning
 
+### Explicit SN85 genesis exception
+
+Automatic promotion remains required by default in production. A mainnet operator
+may explicitly authorize version-zero-only serving on `chain.network=finney`,
+`chain.netuid=85` using all three settings:
+
+```env
+VIDAIO__REGISTRY__AUTOMATIC_PROMOTION_ENABLED=false
+VIDAIO__REGISTRY__ALLOW_DISABLED_AUTOMATIC_PROMOTION_FOR_TESTNET=true
+VIDAIO__REGISTRY__ALLOW_DISABLED_AUTOMATIC_PROMOTION_FOR_MAINNET=true
+```
+
+The additional mainnet flag defaults to false. The legacy exception alone still
+fails on mainnet; the mainnet flag fails on any other network/subnet or with
+enabled promotion. Both full and role-specific preflight enforce this policy.
+The service boots without constructing or injecting a watcher and reports
+`disabled_testnet_exception` for compatibility, not active promotion readiness.
+Archive verification, baseline invariants, authentication, scoring and reward
+window checks are unchanged. Install and verify the real promotion adapters
+before the first CROWN promotion; never inject a placeholder watcher.
+
 Version zero is not synthesized by the service. Before first startup, provision
 one non-empty `submission_archive` and one non-empty provenance `manifest` for
 each track in the configured audit store. Record the following exact values in

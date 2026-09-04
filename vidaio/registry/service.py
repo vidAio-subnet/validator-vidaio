@@ -38,7 +38,7 @@ from vidaio.registry.baseline import (
     pending_promotion,
     seed_genesis_baselines,
 )
-from vidaio.registry.config import RegistryConfig
+from vidaio.registry.config import RegistryConfig, production_registry_network_problems
 from vidaio.registry.registry import migrate
 from vidaio.services.base import BaseService
 
@@ -197,12 +197,24 @@ class BaselineRegistryService(BaseService):
             )
         if (
             cfg.automatic_promotion_enabled
-            and cfg.allow_disabled_automatic_promotion_for_testnet
+            and (
+                cfg.allow_disabled_automatic_promotion_for_testnet
+                or cfg.allow_disabled_automatic_promotion_for_mainnet
+            )
         ):
             raise RegistryStartupError(
                 "the disabled-automatic-promotion testnet exception cannot be set "
                 "when automatic promotion is enabled"
             )
+        if cfg.allow_disabled_automatic_promotion_for_mainnet:
+            from vidaio.chain.factory import ChainConfig
+
+            chain_cfg = section(raw_config, "chain", ChainConfig)
+            problems = production_registry_network_problems(
+                cfg, network=chain_cfg.network, netuid=chain_cfg.netuid
+            )
+            if problems:
+                raise RegistryStartupError("; ".join(problems))
         self._store = store or make_store(section(raw_config, "audit", AuditConfig))
         self._http_api_ok = True
         self._archives_ok = False

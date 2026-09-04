@@ -121,6 +121,7 @@ class RegistryConfig(BaseModel):
     metrics_port: int = Field(REGISTRY_METRICS_PORT, ge=1, le=65535)
     automatic_promotion_enabled: bool = False
     allow_disabled_automatic_promotion_for_testnet: bool = False
+    allow_disabled_automatic_promotion_for_mainnet: bool = False
     genesis_baselines: dict[str, GenesisBaselineConfig] = Field(default_factory=dict)
 
     def genesis_problems(self) -> list[str]:
@@ -158,7 +159,10 @@ def production_registry_problems(config: RegistryConfig) -> list[str]:
         problems.append(f"registry.metrics_port must be {REGISTRY_METRICS_PORT}")
     if (
         config.automatic_promotion_enabled
-        and config.allow_disabled_automatic_promotion_for_testnet
+        and (
+            config.allow_disabled_automatic_promotion_for_testnet
+            or config.allow_disabled_automatic_promotion_for_mainnet
+        )
     ):
         problems.append(
             "registry.allow_disabled_automatic_promotion_for_testnet must be false "
@@ -177,10 +181,36 @@ def production_registry_problems(config: RegistryConfig) -> list[str]:
     return problems
 
 
+def production_registry_network_problems(
+    config: RegistryConfig, *, network: str, netuid: int
+) -> list[str]:
+    """Require separate operator authorization for the SN85 genesis exception."""
+    if config.allow_disabled_automatic_promotion_for_mainnet:
+        if (
+            network != "finney"
+            or netuid != 85
+            or config.automatic_promotion_enabled
+            or not config.allow_disabled_automatic_promotion_for_testnet
+        ):
+            return [
+                "registry.allow_disabled_automatic_promotion_for_mainnet requires "
+                "finney SN85, disabled promotion and the explicit legacy exception"
+            ]
+        return []
+    if config.allow_disabled_automatic_promotion_for_testnet and network != "test":
+        return [
+            "registry.allow_disabled_automatic_promotion_for_testnet is permitted "
+            "only when chain.network is explicitly 'test' unless the SN85 "
+            "mainnet genesis exception is separately authorized"
+        ]
+    return []
+
+
 __all__ = [
     "REGISTRY_HTTP_PORT",
     "REGISTRY_METRICS_PORT",
     "GenesisBaselineConfig",
     "RegistryConfig",
     "production_registry_problems",
+    "production_registry_network_problems",
 ]

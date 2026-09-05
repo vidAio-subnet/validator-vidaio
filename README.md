@@ -1,140 +1,128 @@
 # validator-vidaio
 
-Validation code for the **VidAIO subnet** (Bittensor **SN85**). A VidAIO
-validator is deliberately **thin and verifying**: it mirrors the finalized
-epoch log, re-verifies it against the on-chain anchor, and submits the
-authenticated weight vector — while the auditors it runs alongside re-compute
-the scoring on CPU from published, keyless evidence. Everything the validator
-trusts, this repository lets you re-derive.
+Thin-validator runtime and public verification source for **VidAIO, Bittensor
+SN85 (finney)**. The validator fetches the authenticated epoch pointer, verifies
+`sha256(epoch bytes) == pointer digest == on-chain anchor`, and submits the exact
+authenticated `weight_u16` vector under its own registered validator hotkey.
 
-> **Release mirror.** Each VidAIO release lands here as one snapshot commit.
-> Deep documentation: [docs/VALIDATING.md](docs/VALIDATING.md) (operations and
-> failure modes), [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+> **Release mirror.** Each release is exported as a snapshot. See
+> [docs/VALIDATING.md](docs/VALIDATING.md) for protocol details and
+> [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the verification model.
 
----
+## 1. Packaged roles
 
-## 1. What a validator runs
+The public image **ghcr.io/vidaio-subnet/validator-vidaio** is built from this
+repository's Dockerfile. It runs `thin-validator-node` (alias `weight-setter`).
+It does not contain the private operational scripts or product services.
 
-Three cooperating roles (one box is fine to start):
-
-| Role | What it does |
-|---|---|
-| **thin-validator** (weight-setter) | mirrors the epoch pointer → verifies `sha256(bytes) == pointer digest == on-chain anchor` → submits the authenticated `weight_u16` vector under your hotkey |
-| **beacon-auditor** | walks every finalized epoch contiguously, re-computes scores from published evidence, submits signed CLEAN/DISPUTED verdicts |
-| **own-auditor** | audits your own vector path end-to-end before you follow it |
-
-The three-way digest verification is mandatory; a validator here never
-"trusts an API" — it trusts bytes it re-hashed against the chain.
+Auditor/scorer implementation is included for inspection, but **auditor launchers
+are not packaged in this release**. This image has its own runtime/source digest;
+it is not qualified to recompute the authority's scoring identity. A thin
+validator verifies signed, anchored bytes; that is not an independent scoring
+audit verdict. Do not launch an auditor using this quickstart.
 
 ## 2. Requirements
 
-- Linux x86-64, Python 3.12+, Docker recommended; a few CPU cores (all
-  auditing is CPU-only by design) and ~50 GB disk for mirrored evidence.
-- A Bittensor wallet with a **validator permit** on netuid 85 (enough stake to
-  hold one) — `btcli` to create/register it (fresh hotkey; coldkey offline).
-- An archive-capable chain endpoint for preflight and anchor reads.
+- Linux x86-64, Docker, a few CPU cores and persistent local disk.
+- Your registered SN85 hotkey with a validator permit and transaction fees.
+  Keep coldkeys offline. Never run two weight setters for the same hotkey.
+- An archive-capable WSS chain endpoint and an NTP-synchronized clock.
+- Per-validator S3 publication credentials supplied through subnet operations:
+  read public evidence and write only `manifest/` and `weight_vector/`, with
+  sealed prefixes explicitly denied. The live probe verifies a public round trip;
+  operators must also enforce the IAM policy. No holdout decryption key is needed
+  or permitted. The mainnet bucket is not anonymously writable.
 
-## 3. Set up
+## 3. Thin-validator quickstart
+
+Pin the **public image digest from this repository's GitHub Release notes**.
+Do not use the private monorepo image or a floating tag.
 
 ```sh
-pip install -e .
-
-# every field documented in the per-section config models (vidaio/*/config.py)
-export VIDAIO__CHAIN__NETWORK=finney         # or 'test' first
-export VIDAIO__CHAIN__NETUID=85
-export VIDAIO__CHAIN__VALIDATOR_HOTKEY=<your validator ss58>
-export VIDAIO__WEIGHTSETTER__VALIDATOR_HOTKEY=<the same ss58>
-export VIDAIO__WEIGHTSETTER__AUTHORITY_URL=<the authority pointer API>
-export VIDAIO_HOTKEY_SEED=<hotkey seed — file/secret store, never argv>
+IMAGE=ghcr.io/vidaio-subnet/validator-vidaio@sha256:<release-digest>
+docker pull "$IMAGE"
+cp deploy/public/thin-validator.env.example .env.thin-validator
+chmod 600 .env.thin-validator
 ```
 
-**Run preflight before first start** — it fails closed on every
-misconfiguration that matters (floor rule, anchor capacity, archive depth,
-storage semantics). Preflight (and, in this build generation, the validator
-runners themselves) run from the **canonical release image**,
-`ghcr.io/vidaio-subnet/vidaio-next`, always pinned by `@sha256` digest — audit
-identity binds the canonical runtime, so this is also the posture that lets
-your verdicts count. Each release's exact digest is published in the GitHub
-Release notes of this repository and must match what the fleet advertises;
-never run a floating tag:
+Edit every `REPLACE_*` value in that role file. Both validator-hotkey fields must
+be your own ss58. Keep the authority anchor hotkey as supplied; it is not your
+wallet. Set your wallet name/hotkey, and stage only its hotkey JSON and public
+wallet metadata beneath a dedicated absolute `HOTKEY_ROOT`. Do not mount your
+entire local wallet directory if it contains coldkeys. Give container UID10001
+read access to the staged hotkey, not broad filesystem permissions.
+
+Create a dedicated absolute `STATE_ROOT` owned by UID/GID10001. Never change
+permissions on a home directory, `.ssh` or `authorized_keys`. Keep both paths
+consistent across recreations. The state directory includes SQLite journals and
+the commitment writer lock; all writers using this hotkey must share that lock.
 
 ```sh
-IMAGE=ghcr.io/vidaio-subnet/vidaio-next@sha256:<digest from the release notes>
+docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges \
+  --tmpfs /tmp:rw,nosuid,nodev,size=1g --env-file .env.thin-validator "$IMAGE" \
+  python scripts/production_preflight.py --print-floor
+```
 
-docker run --rm --env-file <your role env> "$IMAGE" \
+Set `VIDAIO__LOCAL_STACK__AUDITOR_CURSOR_FLOOR` to the returned
+`auditor_cursor_floor`, exactly latest closed runtime epoch+1 on first deployment.
+Then run the same image's full preflight:
+
+```sh
+docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges \
+  --tmpfs /tmp:rw,nosuid,nodev,size=1g --env-file .env.thin-validator \
+  -v "$HOTKEY_ROOT:/wallets:ro" -v "$STATE_ROOT:/var/lib/vidaio/state" "$IMAGE" \
   python scripts/production_preflight.py --config config/default.yaml --live
 ```
 
-One rule preflight enforces that deserves calling out: on a fresh start your
-`auditor_cursor_floor` must be **exactly the latest closed runtime epoch + 1**
-— preflight prints the exact value to configure.
+Require `MAINNET_THIN_VALIDATOR_PREFLIGHT_PASS`. The check verifies runtime
+dependencies/manifest, finalized registration+permit, 7200-block archive access,
+local hotkey signature, commitment capacity, fresh floor, authenticated pointer /
+public bytes / independent anchor agreement, and a tiny public S3 publication
+round trip. **It submits no chain transaction.** Its immutable probe object stays
+in the publication prefix. A racing epoch close returns HOLD: refresh the floor
+and retry, never disable anchor verification.
 
-Then:
+Only after a passing preflight and after stopping any old setter for this hotkey:
 
 ```sh
-docker run -d --env-file <role env> "$IMAGE" \
-  python scripts/service_entrypoint.py thin-validator-node   # + auditor, own-auditor
+docker run -d --name vidaio-thin-validator --restart on-failure --init \
+  --read-only --cap-drop ALL --security-opt no-new-privileges \
+  --tmpfs /tmp:rw,nosuid,nodev,size=1g --env-file .env.thin-validator \
+  -v "$HOTKEY_ROOT:/wallets:ro" -v "$STATE_ROOT:/var/lib/vidaio/state" \
+  -p 127.0.0.1:9102:9102 "$IMAGE" \
+  python scripts/service_entrypoint.py thin-validator-node
 ```
 
-(The source tree here is the full audit surface — read, diff, and verify it;
-running the roles straight from source is on the roadmap as the runners are
-extracted from the development tree's orchestration module.)
+The first-start floor is a preflight check, not a setting to advance on every
+restart. Preserve the same durable state when restarting or upgrading.
 
-## 4. Authentication (registered-hotkey auth)
+## 4. Authentication and monitoring
 
-Validator-facing APIs verify you are a **registered hotkey with a validator
-permit** — signed with the wallet you already hold, no extra secret:
+Pointer requests are signed with your registered validator hotkey; no shared
+authority bearer is required. Keep `verify_anchor=true` and `provider=shared`.
+Follow the service logs, localhost9102 `/healthz` and `/metrics`, and the actual
+on-chain weight vector. A healthy process alone does not prove a submitted vector.
 
-- **Signed requests**: `X-Vidaio-Hotkey/-Timestamp/-Nonce/-Signature` headers
-  (`vidaio.services.hotkey_auth.sign_request_headers` builds them).
-- **Session tokens** for polling: `POST /auth/challenge` → sign the nonce →
-  short-lived bearer token. Deregistration revokes within ~45 s.
+## 5. Troubleshooting
 
-Keep the box NTP-synced: the signed-request window is ±120 s.
-
-## 5. What to monitor (and what each state means)
-
-- **Weight submissions land**: your hotkey's on-chain vector updates each
-  tempo, matching the authority vector (`docs/VALIDATING.md` convergence
-  attempt).
-- **Auditor cursor advances** one epoch at a time. A cursor that STOPS is
-  meaningful, never cosmetic:
-  - `HOLD` — something is temporarily unverifiable (unanchored yet,
-    unreadable store). It retries; investigate if it persists.
-  - `REFUSE` — bytes disagree with the on-chain anchor: tampering alarm.
-    This should page a human.
-  - **Outage gap** (schema v16): the authority declares epochs it could
-    never anchor after downtime; your auditor verifies the declaration
-    against the anchor and advances. A silent gap (404 with NO anchored
-    declaration) holds forever — that distinction is the security property.
-- Health endpoints: every role serves `/healthz` + Prometheus metrics.
-
-## 6. Troubleshooting
-
-| Symptom | Likely cause → fix |
+| Symptom | Action |
 |---|---|
-| Preflight refuses the cursor floor | You copied a stale floor: set exactly `latest_closed + 1` (the error names it) and rerun |
-| `commit-reveal`/submit never confirms | Check the netuid's commit-reveal posture; the adapter reports CR state at submit — see logs |
-| Auditor HOLDs on one epoch for hours | Store/anchor genuinely unavailable, or the authority is withholding — check `/epoch/<id>` and the object store; a verified outage-gap declaration advances on its own |
-| `403 hotkey_no_validator_permit` | Your hotkey lost its permit (stake churn) — check the metagraph |
-| `503 hotkey_registry_unavailable` | The service's chain view is stale beyond its bound — check your chain endpoint |
-| Weights submitted but "not matching" alarms | You may be on a different release than the fleet: `VERSION`/`version_key` is a lockstep fence — upgrade to the current release |
-| Clock-skew signature refusals | NTP-sync; the window is ±120 s |
+| Preflight floor HOLD | Discover latest closed epoch again; use exactly+1 for fresh deployment |
+| 403 / no validator permit | Verify the hotkey and current SN85 validator permit |
+| Missing / mismatched anchor | HOLD; never disable the independent anchor check |
+| Public storage probe fails | Check scoped IAM, region/endpoint and public prefix policy |
+| Signature/clock refusals | Verify the wallet matches both ss58 fields and NTP is synchronized |
+| Runtime/manifest check fails | Pull the exact public digest, not a locally altered runtime |
+| Auditor service rejected | This release packages the thin runtime, not auditor launchers |
 
-## 7. Upgrades
+## 6. Upgrades and help
 
-Releases are snapshot commits here; `VERSION` + `version_key` fence the fleet.
-**Epoch-schema releases are lockstep** — release notes will say when every
-validator must move in the same window. The mixed-version fence means a
-foreign-schema log is refused rather than mis-followed; being behind fails
-safe but fails visible.
+Keep durable state and the writer lock; upgrade to the published digest.
+`VERSION` and epoch `version_key=16` fence incompatible releases. Do not change
+tokenomics or sample/scoring knobs to bypass a failure.
 
-## 8. Getting help
-
-- **Discord** — the VidAIO server (invite via [vidaio.io](https://vidaio.io)):
-  validator questions in the validators channel; the core team reads it daily.
-- **GitHub issues on this repo** — include role, epoch id, and the exact HOLD/
-  REFUSE log lines; every verdict is reproducible from public evidence.
+Questions: GitHub issues or the validator channel via [vidaio.io](https://vidaio.io).
+Include image digest, role, epoch and redacted HOLD/REFUSE logs, never secrets.
 
 ## License
 

@@ -18,6 +18,8 @@ class WeightSetterConfig(BaseModel):
 
     #: How often a weight-set is attempted (design spec §01: 72 min against a ~20 min tempo).
     attempt_interval_seconds: float = Field(default=72 * 60.0, gt=0)
+    reconciliation_interval_seconds: float = Field(default=300.0, gt=0)
+    reveal_grace_seconds: float = Field(default=72 * 60.0, ge=0)
 
     #: Timeout around anchor_commitment. set_weights is deliberately not caller-
     #: bounded; both live writes may span inclusion + finalization. Keep this at
@@ -81,9 +83,18 @@ class WeightSetterConfig(BaseModel):
     #: on chain. Disable ONLY in dev/test environments without an audit store.
     publication_enabled: bool = True
 
-    #: Health check: degraded once the last successful weight set (or service start)
-    #: is older than this. Default = 4 attempt intervals.
-    max_last_success_age_seconds: float = Field(default=4 * 72 * 60.0, gt=0)
+    max_last_success_age_seconds: float = Field(default=2 * 72 * 60.0, gt=0)
+
+    @property
+    def effective_max_last_success_age_seconds(self) -> float:
+        """Allow reveal latency but flag at most one missed submission tempo."""
+        return min(
+            max(
+                self.max_last_success_age_seconds,
+                self.attempt_interval_seconds + self.reveal_grace_seconds,
+            ),
+            2 * self.attempt_interval_seconds + self.reveal_grace_seconds,
+        )
 
     # -- snapshot source (build-wave 5, the project design record §1(b)) --------
     #: WHERE the miner snapshots + crown/result come from.

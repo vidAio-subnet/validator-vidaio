@@ -17,6 +17,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import math
 import os
 import uuid
@@ -40,6 +41,8 @@ GPU_DEVICE_HEADER = "x-vidaio-gpu-device"
 MAX_ERROR_BODY_BYTES = 4 * 1024
 MAX_HEALTH_BODY_BYTES = 64 * 1024
 SUPPORTED_GPU_VARIANTS = ("quality", "balanced", "compact", "premium")
+CPU_FALLBACK_DEVICE = "cpu:ffmpeg-fallback"
+LOGGER = logging.getLogger(__name__)
 
 
 def _metadata_header(payload: Mapping[str, object]) -> str:
@@ -78,6 +81,7 @@ class RemoteGpuBackend:
         max_output_bytes: int,
         request_timeout_seconds: float,
         connect_timeout_seconds: float = 10.0,
+        allow_cpu_fallback: bool = False,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         parsed = urlsplit(endpoint_url)
@@ -117,6 +121,7 @@ class RemoteGpuBackend:
         self.max_output_bytes = int(max_output_bytes)
         self.request_timeout_seconds = float(request_timeout_seconds)
         self.connect_timeout_seconds = float(connect_timeout_seconds)
+        self.allow_cpu_fallback = allow_cpu_fallback
         if self.max_output_bytes <= 0:
             raise ValueError("remote GPU output cap must be positive")
         if not (
@@ -205,7 +210,18 @@ class RemoteGpuBackend:
                 ) as response,
             ):
                 if response.status_code != 200:
-                    detail = _response_error(response)
+                    detail = _response_error(response).replace(
+                        self._auth_token, "<redacted>"
+                    )
+                    detail = "".join(
+                        character if character.isprintable() else " "
+                        for character in detail
+                    )
+                    LOGGER.warning(
+                        "remote GPU refused transform status=%s track=%s variant=%s input=%s detail=%s",
+                        response.status_code, self.track, self.solution_variant,
+                        input_digest[:12], detail,
+                    )
                     raise BackendError(
                         "remote GPU worker refused transform "
                         f"(HTTP {response.status_code}): {detail}"
@@ -264,12 +280,14 @@ class RemoteGpuBackend:
             partial.unlink(missing_ok=True)
 
     def _validate_binding(self, response: httpx.Response, input_digest: str) -> None:
+        device = response.headers.get(GPU_DEVICE_HEADER, "")
+        cpu_fallback = self.allow_cpu_fallback and device == CPU_FALLBACK_DEVICE
         expected = {
             GPU_PROTOCOL_HEADER: GPU_PROTOCOL_VERSION,
             GPU_INPUT_DIGEST_HEADER: input_digest,
             GPU_TRACK_HEADER: self.track,
             GPU_VARIANT_HEADER: self.solution_variant,
-            GPU_ACCELERATED_HEADER: "true",
+            GPU_ACCELERATED_HEADER: "false" if cpu_fallback else "true",
         }
         for name, value in expected.items():
             actual = response.headers.get(name, "")
@@ -277,7 +295,6 @@ class RemoteGpuBackend:
                 raise BackendError(
                     f"remote GPU response binding {name}={actual!r}, expected {value!r}"
                 )
-        device = response.headers.get(GPU_DEVICE_HEADER, "")
         cuda = device.lower().startswith("cuda:")
         # The premium variant's compression path is deliberate CPU work
         # (ab-av1 VMAF search) and attests `abav1:<encoder>` instead of
@@ -287,7 +304,7 @@ class RemoteGpuBackend:
             and self.track == "compression"
             and device.lower().startswith("abav1:")
         )
-        if not (cuda or premium_cpu):
+        if not (cuda or premium_cpu or cpu_fallback):
             raise BackendError(
                 "remote worker did not attest an acceptable device in "
                 f"{GPU_DEVICE_HEADER}: {device!r}"

@@ -673,11 +673,12 @@ async def test_crash_after_acceptance_is_published_on_restart(
 
 
 async def test_pending_anchor_is_re_driven_on_the_same_commitment(
-    make_setter, chain, ledger, conn, mk_miner
+    make_setter, chain, ledger, conn, mk_miner, clock
 ):
     """An anchor failure must be retried, not duplicated into a second commitment."""
     hanging = HangingAnchorChain(chain)
     setter = make_setter([mk_miner(1)], chain_override=hanging)
+    setter._monotonic_clock = lambda: clock().timestamp()
 
     assert await setter.attempt_once() is True  # weights set, anchor fails
 
@@ -689,6 +690,8 @@ async def test_pending_anchor_is_re_driven_on_the_same_commitment(
     assert setter.metric_publications._value.get() == 0
 
     hanging.anchor_ok = True
+    assert await setter.reconcile() == 0
+    clock.advance(setter.config.reconciliation_interval_seconds)
     assert await setter.reconcile() == 1
 
     row = intents.get_intent(conn, int(row["id"]))

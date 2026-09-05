@@ -132,7 +132,7 @@ async def test_shared_publication_binds_exact_epoch_packets_and_snapshot(
 
 
 async def test_shared_evidence_failure_never_blocks_authority_vector_and_recovers_exact_epoch(
-    make_setter, ledger, conn, tmp_path
+    make_setter, ledger, conn, tmp_path, clock
 ):
     """Publication/audit evidence is post-submit and report-only in production.
 
@@ -181,6 +181,7 @@ async def test_shared_evidence_failure_never_blocks_authority_vector_and_recover
             publication_inputs=provider,
             burn_uid=0,
         )
+        setter._monotonic_clock = lambda: clock().timestamp()
 
         assert await setter.attempt_once() is True
 
@@ -214,6 +215,7 @@ async def test_shared_evidence_failure_never_blocks_authority_vector_and_recover
 
         provider.score_packet_digests_for_epoch = recover  # type: ignore[method-assign]
 
+        clock.advance(setter.config.reconciliation_interval_seconds)
         assert await setter.reconcile() == 1
         row = intents.intents(conn)[0]
         assert row["state"] == intents.STATE_PUBLISHED
@@ -468,6 +470,7 @@ async def test_a_failed_anchor_leaves_no_evidence_gap(
         chain_override=hanging,
         publication_inputs=ScorePacketEvidence(vconn),
     )
+    setter._monotonic_clock = lambda: clock().timestamp()
 
     # the weights land, the anchor does not: the intent is accepted, not
     # published. Its packet list froze HERE, at T0 = 12:00.

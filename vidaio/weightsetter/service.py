@@ -132,7 +132,7 @@ from vidaio.audit import (
     merkle_root,
     sha256_hex,
 )
-from vidaio.chain.adapter import ChainAdapter, resolve_burn_uid
+from vidaio.chain.adapter import ChainAdapter, PendingWeightReveal, resolve_burn_uid
 from vidaio.chain.anchor_writer import anchor_writer_lock
 from vidaio.chain.factory import ChainConfig
 from vidaio.core import log_fields, section, with_timeout
@@ -408,6 +408,8 @@ class WeightSetter(BaseService):
         )
         self._publication_task: asyncio.Task[bool] | None = None
         self._publication_task_intent_id: int | None = None
+        self._reveal_wait_logged: set[int] = set()
+        self._legacy_cr_holds: set[int] = set()
         self._clock: Callable[[], datetime] = clock or (
             lambda: datetime.now(timezone.utc)
         )
@@ -544,7 +546,8 @@ class WeightSetter(BaseService):
         self.health.register_check(
             "last_success_age",
             lambda: (
-                self._last_success_age_seconds() <= config.max_last_success_age_seconds
+                self._last_success_age_seconds()
+                <= config.effective_max_last_success_age_seconds
             ),
         )
         if self._conn_factory is not None:
@@ -653,12 +656,53 @@ class WeightSetter(BaseService):
             )
 
     async def _wait_for_next_attempt(self, delay_seconds: float) -> None:
-        """Wait interruptibly while preserving a fixed start-to-start cadence."""
+        """Poll CR reads; wake accepted-only retries without metagraph scans."""
         if delay_seconds <= 0.0:
             await asyncio.sleep(0)
             return
-        with contextlib.suppress(asyncio.TimeoutError):
-            await asyncio.wait_for(self.stopping.wait(), timeout=delay_seconds)
+        deadline = self._monotonic_clock() + delay_seconds
+        while not self.stopping.is_set():
+            remaining = deadline - self._monotonic_clock()
+            if remaining <= 0:
+                return
+            poll_reveals = bool(intents.pending_reveals(self._conn))
+            wake_after = (
+                min(remaining, self.config.reconciliation_interval_seconds)
+                if poll_reveals else remaining
+            )
+            publication_budget = self.config.publication_attempt_timeout_seconds
+            publication_in_flight = (
+                self._publication_task is not None and not self._publication_task.done()
+            )
+            if not publication_in_flight and any(
+                row["state"] == intents.STATE_ACCEPTED
+                for row in intents.unsettled_intents(self._conn)
+            ):
+                retry_after = max(
+                    self.config.reconciliation_interval_seconds,
+                    self._publication_next_start() - self._monotonic_clock(),
+                )
+                if retry_after + publication_budget <= remaining:
+                    wake_after = min(wake_after, retry_after)
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    self.stopping.wait(),
+                    timeout=wake_after,
+                )
+            if self.stopping.is_set() or self._monotonic_clock() >= deadline:
+                return
+            try:
+                if poll_reveals and intents.pending_reveals(self._conn):
+                    await self.reconcile(
+                        publish_accepted=False, pending_reveals_only=True
+                    )
+                if deadline - self._monotonic_clock() >= publication_budget:
+                    await self._drain_one_accepted_publication()
+            except Exception:
+                self.metric_loop_errors.inc()
+                self.log.exception(
+                    "between-attempt reconciliation failed; durable intents remain queued"
+                )
 
     # -- chain state -------------------------------------------------
 
@@ -845,8 +889,15 @@ class WeightSetter(BaseService):
                        vector that POSTDATES our attempt (ours may have landed
                        and been overwritten), or an identical-twin ambiguity.
 
+        Known CR intents HOLD on empty/old storage even after a commit disappears:
+        finality lag or a delayed reveal is not evidence of rejection, at any age.
         ALWAYS refreshes first: the question is about the state AFTER our write.
         """
+        known_reveal = (
+            intent_id is not None
+            and intents.get_intent(self._conn, intent_id)["resolution"]
+            == "commit_reveal_pending"
+        )
         hotkey = self.config.validator_hotkey
         if not hotkey:
             self.log.warning(
@@ -895,13 +946,19 @@ class WeightSetter(BaseService):
                 # A POSITIVE answer: this hotkey has no weight record at all, so
                 # no vector of ours — this one included — has ever landed.
                 return _ChainEvidence(
-                    ChainConfirmation.DENIED, detail="chain_reports_no_weights"
+                    ChainConfirmation.UNKNOWN if known_reveal else ChainConfirmation.DENIED,
+                    detail="chain_reports_no_weights",
                 )
             reported = {
                 int(uid): float(w) for uid, w in dict(report.weights or {}).items()
             }
             set_block = None if report.block is None else int(report.block)
         except Exception as exc:
+            if known_reveal and isinstance(exc, PendingWeightReveal):
+                self._log_reveal_wait_once(intent_id, str(exc))
+                return _ChainEvidence(
+                    ChainConfirmation.UNKNOWN, detail="commit_reveal_pending"
+                )
             # Includes a report we cannot decode: an adapter answering nonsense is
             # a failed read, never a denial.
             self.log.warning(
@@ -913,6 +970,14 @@ class WeightSetter(BaseService):
             )
             return _ChainEvidence(
                 ChainConfirmation.UNKNOWN, detail="weights_read_failed"
+            )
+        if known_reveal and (
+            not reported or set_block is None or set_block < attempt_block
+        ):
+            return _ChainEvidence(
+                ChainConfirmation.UNKNOWN,
+                set_block=set_block,
+                detail="commit_reveal_finality_gap",
             )
         if set_block is None:
             # The adapter reported a vector but cannot date it: fall back to the
@@ -1006,6 +1071,16 @@ class WeightSetter(BaseService):
                 " will be submitted (an empty/partial vector is never a valid set)",
                 extra=log_fields(reason=reason),
             )
+            return False
+
+        pending_reveals = intents.pending_reveals(self._conn)
+        if self._legacy_cr_holds:
+            self.metric_chain_state_skips.labels(
+                reason="commit_reveal_state_unavailable"
+            ).inc()
+            return False
+        if pending_reveals:
+            self.metric_chain_state_skips.labels(reason="commit_reveal_pending").inc()
             return False
 
         # CRv4 commits are automatically revealed by the chain after their drand
@@ -1265,6 +1340,13 @@ class WeightSetter(BaseService):
                 verdict=outcome.confirmation.value,
             )
             self._sync_pending_intents_metric()
+            if outcome.resolution == "commit_reveal_pending":
+                intents.note_commit_reveal_pending(self._conn, intent_id)
+                self.log.info(
+                    "CRv4 commitment finalized; pending exact-vector reveal confirmation",
+                    extra=log_fields(intent_id=intent_id, block=outcome.block),
+                )
+                return False
             if outcome.confirmation is ChainConfirmation.UNKNOWN:
                 self.metric_unresolved_intents.inc()
             self.log.warning(
@@ -2263,6 +2345,15 @@ class WeightSetter(BaseService):
         )
         return True
 
+    def _publication_next_start(self) -> float:
+        """Translate durable UTC retry time to this loop's monotonic deadline."""
+        retry_at = intents.publication_retry_at(
+            self._conn, interval=self.config.attempt_interval_seconds
+        )
+        return self._monotonic_clock() + max(
+            retry_at - self._clock().timestamp(), 0.0
+        )
+
     async def _publish_intent_bounded(self, intent_id: int) -> bool:
         """Start at most one detached publication and wait only for its budget.
 
@@ -2273,6 +2364,11 @@ class WeightSetter(BaseService):
         returns immediately, the accepted intent stays durable, and later weight
         attempts merely observe the in-flight publication rather than duplicating
         it or waiting again.
+
+        All callers share at most three starts per rolling attempt interval. A
+        failed publication backs off from the poll interval exponentially, capped
+        at the attempt interval. Neither scheduled drains nor manual reconciliation
+        reset the budget; each publication makes at most one anchor call.
         """
         existing = self._publication_task
         if existing is not None:
@@ -2286,8 +2382,17 @@ class WeightSetter(BaseService):
             self._publication_task = None
             self._publication_task_intent_id = None
 
+        publication_attempt_id = intents.reserve_publication_attempt(
+            self._conn, intent_id, now=self._clock().timestamp(),
+            interval=self.config.attempt_interval_seconds,
+            base_delay=self.config.reconciliation_interval_seconds,
+            timeout=self.config.publication_attempt_timeout_seconds,
+        )
+        if publication_attempt_id is None:
+            return False
+
         task = asyncio.create_task(
-            self._run_publication_task(intent_id),
+            self._run_publication_task(intent_id, publication_attempt_id),
             name=f"weight-publication-{intent_id}",
         )
         self._publication_task = task
@@ -2317,10 +2422,12 @@ class WeightSetter(BaseService):
                 self._publication_task = None
                 self._publication_task_intent_id = None
 
-    async def _run_publication_task(self, intent_id: int) -> bool:
+    async def _run_publication_task(self, intent_id: int, publication_attempt_id: int) -> bool:
         """Exception-contained body for the retained publication task."""
+        published = False
         try:
-            return await self._publish_intent(intent_id)
+            published = await self._publish_intent(intent_id)
+            return published
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # durable ACCEPTED row remains the retry boundary
@@ -2335,6 +2442,18 @@ class WeightSetter(BaseService):
                 ),
             )
             return False
+        finally:
+            try:
+                intents.finish_publication_attempt(
+                    self._conn, publication_attempt_id, now=self._clock().timestamp(),
+                    succeeded=published,
+                    base_delay=self.config.reconciliation_interval_seconds,
+                    interval=self.config.attempt_interval_seconds,
+                )
+            except Exception:
+                self.log.exception(
+                    "publication outcome bookkeeping failed; durable retry reservation remains"
+                )
 
     async def _finish_publication_task(self) -> None:
         """Drain the owned single-flight task during an orderly service stop."""
@@ -2360,7 +2479,7 @@ class WeightSetter(BaseService):
                 self._publication_task_intent_id = None
 
     async def _drain_one_accepted_publication(self) -> bool:
-        """Retry at most one old accepted row after the scheduled weight attempt."""
+        """Drain one accepted row through the shared retry budget, never bypass it."""
         for row in intents.unsettled_intents(self._conn):
             if row["state"] == intents.STATE_ACCEPTED:
                 published = await self._publish_intent_bounded(int(row["id"]))
@@ -2370,60 +2489,102 @@ class WeightSetter(BaseService):
         return False
 
     async def _anchor(self, commitment_id: int, payload: CommitmentPayload) -> bool:
-        """Anchor a pending commitment on chain. False leaves it re-drivable."""
+        """One anchor write; the publication governor owns all retry/backoff."""
         if self._ledger is None:
             return False
         if self._ledger.current_status(commitment_id) != CommitmentStatus.PENDING_CHAIN:
             return True  # already anchored by an earlier attempt
         cfg = self.config
-        for attempt in range(1, cfg.chain_retry_attempts + 1):
-            try:
-                async with anchor_writer_lock(
-                    self._anchor_writer_lock_path,
-                    timeout_seconds=self._anchor_writer_lock_timeout_seconds,
-                ):
-                    await require_commitment_capacity(
-                        self._chain,
-                        netuid=self._anchor_netuid,
-                        hotkey=self._anchor_hotkey,
-                        payload=payload.payload,
-                        operation=f"weight publication {commitment_id} anchor",
-                    )
-                    tx_id = await with_timeout(
-                        self._chain.anchor_commitment(payload.payload),
-                        cfg.chain_timeout_seconds,
-                        "anchor_commitment",
-                    )
-            except (CommitmentCapacityError, TimeoutError, OSError) as exc:
-                if attempt < cfg.chain_retry_attempts:
-                    await asyncio.sleep(
-                        cfg.chain_retry_base_delay_seconds * 2 ** (attempt - 1)
-                    )
-                    continue
-                self.metric_chain_failures.inc()
-                self.log.error(
-                    "publication anchor failed after retries — commitment stays"
-                    " pending_chain and IS re-driven by the reconciliation pass",
-                    extra=log_fields(
-                        commitment_id=commitment_id,
-                        root=payload.root,
-                        error=f"{type(exc).__name__}: {exc}",
-                    ),
+        try:
+            async with anchor_writer_lock(
+                self._anchor_writer_lock_path,
+                timeout_seconds=self._anchor_writer_lock_timeout_seconds,
+            ):
+                await require_commitment_capacity(
+                    self._chain,
+                    netuid=self._anchor_netuid,
+                    hotkey=self._anchor_hotkey,
+                    payload=payload.payload,
+                    operation=f"weight publication {commitment_id} anchor",
                 )
-                return False
-            self._ledger.advance(
-                commitment_id, CommitmentStatus.ANCHORED, at=self._iso_now()
+                tx_id = await with_timeout(
+                    self._chain.anchor_commitment(payload.payload),
+                    cfg.chain_timeout_seconds,
+                    "anchor_commitment",
+                )
+        except (CommitmentCapacityError, TimeoutError, OSError) as exc:
+            self.metric_chain_failures.inc()
+            self.log.error(
+                "publication anchor failed — commitment stays pending_chain;"
+                " retry uses the bounded publication backoff",
+                extra=log_fields(
+                    commitment_id=commitment_id,
+                    root=payload.root,
+                    error=f"{type(exc).__name__}: {exc}",
+                ),
             )
-            self.log.info(
-                "publication anchored",
-                extra=log_fields(commitment_id=commitment_id, tx_id=tx_id),
-            )
-            return True
-        return False
+            return False
+        self._ledger.advance(
+            commitment_id, CommitmentStatus.ANCHORED, at=self._iso_now()
+        )
+        self.log.info(
+            "publication anchored",
+            extra=log_fields(commitment_id=commitment_id, tx_id=tx_id),
+        )
+        return True
 
     # -- recovery loop -----------------------------------------------
 
-    async def reconcile(self, *, publish_accepted: bool = True) -> int:
+    def _log_reveal_wait_once(self, intent_id: int, detail: str) -> None:
+        """One informational reveal-wait record per intent, including restarts."""
+        if intent_id in self._reveal_wait_logged:
+            return
+        self._reveal_wait_logged.add(intent_id)
+        if not intents.claim_reveal_wait_log(self._conn, intent_id, at=self._iso_now()):
+            return
+        self.log.info(
+            "CRv4 reveal remains UNKNOWN; HOLDING intent until finalized vector proof",
+            extra=log_fields(intent_id=intent_id, chain_check=detail),
+        )
+
+    async def _recover_legacy_cr_intents(self) -> None:
+        """Recover NULL-cause rows only on a strictly positive CR-mode read.
+
+        Mode does not prove acceptance: it only makes old/empty storage insufficient
+        to deny an old attempt. Unreadable mode HOLDS without labeling it CR.
+        """
+        legacy = [
+            row for row in intents.unsettled_intents(self._conn)
+            if row["state"] == intents.STATE_PENDING and row["resolution"] is None
+        ]
+        self._legacy_cr_holds = set()
+        mode_reader = getattr(self._chain, "commit_reveal_enabled", None)
+        if not legacy or not callable(mode_reader):
+            return
+        self._legacy_cr_holds = {int(row["id"]) for row in legacy}
+        try:
+            enabled = await asyncio.to_thread(mode_reader)
+            if not isinstance(enabled, bool):
+                raise TypeError("commit_reveal_enabled must return a boolean")
+        except Exception as exc:
+            for row in legacy:
+                intents.note_check(
+                    self._conn, int(row["id"]), at=self._iso_now(), verdict="unknown"
+                )
+            self.log.warning(
+                "cannot determine legacy weight intent CR mode; HOLDING without"
+                " classifying, abandoning or resubmitting the intent",
+                extra=log_fields(error=f"{type(exc).__name__}: {exc}"),
+            )
+            return
+        if enabled:
+            for row in legacy:
+                intents.note_commit_reveal_pending(self._conn, int(row["id"]))
+        self._legacy_cr_holds.clear()
+
+    async def reconcile(
+        self, *, publish_accepted: bool = True, pending_reveals_only: bool = False
+    ) -> int:
         """Finish every half-done attempt. Runs at startup AND before each attempt.
 
         - `accepted` intents: the chain holds the vector but publication (or its
@@ -2453,14 +2614,23 @@ class WeightSetter(BaseService):
         settled (accepted, published, or abandoned).
         """
         settled = 0
+        if not pending_reveals_only:
+            await self._recover_legacy_cr_intents()
         if self._chain_state_reason() is not None:
             # Self-contained entry point: try once to get a usable snapshot before
             # deciding anything about a pending intent.
             await self._refresh_chain_async()
         chain_usable = self._chain_state_reason() is None
         pending = 0
-        for row in intents.unsettled_intents(self._conn):
+        rows = (
+            intents.pending_reveals(self._conn)
+            if pending_reveals_only else intents.unsettled_intents(self._conn)
+        )
+        for row in rows:
             intent_id = int(row["id"])
+            if intent_id in self._legacy_cr_holds:
+                pending += 1
+                continue
             if row["state"] == intents.STATE_ACCEPTED:
                 if not publish_accepted:
                     pending += 1
@@ -2502,13 +2672,18 @@ class WeightSetter(BaseService):
                 self._conn, intent_id, at=self._iso_now(), verdict=verdict.value
             )
             if verdict is ChainConfirmation.CONFIRMED:
-                self.log.warning(
-                    "a crashed attempt's OWN vector is on chain — completing its"
-                    " publication instead of losing the audit trail",
+                resolution = (
+                    "commit_reveal_confirmed"
+                    if row["resolution"] == "commit_reveal_pending"
+                    else "chain_confirmed_on_restart"
+                )
+                self.log.info(
+                    "pending intent's OWN vector confirmed on chain; completing publication",
                     extra=log_fields(
                         intent_id=intent_id,
                         block=row["attempt_block"],
                         set_block=evidence.set_block,
+                        resolution=resolution,
                     ),
                 )
                 accepted_block = (
@@ -2530,7 +2705,7 @@ class WeightSetter(BaseService):
                         self._conn,
                         intent_id,
                         accepted_block=accepted_block,
-                        resolution="chain_confirmed_on_restart",
+                        resolution=resolution,
                         weights=evidence.reported_weights,
                     )
                 else:
@@ -2538,7 +2713,7 @@ class WeightSetter(BaseService):
                         self._conn,
                         intent_id,
                         accepted_block=accepted_block,
-                        resolution="chain_confirmed_on_restart",
+                        resolution=resolution,
                     )
                     self.log.warning(
                         "recovery confirmed this intent by block bookkeeping without a"
@@ -2549,9 +2724,9 @@ class WeightSetter(BaseService):
                             intent_id=intent_id, set_block=evidence.set_block
                         ),
                     )
-                self.metric_reconciled.labels(
-                    resolution="chain_confirmed_on_restart"
-                ).inc()
+                self.metric_successes.inc()
+                self._last_success_at = self._clock()
+                self.metric_reconciled.labels(resolution=resolution).inc()
                 if publish_accepted:
                     if await self._publish_intent_bounded(intent_id):
                         self.metric_redriven.inc()
@@ -2566,6 +2741,13 @@ class WeightSetter(BaseService):
                 # need be: an unpublishable accepted vector is unrecoverable,
                 # whereas a pending intent costs a row and a re-check.
                 pending += 1
+                if row["resolution"] == "commit_reveal_pending":
+                    if evidence.detail in {
+                        "commit_reveal_pending", "commit_reveal_finality_gap",
+                        "chain_reports_no_weights",
+                    }:
+                        self._log_reveal_wait_once(intent_id, evidence.detail)
+                    continue
                 self.log.warning(
                     "a weight intent's fate is still UNKNOWN — it stays PENDING"
                     " and will be re-checked. It is never abandoned and never"
@@ -2614,7 +2796,10 @@ class WeightSetter(BaseService):
             )
             self.metric_abandoned.labels(resolution="chain_denied_after_crash").inc()
             settled += 1
-        self.metric_pending_intents.set(pending)
+        if pending_reveals_only:
+            self._sync_pending_intents_metric()
+        else:
+            self.metric_pending_intents.set(pending)
         return settled
 
     def _intent_age_seconds(self, row: sqlite3.Row) -> float:

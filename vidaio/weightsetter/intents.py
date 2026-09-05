@@ -48,6 +48,7 @@ Schema lives in vidaio/weightsetter/migrations/0002_weight_intents.sql through
 the crown tables. In a shared authority intent, JSON ``null`` packet digests mean
 "post-submit resolution still owed", never "the epoch had no packets"; the durable
 snapshot epoch id/digest make that resolution exact and crash-recoverable.
+Migration 0010 adds durable publication retry reservations and reveal-wait log claims.
 """
 
 from __future__ import annotations
@@ -412,6 +413,19 @@ def note_check(
     )
 
 
+def note_commit_reveal_pending(conn: sqlite3.Connection, intent_id: int) -> None:
+    """Remember a CR obligation without claiming an active vector or acceptance.
+
+    Also used for legacy NULL-cause rows after a positive CR-mode read; that mode
+    alone cannot prove their commitment landed, so only vector proof settles them.
+    """
+    conn.execute(
+        "UPDATE weight_intents SET resolution = 'commit_reveal_pending' "
+        "WHERE id = ? AND state = ?",
+        (intent_id, STATE_PENDING),
+    )
+
+
 def get_intent(conn: sqlite3.Connection, intent_id: int) -> sqlite3.Row:
     row = conn.execute(
         "SELECT * FROM weight_intents WHERE id = ?", (intent_id,)
@@ -453,6 +467,94 @@ def unsettled_intents(conn: sqlite3.Connection) -> list[sqlite3.Row]:
         f"SELECT * FROM weight_intents WHERE state IN ({marks}) ORDER BY id",
         UNSETTLED_STATES,
     ).fetchall()
+
+
+def pending_reveals(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Known finalized CR commitments that still need exact-vector confirmation."""
+    return conn.execute(
+        "SELECT * FROM weight_intents WHERE state = ? "
+        "AND resolution = 'commit_reveal_pending' ORDER BY id",
+        (STATE_PENDING,),
+    ).fetchall()
+
+
+def claim_reveal_wait_log(conn: sqlite3.Connection, intent_id: int, *, at: str) -> bool:
+    """Claim the one reveal-wait log durably, including across restarts."""
+    return conn.execute(
+        "UPDATE weight_intents SET reveal_wait_logged_at = ? "
+        "WHERE id = ? AND reveal_wait_logged_at IS NULL",
+        (at, intent_id),
+    ).rowcount == 1
+
+
+def publication_retry_at(conn: sqlite3.Connection, *, interval: float) -> float:
+    """UTC epoch seconds when both backoff and the rolling budget permit a start."""
+    rows = conn.execute(
+        "SELECT started_at, retry_after FROM weight_publication_attempts "
+        "ORDER BY id DESC LIMIT 3"
+    ).fetchall()
+    if not rows:
+        return 0.0
+    return max(
+        float(rows[0]["retry_after"]),
+        float(rows[2]["started_at"]) + interval if len(rows) == 3 else 0.0,
+    )
+
+
+def publication_retry_delay(*, failures: int, base_delay: float, interval: float) -> float:
+    return min(interval, base_delay * 2 ** min(failures - 1, 16))
+
+
+def reserve_publication_attempt(
+    conn: sqlite3.Connection, intent_id: int, *, now: float, interval: float,
+    base_delay: float, timeout: float,
+) -> int | None:
+    """Reserve before launch atomically; an interrupted start still spends budget."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if now < publication_retry_at(conn, interval=interval):
+            conn.execute("COMMIT")
+            return None
+        latest = conn.execute(
+            "SELECT failure_count, succeeded FROM weight_publication_attempts "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        failures = (
+            int(latest["failure_count"]) + 1
+            if latest is not None and latest["succeeded"] != 1 else 1
+        )
+        delay = publication_retry_delay(
+            failures=failures, base_delay=base_delay, interval=interval
+        )
+        cursor = conn.execute(
+            "INSERT INTO weight_publication_attempts "
+            "(intent_id, started_at, retry_after, failure_count) VALUES (?, ?, ?, ?)",
+            (intent_id, now, now + timeout + delay, failures),
+        )
+        attempt_id = int(cursor.lastrowid)
+        conn.execute("COMMIT")
+        return attempt_id
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+
+
+def finish_publication_attempt(
+    conn: sqlite3.Connection, attempt_id: int, *, now: float, succeeded: bool,
+    base_delay: float, interval: float,
+) -> None:
+    row = conn.execute(
+        "SELECT failure_count FROM weight_publication_attempts WHERE id = ?",
+        (attempt_id,),
+    ).fetchone()
+    delay = publication_retry_delay(
+        failures=int(row["failure_count"]), base_delay=base_delay, interval=interval
+    )
+    conn.execute(
+        "UPDATE weight_publication_attempts SET finished_at = ?, succeeded = ?, "
+        "retry_after = ? WHERE id = ?",
+        (now, int(succeeded), 0.0 if succeeded else now + delay, attempt_id),
+    )
 
 
 def other_intents(

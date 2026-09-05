@@ -43,6 +43,10 @@ class ChainStateUnavailable(RuntimeError):
     """
 
 
+class PendingWeightReveal(ChainStateUnavailable):
+    """Finalized storage positively contains a weight commit awaiting reveal."""
+
+
 @dataclass(frozen=True, slots=True)
 class ChainCommitmentRecord:
     """Raw contents and original inclusion height of one commitment slot.

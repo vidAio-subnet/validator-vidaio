@@ -15,6 +15,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import logging
 import math
 import os
 import re
@@ -24,6 +25,7 @@ import subprocess
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -34,7 +36,14 @@ from vidaio.miner.premium import (
     PremiumEncodeError,
     run_premium_compression,
 )
-from vidaio.miner.remote_gpu import GPU_PROTOCOL_VERSION, SUPPORTED_GPU_VARIANTS
+from vidaio.miner.remote_gpu import (
+    CPU_FALLBACK_DEVICE,
+    GPU_PROTOCOL_VERSION,
+    SUPPORTED_GPU_VARIANTS,
+)
+from vidaio.scoring.canonicalize import build_canonicalization_plan
+
+LOGGER = logging.getLogger(__name__)
 
 MAX_GPU_METADATA_BYTES = 16 * 1024
 SUPPORTED_TRACKS = ("compression", "upscaling")
@@ -159,6 +168,10 @@ class GpuTransformError(RuntimeError):
     pass
 
 
+class RecoverableGpuTransformError(GpuTransformError):
+    """A bounded raw-frame pipeline limitation, not invalid media or a CUDA fault."""
+
+
 def _remaining(deadline: float) -> float:
     value = deadline - time.monotonic()
     if value <= 0:
@@ -239,6 +252,31 @@ def _positive_int(params: Mapping[str, object], name: str) -> int | None:
     return value
 
 
+def _cfr_info(
+    input_path: Path, info: VideoInfo, *, ffmpeg_path: str, deadline: float,
+) -> VideoInfo:
+    """Count the scorer's CFR timeline without allocating a whole raw clip."""
+    command = build_canonicalization_plan(str(input_path), "pipe:1")
+    command[0] = ffmpeg_path
+    command[-1:-1] = ["-frames:v", "3601", "-c:v", "wrapped_avframe", "-f", "framecrc"]
+    lines = _run_capture(command, deadline=deadline).decode("ascii").splitlines()
+    timebases = [line.split(":", 1)[1].strip() for line in lines if line.startswith("#tb 0:")]
+    frames = [line for line in lines if line and not line.startswith("#")]
+    try:
+        if len(timebases) != 1 or not 1 <= len(frames) <= 3600:
+            raise ValueError("unbounded CFR frame count or missing timebase")
+        fps = float(1 / Fraction(timebases[0]))
+        if not math.isfinite(fps) or not 0 < fps <= 120:
+            raise ValueError("unbounded CFR frame rate")
+        for index, line in enumerate(frames):
+            fields = [field.strip() for field in line.split(",")]
+            if len(fields) < 6 or [int(value) for value in fields[:4]] != [0, index, index, 1]:
+                raise ValueError("nonuniform canonical frame timeline")
+    except (ValueError, ZeroDivisionError) as exc:
+        raise GpuTransformError(f"could not derive bounded CFR geometry: {exc}") from exc
+    return VideoInfo(info.width, info.height, fps, len(frames))
+
+
 def _target(info: VideoInfo, metadata: GpuTaskMetadata) -> tuple[int, int]:
     width = _positive_int(metadata.params, "target_width")
     height = _positive_int(metadata.params, "target_height")
@@ -282,21 +320,11 @@ def _decode_bounded(
     deadline: float,
 ) -> int:
     """Decode stdout while concurrently draining stderr, with a hard byte cap."""
+    command = build_canonicalization_plan(str(input_path), "pipe:1")
+    command[0] = ffmpeg_path
+    command[-1:-1] = ["-f", "rawvideo", "-pix_fmt", "rgb24"]
     process = subprocess.Popen(
-        [
-            ffmpeg_path,
-            "-v",
-            "error",
-            "-i",
-            str(input_path),
-            "-map",
-            "0:v:0",
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "rgb24",
-            "pipe:1",
-        ],
+        command,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         start_new_session=True,
@@ -389,7 +417,7 @@ def _gpu_frames(
     target_width, target_height = target
     output_bytes = frames * target_width * target_height * 3
     if output_bytes > maximum_output_raw_bytes:
-        raise GpuTransformError(
+        raise RecoverableGpuTransformError(
             f"transformed raw video projects to {output_bytes} bytes, cap is "
             f"{maximum_output_raw_bytes}"
         )
@@ -515,6 +543,7 @@ def transform_media(
     ffprobe_path: str = "ffprobe",
     maximum_raw_bytes: int = 4 * 1024 * 1024 * 1024,
     maximum_output_bytes: int = 4 * 1024 * 1024 * 1024,
+    allow_cpu_fallback: bool = False,
 ) -> TransformResult:
     """Bounded decode -> CUDA transform -> software encode per the task codec params.
 
@@ -547,15 +576,22 @@ def transform_media(
         )
     info = _probe(input_path, ffprobe_path=ffprobe_path, deadline=deadline)
     target = _target(info, metadata)
+    info = _cfr_info(input_path, info, ffmpeg_path=ffmpeg_path, deadline=deadline)
     input_raw = output_path.with_suffix(".input.rgb")
     transformed_raw = output_path.with_suffix(".gpu.rgb")
     expected_input_raw = info.frame_count * info.width * info.height * 3
-    if expected_input_raw > maximum_raw_bytes:
-        raise GpuTransformError(
-            f"decoded input projects to {expected_input_raw} bytes, cap is "
-            f"{maximum_raw_bytes}"
-        )
     try:
+        if expected_input_raw > maximum_raw_bytes:
+            raise RecoverableGpuTransformError(
+                f"decoded input projects to {expected_input_raw} bytes, cap is "
+                f"{maximum_raw_bytes}"
+            )
+        expected_output_raw = info.frame_count * target[0] * target[1] * 3
+        if expected_output_raw > maximum_raw_bytes:
+            raise RecoverableGpuTransformError(
+                f"transformed raw video projects to {expected_output_raw} bytes, cap is "
+                f"{maximum_raw_bytes}"
+            )
         decoded = _decode_bounded(
             input_path,
             input_raw,
@@ -564,7 +600,7 @@ def transform_media(
             deadline=deadline,
         )
         if decoded != expected_input_raw:
-            raise GpuTransformError(
+            raise RecoverableGpuTransformError(
                 f"decoded byte count {decoded} != projected {expected_input_raw}"
             )
         frames, device, gpu_seconds = _gpu_frames(
@@ -599,9 +635,93 @@ def transform_media(
             device=device,
             gpu_seconds=gpu_seconds,
         )
+    except RecoverableGpuTransformError as exc:
+        output_path.unlink(missing_ok=True)
+        if not allow_cpu_fallback:
+            raise
+        _remaining(deadline)
+        input_raw.unlink(missing_ok=True)
+        transformed_raw.unlink(missing_ok=True)
+        LOGGER.warning(
+            "GPU raw pipeline fallback track=%s variant=%s input=%s reason=%s",
+            metadata.track, metadata.solution_variant, metadata.input_digest[:12], exc,
+        )
+        return _stream_cpu_fallback(
+            input_path, output_path, metadata, info=info, target=target,
+            ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path,
+            maximum_output_bytes=maximum_output_bytes, deadline=deadline,
+        )
     except BaseException:
         output_path.unlink(missing_ok=True)
         raise
     finally:
         input_raw.unlink(missing_ok=True)
         transformed_raw.unlink(missing_ok=True)
+
+
+def _stream_cpu_fallback(
+    input_path: Path,
+    output_path: Path,
+    metadata: GpuTaskMetadata,
+    *,
+    info: VideoInfo,
+    target: tuple[int, int],
+    ffmpeg_path: str,
+    ffprobe_path: str,
+    maximum_output_bytes: int,
+    deadline: float,
+) -> TransformResult:
+    """Stream validated media without raw spools, under the original deadline."""
+    variant = _VARIANTS[metadata.solution_variant]
+    width, height = target
+    scale_mode = variant.upscale_mode if metadata.track == "upscaling" else "bicubic"
+    canonical = build_canonicalization_plan(str(input_path), str(output_path))
+    filters = [canonical[canonical.index("-vf") + 1], f"scale={width}:{height}:flags={scale_mode}"]
+    detail = (
+        variant.upscale_detail if metadata.track == "upscaling"
+        else variant.compression_detail
+    )
+    if detail:
+        filters.append(f"unsharp=3:3:{detail}:3:3:0")
+    frame_rate = Fraction(info.fps).limit_denominator(1_000_000)
+    fps = str(frame_rate)
+    if metadata.track == "compression":
+        try:
+            codec_args = resolve_encode(
+                metadata.params, default_crf=variant.compression_crf, preset=variant.preset
+            ).ffmpeg_args
+        except EncodeParamError as exc:
+            raise GpuTransformError(str(exc)) from None
+    else:
+        codec_args = [
+            "-c:v", "libx264", "-preset", variant.preset,
+            "-crf", str(variant.upscaling_crf), "-pix_fmt", "yuv420p",
+        ]
+    try:
+        _run_capture(
+            [
+                ffmpeg_path, "-y", "-v", "error", "-threads", "4",
+                "-filter_threads", "1", "-i", str(input_path), "-map", "0:v:0",
+                "-vf", ",".join(filters), "-enc_time_base",
+                f"{frame_rate.denominator}:{frame_rate.numerator}",
+                "-r", fps, "-fps_mode", "cfr",
+                *codec_args, "-threads", "4", "-fs", str(maximum_output_bytes),
+                "-movflags", "+faststart", "-an", str(output_path),
+            ],
+            deadline=deadline,
+        )
+        if not output_path.is_file() or not 0 < output_path.stat().st_size <= maximum_output_bytes:
+            raise GpuTransformError("CPU fallback output is empty or exceeded its byte cap")
+        result = _probe(output_path, ffprobe_path=ffprobe_path, deadline=deadline)
+        if (result.width, result.height) != target or result.frame_count != info.frame_count:
+            raise GpuTransformError("CPU fallback changed the required geometry or frame count")
+        if not math.isclose(result.fps, info.fps, rel_tol=0.001):
+            raise GpuTransformError("CPU fallback changed the required frame rate")
+        return TransformResult(
+            output_path=output_path, frames=result.frame_count,
+            width=result.width, height=result.height,
+            device=CPU_FALLBACK_DEVICE, gpu_seconds=0.0,
+        )
+    except BaseException:
+        output_path.unlink(missing_ok=True)
+        raise

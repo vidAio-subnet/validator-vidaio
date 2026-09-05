@@ -11,6 +11,7 @@ from vidaio.audit.store import ArtifactKind, LocalFsStore
 from vidaio.chain import (
     ChainNeuron,
     ChainStateUnavailable,
+    PendingWeightReveal,
     InMemoryChain,
     SetWeightsResult,
     SubmittedWeights,
@@ -417,7 +418,7 @@ class CommitRevealChain(_ChainProxy):
 
     def submitted_weights(self, hotkey: str) -> SubmittedWeights | None:  # noqa: ARG002
         if self.pending:
-            raise ChainStateUnavailable("weight commit pending reveal")
+            raise PendingWeightReveal("weight commit pending reveal")
         if self.staged is None:
             return None
         return SubmittedWeights(weights=dict(self.staged), block=self.staged_block)

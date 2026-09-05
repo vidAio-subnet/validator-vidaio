@@ -24,6 +24,7 @@ from vidaio.chain import (
     BittensorHotkeySigner,
     BittensorReadOnlyChainAdapter,
     ChainStateUnavailable,
+    PendingWeightReveal,
     CommitmentRecordReadable,
     EpochBoundary,
     HistoricalEpochAnchorReadable,
@@ -252,6 +253,8 @@ class FakeTransport:
     def submitted_weights_at_finalized_head(self, netuid, hotkey):
         self.submitted_weights_calls += 1
         self._maybe("submitted_weights_at_finalized_head")
+        if self.pending_timelocked_commit(netuid, hotkey):
+            raise PendingWeightReveal("weight commit pending reveal")
         self._maybe("query_weights")
         self._maybe("query_last_update")
         uid = self._uid_map.get(hotkey)
@@ -1204,7 +1207,7 @@ async def test_commit_reveal_acceptance_stays_pending_until_vector_readback():
     assert adapter.commit_reveal_enabled() is True
     assert adapter.weight_commit_pending("hk-0") is True
     assert adapter.commitment_rate_limit() == 7
-    with pytest.raises(ChainStateUnavailable, match="pending reveal"):
+    with pytest.raises(PendingWeightReveal, match="pending reveal"):
         adapter.submitted_weights("hk-0")
 
 
@@ -2289,7 +2292,7 @@ def test_pending_timelocked_commit_exhausts_all_epoch_buckets_at_pinned_head():
             "module": "SubtensorModule",
             "storage_function": "TimelockedWeightCommits",
             "params": [1],
-            "block_hash": "0xhead",
+            "block_hash": "0xfinalized",
             "page_size": 100,
             "ignore_decoding_errors": False,
         }
@@ -2539,11 +2542,113 @@ def test_real_transport_weight_proof_pins_all_storage_to_one_finalized_hash():
     report = transport.submitted_weights_at_finalized_head(1, "hk-0")
 
     assert report == SubmittedWeights(weights={2: 65535.0, 3: 32768.0}, block=1199)
+    assert [call["block_hash"] for call in substrate.timelocked_calls] == [
+        "0xfinalized-proof"
+    ]
     assert substrate.queries == [
         ("SubtensorModule", "Uids", [1, "hk-0"], "0xfinalized-proof"),
         ("SubtensorModule", "Weights", [1, 0], "0xfinalized-proof"),
         ("SubtensorModule", "LastUpdate", [1], "0xfinalized-proof"),
     ]
+
+
+@pytest.mark.parametrize("old_weights", [[], [(7, U16_MAX)]])
+def test_reveal_at_best_head_cannot_expose_old_finalized_weights_as_denial(old_weights):
+    class FinalityGapStorage(FakeSubstrate):
+        def __init__(self):
+            super().__init__()
+            self.finality_caught_up = False
+            self.finalized_reads = 0
+            self.queries = []
+
+        def get_chain_head(self):
+            return "0xrevealed"
+
+        def get_chain_finalised_head(self):
+            self.finalized_reads += 1
+            return "0xrevealed" if self.finality_caught_up else "0xpending"
+
+        def get_block_number(self, block_hash=None):
+            return 1200 if block_hash == "0xrevealed" else 1198
+
+        def query_map(self, **kwargs):
+            self.timelocked_calls.append(kwargs)
+            if kwargs["block_hash"] == "0xpending":
+                return iter([(40, [("hk-0", 1190, b"commit", 1)])])
+            return iter([])
+
+        def query(self, module, storage_function, params=None, block_hash=None):
+            self.queries.append((storage_function, block_hash))
+            if storage_function == "Uids":
+                return 0
+            if storage_function == "Weights":
+                return [(2, U16_MAX)] if block_hash == "0xrevealed" else old_weights
+            if storage_function == "LastUpdate":
+                return [1200] if block_hash == "0xrevealed" else [1100]
+            raise AssertionError(storage_function)
+
+    substrate = FinalityGapStorage()
+    transport = _real_transport_with(FakeSubtensor(commits=[]), substrate=substrate)
+    transport._hotkey = types.SimpleNamespace(ss58_address="hk-0")
+    adapter = BittensorChainAdapter(
+        BittensorAdapterConfig(validator_hotkey="hk-0", netuid=1), transport=transport
+    )
+    with pytest.raises(PendingWeightReveal, match="pending reveal"):
+        adapter.submitted_weights("hk-0")
+    assert substrate.queries == []
+    assert substrate.finalized_reads == 1
+    assert [call["block_hash"] for call in substrate.timelocked_calls] == ["0xpending"]
+    substrate.finality_caught_up = True
+    assert adapter.submitted_weights("hk-0") == SubmittedWeights(
+        weights={2: float(U16_MAX)}, block=1200
+    )
+    assert substrate.finalized_reads == 2
+    assert [call["block_hash"] for call in substrate.timelocked_calls] == [
+        "0xpending", "0xrevealed"
+    ]
+    assert substrate.queries == [
+        ("Uids", "0xrevealed"), ("Weights", "0xrevealed"),
+        ("LastUpdate", "0xrevealed"),
+    ]
+
+
+def test_changing_finalized_head_is_resolved_only_once_for_commit_and_vector_proof():
+    class AdvancingFinalityStorage(FakeSubstrate):
+        def __init__(self):
+            super().__init__()
+            self.head_reads = 0
+            self.query_hashes = []
+
+        def get_chain_finalised_head(self):
+            self.head_reads += 1
+            return f"0xfinal-{self.head_reads}"
+
+        def get_block_number(self, block_hash=None):
+            assert block_hash == "0xfinal-1"
+            return 100
+
+        def query(self, module, storage_function, params=None, block_hash=None):
+            self.query_hashes.append(block_hash)
+            return {"Uids": 0, "Weights": [(2, U16_MAX)], "LastUpdate": [99]}[
+                storage_function
+            ]
+
+    substrate = AdvancingFinalityStorage()
+    transport = _real_transport_with(FakeSubtensor(commits=[]), substrate=substrate)
+    assert transport.submitted_weights_at_finalized_head(1, "hk-0").block == 99
+    assert substrate.head_reads == 1
+    assert substrate.query_hashes == ["0xfinal-1"] * 3
+    assert [call["block_hash"] for call in substrate.timelocked_calls] == ["0xfinal-1"]
+
+
+def test_adapter_refuses_legacy_mixed_head_weight_readback():
+    transport = FakeTransport()
+    transport.submitted_weights_at_finalized_head = None
+    adapter = BittensorChainAdapter(
+        BittensorAdapterConfig(validator_hotkey="hk-0", netuid=1), transport=transport
+    )
+    with pytest.raises(ChainStateUnavailable, match="refusing mixed-head"):
+        adapter.submitted_weights("hk-0")
 
 
 def test_real_transport_historical_commitment_uses_exact_sdk_block_kwarg():

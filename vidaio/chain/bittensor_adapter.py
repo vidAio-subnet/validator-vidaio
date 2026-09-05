@@ -46,6 +46,7 @@ from vidaio.chain.adapter import (
     ChainStateUnavailable,
     CommitmentCapacity,
     EpochBoundary,
+    PendingWeightReveal,
     SetWeightsResult,
     SubmittedWeights,
     parse_anchor_digest,
@@ -184,10 +185,10 @@ class _SubtensorTransport(Protocol):
     def submitted_weights_at_finalized_head(
         self, netuid: int, hotkey: str
     ) -> SubmittedWeights | None:
-        """Read one validator's Uids/Weights/LastUpdate at one finalized hash.
+        """Read pending commits and Uids/Weights/LastUpdate at one finalized hash.
 
         ``None`` is the positive, block-pinned answer "registered but no weights";
-        an unregistered hotkey or any unreadable/malformed storage must raise.
+        a pending commit, unregistered hotkey or unreadable storage must raise.
         """
         ...
 
@@ -1262,8 +1263,8 @@ class BittensorChainAdapter:
 
         - pending commit for this hotkey -> raise (UNKNOWN);
         - Weights empty AND hotkey registered -> None (positive 'no weights');
-        - otherwise -> SubmittedWeights(raw u16, block=LastUpdate) — Uids,
-          Weights and LastUpdate are pinned to one GRANDPA-finalized hash; u16 is
+        - otherwise -> SubmittedWeights(raw u16, block=LastUpdate) — pending commits,
+          Uids, Weights and LastUpdate use one GRANDPA-finalized hash; u16 is
           RAW, NOT renormalized (the weight-setter puts both sides on the grid);
         - anything unreadable (RPC failure, unresolvable uid, decode error) ->
           raise ChainStateUnavailable. NEVER None for a failed read: None denies,
@@ -1277,41 +1278,21 @@ class BittensorChainAdapter:
             with self._transport_call() as transport:
                 netuid = self._config.netuid
 
-                if transport.pending_timelocked_commit(netuid, hotkey):
-                    raise ChainStateUnavailable(
-                        f"a weight commit for {hotkey!r} is pending reveal;"
-                        " on-chain Weights still hold the pre-commit vector — UNKNOWN,"
-                        " not DENIED (commit-reveal caveat)"
-                    )
-
-                # Production reads Uids + Weights + LastUpdate at ONE GRANDPA-
-                # finalized hash.  Mixing three best-head reads can manufacture a
-                # vector/block pairing that never coexisted, and trusting the SDK's
-                # submit verdict without this storage proof recreates a production
-                # false-success incident (Aug 2026).  The fallback keeps deliberately-small
-                # third-party/injected transports source-compatible; the real
-                # transport always implements the finalized reader and its startup
-                # contract is pinned below.
                 finalized_reader = getattr(
                     transport, "submitted_weights_at_finalized_head", None
                 )
-                if callable(finalized_reader):
-                    report = finalized_reader(netuid, hotkey)
-                    if report is not None and not isinstance(report, SubmittedWeights):
-                        raise TypeError(
-                            "submitted_weights_at_finalized_head returned "
-                            f"{type(report).__name__}, expected SubmittedWeights or None"
-                        )
-                    return report
-
-                uid = transport.uid_for_hotkey(hotkey, netuid)
-                if uid is None:
+                if not callable(finalized_reader):
                     raise ChainStateUnavailable(
-                        f"hotkey {hotkey!r} is not registered on subnet {netuid}"
+                        "transport cannot read pending commits and weights at one"
+                        " finalized hash; refusing mixed-head readback"
                     )
-
-                raw = transport.query_weights(netuid, uid)
-                last = transport.query_last_update(netuid, uid)
+                report = finalized_reader(netuid, hotkey)
+                if report is not None and not isinstance(report, SubmittedWeights):
+                    raise TypeError(
+                        "submitted_weights_at_finalized_head returned "
+                        f"{type(report).__name__}, expected SubmittedWeights or None"
+                    )
+                return report
         except ChainStateUnavailable:
             raise
         except Exception as exc:  # noqa: BLE001 - a failed read is UNKNOWN, never None
@@ -1320,14 +1301,6 @@ class BittensorChainAdapter:
                 f"cannot read on-chain weights for {hotkey!r}:"
                 f" {type(exc).__name__}: {exc}"
             ) from exc
-
-        if not raw:
-            # Registered, but no positive weight recorded — the one positive
-            # answer that can deny an intent on its own.
-            return None
-        return SubmittedWeights(
-            weights={int(u): float(w) for u, w in raw}, block=int(last)
-        )
 
     def commit_reveal_enabled(self) -> bool:
         """Whether the bound subnet currently uses CRv4 weight commits.
@@ -2900,12 +2873,12 @@ class _RealSubtensorTransport:
     def submitted_weights_at_finalized_head(
         self, netuid: int, hotkey: str
     ) -> SubmittedWeights | None:
-        """Read Uids, Weights and LastUpdate from one GRANDPA-finalized state.
+        """Read pending commits, Uids, Weights and LastUpdate at one finalized hash.
 
         This is the storage proof behind every production weight confirmation.
         Resolving the uid at head and the vector at another head can pair states
         that never coexisted (especially across deregistration/recycling), so all
-        three keys use the exact same finalized block hash.
+        keys, including every pending-commit page, use the same finalized hash.
         """
 
         def _read() -> SubmittedWeights | None:
@@ -2919,6 +2892,12 @@ class _RealSubtensorTransport:
             if block_number is None:
                 raise RuntimeError(
                     f"cannot resolve finalized weight-proof hash {block_hash}"
+                )
+            if self._pending_timelocked_commit_at(netuid, hotkey, block_hash):
+                raise PendingWeightReveal(
+                    f"a weight commit for {hotkey!r} is pending reveal at {block_hash};"
+                    " on-chain Weights still hold the pre-commit vector — UNKNOWN,"
+                    " not DENIED (commit-reveal caveat)"
                 )
 
             uid_raw = self._substrate.query(
@@ -3027,82 +3006,89 @@ class _RealSubtensorTransport:
         Query the current runtime's exact storage shape instead:
         ``TimelockedWeightCommits[netuid_index][epoch]``.  Main mechanism id zero
         has ``netuid_index == netuid`` under both Bittensor 10.5 and current
-        Subtensor.  The best-head hash is captured once and reused for every page,
+        Subtensor.  The finalized hash is captured once and reused for every page,
         so a rollover cannot change the map while it is being scanned.  Any
         malformed key/value or paging failure raises; UNKNOWN must HOLD, never be
         flattened into a false ``False``.
         """
 
         def _read() -> bool:
-            head_hash = self._substrate.get_chain_head()
-            if not isinstance(head_hash, str) or not head_hash.startswith("0x"):
-                raise RuntimeError(
-                    "get_chain_head returned an invalid hash; pending commit state "
-                    "is UNKNOWN"
-                )
-            keypair = getattr(self, "_hotkey", None)
-            hotkey_account_id = None
-            if (
-                keypair is not None
-                and str(getattr(keypair, "ss58_address", hotkey)) == hotkey
-            ):
-                hotkey_account_id = _account_id_bytes_from_keypair(keypair)
-            if hotkey_account_id is None:
-                converter = getattr(
-                    getattr(getattr(self, "_bt", None), "utils", None),
-                    "ss58_address_to_bytes",
-                    None,
-                )
-                if callable(converter):
-                    try:
-                        candidate = bytes(converter(hotkey))
-                    except Exception:  # noqa: BLE001 - decoded string rows may suffice
-                        candidate = b""
-                    if len(candidate) == 32:
-                        hotkey_account_id = candidate
-
-            rows = self._substrate.query_map(
-                module="SubtensorModule",
-                storage_function="TimelockedWeightCommits",
-                params=[int(netuid)],  # mechid=0 => storage index is the netuid
-                block_hash=head_hash,
-                page_size=100,
-                ignore_decoding_errors=False,
+            return self._pending_timelocked_commit_at(
+                netuid, hotkey, self._substrate.get_chain_finalised_head()
             )
-            if rows is None or not hasattr(rows, "__iter__"):
-                raise TypeError(
-                    "TimelockedWeightCommits query_map returned a non-iterable result"
-                )
-            for row in rows:  # iteration (not .records) exhausts every SDK page
-                if not isinstance(row, (tuple, list)) or len(row) != 2:
-                    raise TypeError(
-                        "TimelockedWeightCommits query_map yielded a malformed row"
-                    )
-                epoch_raw, bucket_raw = row
-                epoch_value = getattr(epoch_raw, "value", epoch_raw)
-                if isinstance(epoch_value, bool):
-                    raise TypeError("TimelockedWeightCommits epoch key is boolean")
-                try:
-                    epoch = int(epoch_value)
-                except (TypeError, ValueError) as exc:
-                    raise TypeError(
-                        "TimelockedWeightCommits epoch key is not an integer"
-                    ) from exc
-                if epoch < 0:
-                    raise ValueError(
-                        f"TimelockedWeightCommits epoch key is negative: {epoch}"
-                    )
-                bucket = getattr(bucket_raw, "value", bucket_raw)
-                if _hotkey_in_timelocked_commits(
-                    bucket,
-                    hotkey,
-                    epoch=epoch,
-                    account_id=hotkey_account_id,
-                ):
-                    return True
-            return False
 
         return bool(self._rpc(_read, "timelocked_commits_all_epochs"))
+
+    def _pending_timelocked_commit_at(
+        self, netuid: int, hotkey: str, block_hash: str
+    ) -> bool:
+        """Scan within the caller's serialized RPC and pinned finalized snapshot."""
+        if not isinstance(block_hash, str) or not block_hash.startswith("0x"):
+            raise RuntimeError(
+                "get_chain_finalised_head returned an invalid hash; pending commit "
+                "state is UNKNOWN"
+            )
+        keypair = getattr(self, "_hotkey", None)
+        hotkey_account_id = None
+        if (
+            keypair is not None
+            and str(getattr(keypair, "ss58_address", hotkey)) == hotkey
+        ):
+            hotkey_account_id = _account_id_bytes_from_keypair(keypair)
+        if hotkey_account_id is None:
+            converter = getattr(
+                getattr(getattr(self, "_bt", None), "utils", None),
+                "ss58_address_to_bytes",
+                None,
+            )
+            if callable(converter):
+                try:
+                    candidate = bytes(converter(hotkey))
+                except Exception:
+                    candidate = b""
+                if len(candidate) == 32:
+                    hotkey_account_id = candidate
+
+        rows = self._substrate.query_map(
+            module="SubtensorModule",
+            storage_function="TimelockedWeightCommits",
+            params=[int(netuid)],
+            block_hash=block_hash,
+            page_size=100,
+            ignore_decoding_errors=False,
+        )
+        if rows is None or not hasattr(rows, "__iter__"):
+            raise TypeError(
+                "TimelockedWeightCommits query_map returned a non-iterable result"
+            )
+        for row in rows:
+            if not isinstance(row, (tuple, list)) or len(row) != 2:
+                raise TypeError(
+                    "TimelockedWeightCommits query_map yielded a malformed row"
+                )
+            epoch_raw, bucket_raw = row
+            epoch_value = getattr(epoch_raw, "value", epoch_raw)
+            if isinstance(epoch_value, bool):
+                raise TypeError("TimelockedWeightCommits epoch key is boolean")
+            try:
+                epoch = int(epoch_value)
+            except (TypeError, ValueError) as exc:
+                raise TypeError(
+                    "TimelockedWeightCommits epoch key is not an integer"
+                ) from exc
+            if epoch < 0:
+                raise ValueError(
+                    f"TimelockedWeightCommits epoch key is negative: {epoch}"
+                )
+            bucket = getattr(bucket_raw, "value", bucket_raw)
+            if _hotkey_in_timelocked_commits(
+                bucket,
+                hotkey,
+                epoch=epoch,
+                account_id=hotkey_account_id,
+            ):
+                return True
+        return False
 
     def uid_for_hotkey(self, hotkey: str, netuid: int) -> int | None:
         uid = self._rpc(

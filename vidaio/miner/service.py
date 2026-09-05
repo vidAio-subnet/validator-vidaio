@@ -258,6 +258,7 @@ def build_backends(cfg: MinerConfig) -> dict[str, MinerBackend]:
             "max_output_bytes": cfg.max_output_bytes,
             "request_timeout_seconds": cfg.ffmpeg_timeout_seconds,
             "connect_timeout_seconds": cfg.remote_gpu_connect_timeout_seconds,
+            "allow_cpu_fallback": cfg.remote_gpu_allow_cpu_fallback,
         }
         return {
             "compression": RemoteGpuBackend(track="compression", **shared),

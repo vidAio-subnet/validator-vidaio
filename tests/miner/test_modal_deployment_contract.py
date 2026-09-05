@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import json
 import os
 import runpy
 import subprocess
@@ -273,3 +276,42 @@ def test_remote_asgi_routes_inject_request_instead_of_query_parameter(
             assert "query" not in process.text
 
     asyncio.run(exercise_routes())
+
+    from vidaio.miner import gpu_worker
+    from vidaio.miner.remote_gpu import (
+        CPU_FALLBACK_DEVICE, GPU_ACCELERATED_HEADER, GPU_DEVICE_HEADER,
+        GPU_METADATA_HEADER, GPU_PROTOCOL_HEADER, GPU_PROTOCOL_VERSION,
+    )
+
+    monkeypatch.setenv("VIDAIO_NEXT_GPU_ALLOW_CPU_FALLBACK", "true")
+    observed = []
+
+    def recovered(input_path, output_path, metadata, **kwargs):
+        observed.append(kwargs)
+        output_path.write_bytes(b"test-media")
+        return gpu_worker.TransformResult(
+            output_path, 10, 128, 96, CPU_FALLBACK_DEVICE, 0.0,
+        )
+
+    monkeypatch.setattr(gpu_worker, "transform_media", recovered)
+    fallback_web = namespace["gpu_miner_app"]()
+
+    async def exercise_recovery():
+        payload = {
+            "protocol": GPU_PROTOCOL_VERSION, "track": "upscaling",
+            "solution_variant": "quality", "input_digest": hashlib.sha256(b"input").hexdigest(),
+            "input_size": 5, "deadline_seconds": 30, "params": {"upscale_factor": 2},
+        }
+        bound_headers = {
+            **headers, GPU_PROTOCOL_HEADER: GPU_PROTOCOL_VERSION,
+            GPU_METADATA_HEADER: base64.urlsafe_b64encode(json.dumps(payload).encode()).decode(),
+        }
+        async with AsyncClient(transport=ASGITransport(app=fallback_web), base_url="http://modal.test") as client:
+            response = await client.post("/process", headers=bound_headers, content=b"input")
+        assert response.status_code == 200
+        assert response.content == b"test-media"
+        assert response.headers[GPU_ACCELERATED_HEADER] == "false"
+        assert response.headers[GPU_DEVICE_HEADER] == CPU_FALLBACK_DEVICE
+        assert observed[0]["allow_cpu_fallback"] is True
+
+    asyncio.run(exercise_recovery())

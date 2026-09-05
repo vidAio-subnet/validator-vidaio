@@ -183,6 +183,7 @@ def gpu_miner_app():  # type: ignore[no-untyped-def]
         transform_media,
     )
     from vidaio.miner.remote_gpu import (
+        CPU_FALLBACK_DEVICE,
         GPU_ACCELERATED_HEADER,
         GPU_DEVICE_HEADER,
         GPU_INPUT_DIGEST_HEADER,
@@ -224,6 +225,10 @@ def gpu_miner_app():  # type: ignore[no-untyped-def]
     )
     if min(max_input_bytes, max_output_bytes, max_raw_bytes) < 1:
         raise RuntimeError("GPU worker byte bounds must all be positive")
+    fallback_setting = os.environ.get("VIDAIO_NEXT_GPU_ALLOW_CPU_FALLBACK", "false").lower()
+    if fallback_setting not in {"true", "false"}:
+        raise RuntimeError("VIDAIO_NEXT_GPU_ALLOW_CPU_FALLBACK must be true or false")
+    allow_cpu_fallback = fallback_setting == "true"
 
     registry = CollectorRegistry()
     requests_total = Counter(
@@ -391,6 +396,7 @@ def gpu_miner_app():  # type: ignore[no-untyped-def]
                     bounded_metadata,
                     maximum_raw_bytes=max_raw_bytes,
                     maximum_output_bytes=max_output_bytes,
+                    allow_cpu_fallback=allow_cpu_fallback,
                 )
             except GpuTransformError as exc:
                 requests_total.labels(
@@ -401,6 +407,9 @@ def gpu_miner_app():  # type: ignore[no-untyped-def]
                     track=metadata.track,
                     variant=metadata.solution_variant,
                     error_type=type(exc).__name__,
+                    reason=str(exc).replace(auth_token, "<redacted>")[:2048],
+                    input_digest_prefix=input_digest[:12],
+                    params=metadata.params,
                 )
                 status = 504 if "deadline" in str(exc).lower() else 422
                 raise HTTPException(status_code=status, detail=str(exc)) from exc
@@ -461,6 +470,7 @@ def gpu_miner_app():  # type: ignore[no-untyped-def]
                 output_bytes=output_size,
                 processing_seconds=round(total_seconds, 6),
                 gpu_seconds=round(result.gpu_seconds, 6),
+                device=result.device,
                 input_digest_prefix=input_digest[:12],
                 output_digest_prefix=output_digest[:12],
             )
@@ -470,7 +480,7 @@ def gpu_miner_app():  # type: ignore[no-untyped-def]
                 GPU_OUTPUT_DIGEST_HEADER: output_digest,
                 GPU_TRACK_HEADER: metadata.track,
                 GPU_VARIANT_HEADER: metadata.solution_variant,
-                GPU_ACCELERATED_HEADER: "true",
+                GPU_ACCELERATED_HEADER: "false" if result.device == CPU_FALLBACK_DEVICE else "true",
                 GPU_DEVICE_HEADER: result.device,
             }
             # FileResponse adds Content-Length; the subclass cleanup covers both

@@ -348,6 +348,69 @@ from their own durable contiguous cursor, mirror the epoch log, and:
 
 ### What the logs / metrics / health tell you
 
+CRv4 commitment finalization is not yet an active weight vector. Its durable
+intent remains `commit_reveal_pending`; reconciliation polls every 300 seconds
+between scheduled submissions (`weightsetter.reconciliation_interval_seconds`),
+**only while such a pending row exists**. Ordinary ambiguous or accepted rows alone
+do not enable chain/metagraph polling. Accepted-only publication queues get
+separate bounded retry wakeups without those reads. The production read pins all pending-commit pages,
+`Uids`, `Weights`, and `LastUpdate` to the **same finalized hash**. Only a dated,
+matching vector accepts the intent and updates the success counter/clock once.
+No commit plus old/empty weights is a finality gap, not rejection: a known CR
+intent HOLDS at any age and blocks another submission until confirmed.
+Startup/scheduled reconciliation also covers legacy `pending` rows with NULL
+resolution: a strictly boolean `commit_reveal_enabled() == True` durably labels
+them `commit_reveal_pending` before reading old/empty weights. This is a
+conservative obligation, **not proof the old commitment landed**. Unreadable or
+non-boolean mode leaves resolution NULL, records UNKNOWN, and blocks scheduled
+resubmission/abandonment; a positive False preserves ordinary non-CR recovery.
+Already-labeled CR rows remain protected even if the current mode later changes.
+Legacy adapters without a CR-mode surface keep their ordinary non-CR behavior;
+the production Bittensor adapter always exposes this fail-closed read. Its
+readback now refuses transports lacking the coherent finalized-read surface.
+
+Polling never calls `set_weights` or advances its fixed cadence, but **can WRITE
+publication anchors** after confirmation. A poll drains at most one accepted row,
+only when its publication timeout budget fits before the next submission. All
+publication paths (including the scheduled drain and explicit reconciliation)
+share at most **three starts per rolling attempt interval**, including the first
+attempt, across all intents. Each start makes at most one anchor call. Failures
+back off exponentially from 300 seconds (300, 600, 1,200, ...), capped at the
+attempt interval; scheduled drains cannot bypass the backoff. A timed-out worker
+stays single-flight. When the last pending CR row clears, failed publications
+still get backoff-aware wakeups without scanning the metagraph. An exhausted
+budget or in-flight task adds no publication-only wakeups before the next
+eligible time; the scheduled drain uses the same gate. Here the retry "tempo"
+means the configured submission interval, not a newly queried subnet epoch.
+Migration `0010_publication_retry_budget.sql` durably reserves each publication
+start before launching it, with its intent id, UTC start/completion timestamps,
+failure count and retry deadline. Restart cannot reset either the rolling cap or
+exponential backoff. An interrupted reservation still consumes a start and waits
+at least the publication timeout plus backoff before recovery. Within a running
+process, even a worker outliving that timeout remains single-flight. The
+once-per-intent INFO reveal-wait claim is durable too (a crash between claiming
+and emitting can omit that informational message rather than duplicate it).
+Persistent deadlines assume a sane host UTC clock; submission cadence still uses
+monotonic time. This does not promise exactly-once external anchors after abrupt
+process death with an ambiguous remote outcome, or support overlapping service
+processes beyond the existing writer lock. Accepted rows drain oldest-first;
+a persistently failing old publication can delay younger rows.
+Only `PendingWeightReveal`, raised on a positive finalized pending-commit read,
+uses the once-only INFO path. Generic `ChainStateUnavailable` RPC/storage errors
+still warn on every failed read, including for known CR intents, while HOLDing.
+Unconfirmed CR intents can HOLD
+indefinitely and require investigation rather than automatic abandonment.
+
+The effective `last_success_age` limit clamps `max_last_success_age_seconds`
+(default **8,640 seconds / 2.4 hours**, previously 4.8 hours) between
+`attempt_interval_seconds + reveal_grace_seconds` and
+`2 * attempt_interval_seconds + reveal_grace_seconds`. The defaults are 4,320
+seconds for both the attempt interval and reveal grace; even an oversized health
+override cannot mask more than one missed submission tempo beyond that allowance.
+Set the reveal allowance for the subnet's actual tempo/reveal period plus
+finalization margin; it is a health allowance, not permission to publish early.
+A pending commitment alone never refreshes success health.
+
 - **Structured JSON logs** from every service; every HOLD, refusal and transition
   carries a machine-readable reason. Each audit worker emits a local CRITICAL
   (`DISPUTED`) or WARNING (`INCONCLUSIVE`) before central delivery; the Audit Results API

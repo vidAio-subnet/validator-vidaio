@@ -17,7 +17,8 @@ def test_defaults():
     assert config.version_key == 16
     assert config.metrics_port == 9102
     assert config.publication_enabled is True
-    assert config.max_last_success_age_seconds == 4 * 72 * 60
+    assert config.max_last_success_age_seconds == 2 * 72 * 60
+    assert config.reconciliation_interval_seconds == 300
 
 
 @pytest.mark.parametrize(
@@ -39,3 +40,10 @@ def test_out_of_range_values_rejected(field, value):
 def test_unknown_keys_rejected():
     with pytest.raises(ValidationError):
         WeightSetterConfig(tempo=100)
+
+
+def test_proposed_mainnet_reveal_grace_sets_8820_second_health_floor():
+    config = WeightSetterConfig(reveal_grace_seconds=4500)
+    assert config.max_last_success_age_seconds == 8640
+    assert config.effective_max_last_success_age_seconds == 8820
+    assert config.effective_max_last_success_age_seconds <= 2 * 4320 + 4500

@@ -168,6 +168,32 @@ present; it intentionally does not cold-start and bill Modal on every scrape.
 The explicit preflight below proves the remote GPU live. Existing local miner
 task counters and latency histograms include the remote call.
 
+### Optional bounded CPU recovery
+
+The worker canonicalizes timestamps with the scorer's exact CFR plan. A bounded
+metadata-only encode pass counts the resulting frames and frame rate before
+projecting raw-spool capacity. VFR inputs can legitimately gain duplicate frames
+on this timeline; the original packet/frame count is not the projection basis.
+For raw-spool capacity or decoded-byte-count failures only, it can stream a
+software FFmpeg transform instead. This is disabled by default. Invalid inputs,
+expired deadlines and CUDA runtime faults still fail closed; the fallback does
+not raise byte caps, reset the request deadline, or change the scorer/auditor.
+It preserves the requested codec, geometry and canonical CFR timeline, verifies frame count/rate, and
+cleans partial outputs. Software filters may produce different bytes and scores
+from CUDA; a successful encode is not a quality-gate guarantee.
+
+Upgrade the ingress first and opt in with
+`VIDAIO__MINER__REMOTE_GPU_ALLOW_CPU_FALLBACK=true`. Only then enable
+`VIDAIO_NEXT_GPU_ALLOW_CPU_FALLBACK=true` in the worker runtime environment.
+Responses honestly attest `x-vidaio-gpu-accelerated: false` and
+`x-vidaio-gpu-device: cpu:ffmpeg-fallback`; older or non-opted-in ingresses reject
+them. CUDA execution remains the default and the worker still requires a healthy
+CUDA device at startup. Upstream non-200 responses are logged at the ingress with
+status, track, variant, input-digest prefix and bounded token-redacted detail.
+
+Roll back by disabling worker fallback first, then ingress acceptance. Do not
+redeploy an app or recreate a miner with an in-flight customer/validator task.
+
 ## Per-track GPU -> CPU preflight
 
 First prove the deployed worker live through its authenticated health route.

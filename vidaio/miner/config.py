@@ -110,6 +110,7 @@ class MinerConfig(BaseModel):
     #: Separate connect cap; the request's signed deadline remains the tighter
     #: whole-call bound and is also sent to the worker.
     remote_gpu_connect_timeout_seconds: float = Field(10.0, gt=0, le=60.0)
+    remote_gpu_allow_cpu_fallback: bool = False
     # Compression-track encode (see module docstring).
     compress_crf: int = Field(22, ge=0, le=51)
     compress_preset: str = "medium"

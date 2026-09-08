@@ -127,3 +127,7 @@ Include image digest, role, epoch and redacted HOLD/REFUSE logs, never secrets.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Whitepaper
+
+[Vidaio Whitepaper v1.0 (PDF)](docs/vidaio-whitepaper.pdf) — the mechanism design: measurement, continuous scoring, competitions, anchored epoch logs and independent audit, payout mechanics.

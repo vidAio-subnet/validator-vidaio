@@ -27,10 +27,9 @@ from vidaio.weightsetter.own_audit_ledger import OwnAuditLedger
 
 from tests.weightsetter.weightsetter_support import (
     NOW,
-    AuthorityHarness,
-    make_item,
     make_miner,
 )
+from tests.weightsetter.test_own_audit import AuthorityHarness, make_item
 
 _CYCLE = 0.8
 
@@ -56,10 +55,10 @@ async def _finalize_carry_chain(a: AuthorityHarness, n: int) -> dict[int, object
             )
             prior_accumulate = {1: prior_acc}
         finalized = await a.finalize(
-            # Each epoch folds a NEW cycle at a strictly higher committed key (seq=k-1) — a
+            # Each epoch folds a NEW challenge at a strictly higher committed key (seq=k) — a
             # monotonic per-uid ordering, not a re-fold of an earlier packet (round-22 #1).
             epoch_id=k, close_block=(k + 1) * 3600 - 1,
-            miners=[miner], items=[make_item(1, a.store, seq=k - 1)],
+            miners=[miner], items=[make_item(1, a.store, seq=k)],
             prior_accumulate=prior_accumulate, prior_log_digest=prev_digest,
         )
         logs[k] = finalized.log

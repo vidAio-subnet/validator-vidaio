@@ -74,13 +74,20 @@ def utc_now_iso() -> str:
 
 
 @contextlib.contextmanager
-def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+def transaction(conn: sqlite3.Connection, *, defer_busy: bool = False) -> Iterator[sqlite3.Connection]:
     """One explicit BEGIN IMMEDIATE ... COMMIT (connections are autocommit).
 
     The write lock is taken up-front so a concurrent reader either sees the whole
     batch or none of it; any exception rolls the whole batch back.
     """
-    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+    except sqlite3.OperationalError as exc:
+        if (defer_busy and not conn.in_transaction and
+                getattr(exc, "sqlite_errorcode", None) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)):
+            from vidaio.validator.round_membership import RoundCommitDeferred
+            raise RoundCommitDeferred("round commit waits for the epoch/round writer exclusion") from exc
+        raise
     try:
         yield conn
     except BaseException:
@@ -243,9 +250,13 @@ def commit_round(
     scores: Mapping[int, float],
     decay: float,
     packets: Iterable[Mapping[str, object]] = (),
+    content_rounds: Iterable[Mapping[str, object]] = (),
     availability_observations: Iterable[Mapping[str, object]] = (),
     committed_at: str,
     registry: RegistryUpdate | None = None,
+    read_best_head: Callable[[], int] | None = None,
+    commit_block: int | None = None,
+    challenges: Iterable[Mapping[str, object]] = (),
 ) -> list[int]:
     """Apply ONE round's whole observable state atomically. Returns purged uids.
 
@@ -255,10 +266,37 @@ def commit_round(
 . A round whose transaction never committed leaves committed_at NULL and
     is ignored by evidence readers.
 
-    `registry` is optional so callers that only fold scores (tests, tools) keep
-    working; the round loop always passes it.
+    Production passes ``read_best_head``: it is called only after acquiring the
+    writer exclusion. Pure callers must supply an explicit ``commit_block``;
+    assignment height is never silently substituted for completion height.
     """
-    with transaction(conn):
+    from vidaio.validator.round_membership import RoundCommitDeferred, block_height
+
+    if (read_best_head is None) == (commit_block is None):
+        raise ValueError("supply exactly one fresh head reader or explicit commit_block")
+    contexts = tuple(dict(context) for context in challenges)
+    for context in contexts:
+        if not context.get("challenge_id") or context.get("track") not in KNOWN_TRACKS:
+            raise RoundLedgerError("invalid completed challenge identity/track")
+        block_height(context["anchor_block"])
+        block_height(context["ordering_key"])
+        if context["ordering_key"] < 1:
+            raise RoundLedgerError("completed challenge ordering key must be positive")
+    with transaction(conn, defer_busy=True):
+        pending = conn.execute("SELECT block, committed_at FROM rounds WHERE round_id = ?", (round_id,)).fetchone()
+        if pending is None or pending["committed_at"] is not None:
+            raise RoundLedgerError("round must be an open ledger row before completion")
+        observed = block_height(read_best_head() if read_best_head is not None else commit_block)
+        sealed = conn.execute("SELECT sealed_close FROM round_seal WHERE singleton = 1").fetchone()[0]
+        previous_completion = conn.execute(
+            "SELECT MAX(commit_block) FROM rounds WHERE committed_at IS NOT NULL"
+        ).fetchone()[0]
+        minimum = max([int(pending["block"]), previous_completion or 0]
+                      + [int(c["anchor_block"]) for c in contexts])
+        if observed <= sealed or observed < minimum:
+            raise RoundCommitDeferred(
+                f"observed best head {observed} must exceed sealed close {sealed} and reach completion/dispatch floor {minimum}"
+            )
         purged: list[int] = []
         if registry is not None:
             purged = sync_neurons(conn, registry.neurons, registry.block)
@@ -299,6 +337,21 @@ def commit_round(
                     packet.get("miner_receipt_json"),
                     committed_at,
                 ),
+            )
+        for evidence in content_rounds:
+            from vidaio.scoring.content_duplicate_evidence import parse_content_round
+
+            context = parse_content_round(evidence["round_json"])
+            if (context.digest() != evidence["round_digest"]
+                    or context.challenge_id != evidence["challenge_id"]
+                    or context.item_id != evidence["item_id"]
+                    or context.track != evidence["track"]):
+                raise RoundLedgerError("content round evidence binding differs from canonical payload")
+            conn.execute(
+                "INSERT INTO content_round_evidence (round_id, challenge_id, item_id, track,"
+                " round_json, round_digest, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (round_id, context.challenge_id, context.item_id, context.track,
+                 context.to_json(), context.digest(), committed_at),
             )
         for observation in availability_observations:
             if float(observation.get("score", 0.0)) != 0.0:
@@ -351,9 +404,14 @@ def commit_round(
                         committed_at,
                     ),
                 )
+        for context in contexts:
+            conn.execute(
+                "INSERT INTO round_challenges(round_id,challenge_id,track,anchor_block,ordering_key) VALUES(?,?,?,?,?)",
+                (round_id, context["challenge_id"], context["track"], context["anchor_block"], context["ordering_key"]),
+            )
         cur = conn.execute(
-            "UPDATE rounds SET committed_at = ? WHERE round_id = ? AND committed_at IS NULL",
-            (committed_at, round_id),
+            "UPDATE rounds SET committed_at = ?, commit_block = ? WHERE round_id = ? AND committed_at IS NULL",
+            (committed_at, observed, round_id),
         )
         if cur.rowcount != 1:
             raise RoundLedgerError(
@@ -546,6 +604,7 @@ def snapshot(
                 ip=n.ip,
                 track=track,
                 accumulate_score=row["accumulate_score"],
+                alpha_stake=n.alpha_stake,
             )
         )
     return snapshots
@@ -556,6 +615,8 @@ def snapshot_at(
     chain_neurons: Sequence[ChainNeuron],
     close_block: int,
     now: datetime,
+    *,
+    membership: str = "commit",
 ) -> list[MinerSnapshot]:
     """Return miner state at the newest committed round not after ``close_block``.
 
@@ -568,14 +629,17 @@ def snapshot_at(
     del now  # retained for API parity with snapshot()
     if close_block < 0:
         raise ValueError(f"close_block must be non-negative, got {close_block}")
+    if membership not in {"commit", "assignment"}:
+        raise ValueError("unknown round membership")
+    height = "r.commit_block" if membership == "commit" else "h.block"
 
     snapshots: list[MinerSnapshot] = []
     for neuron in sorted(chain_neurons, key=lambda value: value.uid):
         row = conn.execute(
             "SELECT h.* FROM miner_state_history h"
             " JOIN rounds r ON r.round_id = h.round_id"
-            " WHERE h.uid = ? AND h.block <= ? AND r.committed_at IS NOT NULL"
-            " ORDER BY h.block DESC, h.committed_at DESC, h.round_id DESC LIMIT 1",
+            f" WHERE h.uid = ? AND {height} <= ? AND r.committed_at IS NOT NULL"
+            f" ORDER BY {height} DESC, h.committed_at DESC, h.round_id DESC LIMIT 1",
             (neuron.uid, close_block),
         ).fetchone()
         if row is None or str(row["hotkey"]) != neuron.hotkey:
@@ -591,6 +655,7 @@ def snapshot_at(
                 ip=neuron.ip,
                 track=track,
                 accumulate_score=float(row["accumulate_score"]),
+                alpha_stake=neuron.alpha_stake,
             )
         )
     return snapshots

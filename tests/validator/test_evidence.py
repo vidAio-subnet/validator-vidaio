@@ -286,6 +286,7 @@ def test_commit_round_is_all_or_nothing(conn):
             decay=DECAY,
             packets=[broken_packet],
             committed_at=NOW_ISO,
+            commit_block=1,
         )
 
     assert miner_manager.get_miner(conn, 1)["accumulate_score"] == 0.0
@@ -299,17 +300,17 @@ def test_commit_round_refuses_an_unopened_or_recommitted_round(conn):
     miner_manager.sync_neurons(conn, [mk_neuron(1)], block=1)
     with pytest.raises(miner_manager.RoundLedgerError):
         miner_manager.commit_round(
-            conn, "never-begun", scores={1: 0.8}, decay=DECAY, committed_at=NOW_ISO
+            conn, "never-begun", scores={1: 0.8}, decay=DECAY, committed_at=NOW_ISO, commit_block=1
         )
     assert miner_manager.get_miner(conn, 1)["accumulate_score"] == 0.0
 
     miner_manager.begin_round(conn, "r1", 1, NOW_ISO)
     miner_manager.commit_round(
-        conn, "r1", scores={1: 0.8}, decay=DECAY, committed_at=NOW_ISO
+        conn, "r1", scores={1: 0.8}, decay=DECAY, committed_at=NOW_ISO, commit_block=1
     )
     with pytest.raises(miner_manager.RoundLedgerError):
         miner_manager.commit_round(
-            conn, "r1", scores={1: 0.4}, decay=DECAY, committed_at=NOW_ISO
+            conn, "r1", scores={1: 0.4}, decay=DECAY, committed_at=NOW_ISO, commit_block=1
         )
     assert miner_manager.get_miner(conn, 1)["accumulate_score"] == accumulate(
         0.0, 0.8, DECAY
@@ -327,6 +328,7 @@ def test_packets_until_excludes_future_packet_and_round(conn):
             scores={},
             decay=DECAY,
             committed_at=created_at,
+            commit_block=uid,
             packets=(
                 {
                     "uid": uid,
@@ -350,7 +352,7 @@ def test_packets_until_excludes_future_packet_and_round(conn):
 def test_packets_through_block_and_open_round_probe(conn):
     miner_manager.begin_round(conn, "old", 10, NOW_ISO)
     miner_manager.commit_round(
-        conn, "old", scores={}, decay=DECAY, committed_at=NOW_ISO
+        conn, "old", scores={}, decay=DECAY, committed_at=NOW_ISO, commit_block=10
     )
     miner_manager.begin_round(conn, "future", 20, NOW_ISO)
 
@@ -368,7 +370,7 @@ async def test_crash_mid_round_leaves_no_partial_ewma_visible(
     original = validator._run_track
     seen: list[str] = []
 
-    async def flaky(track, neurons, report, *, round_id, evidence, availability):
+    async def flaky(track, neurons, report, *, round_id, evidence, availability, content_rounds=None, round_contexts=None):
         result = await original(
             track,
             neurons,
@@ -376,6 +378,8 @@ async def test_crash_mid_round_leaves_no_partial_ewma_visible(
             round_id=round_id,
             evidence=evidence,
             availability=availability,
+            content_rounds=content_rounds,
+            round_contexts=round_contexts,
         )
         seen.append(track)
         if len(seen) == 2:
@@ -522,6 +526,7 @@ def test_readers_ignore_uncommitted_rounds(conn):
     miner_manager.commit_round(
         conn,
         "committed",
+        commit_block=1,
         scores={},
         decay=DECAY,
         packets=[
@@ -564,6 +569,7 @@ def test_recent_packet_digests_respects_the_since_cutoff(conn):
         miner_manager.commit_round(
             conn,
             round_id,
+            commit_block=index,
             scores={},
             decay=DECAY,
             packets=[

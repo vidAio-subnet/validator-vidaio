@@ -424,7 +424,7 @@ def test_substituted_track_cannot_dodge_verification_via_skip(tmp_path) -> None:
         uid=1, hotkey="hk1", challenge_id="c1", item_id="i1",
         bundle_digest=b.bundle_digest(), packet_digest=b.score_packet.digest,
         committed_track="compression",  # the COMMITTED track (packet substitutes upscaling)
-        score=0.81, cycle_sequence=0,
+        score=0.81, cycle_sequence=1,
     )
     manifest = build_audit_manifest([item], store=store)
     log = honest_log([folded_miner(1, 0.81)], manifest)

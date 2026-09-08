@@ -44,6 +44,9 @@ class FreshnessChain:
     def current_block(self):
         return self.inner.current_block()
 
+    def best_head_block(self):
+        return self.inner.best_head_block()
+
     def neurons(self):
         return self.inner.neurons()
 

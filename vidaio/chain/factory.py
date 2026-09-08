@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 
 
 BITTENSOR_PRODUCTION_SEAMS = (
+    "best_head_block",
     "anchor_commitment",
     "block_hash",
     "block_time",
@@ -58,6 +59,7 @@ BITTENSOR_PRODUCTION_SEAMS = (
 )
 
 BITTENSOR_READ_ONLY_SEAMS = (
+    "best_head_block",
     "block_hash",
     "block_time",
     "commitment_capacity",
@@ -182,7 +184,7 @@ class ChainConfig(BaseModel):
     hotkey_seed_env: str = "VIDAIO_HOTKEY_SEED"
     #: Fleet convergence fence; bump with the epoch-log schema. Report/test
     #: overlays may explicitly select 0 when no live SDK submission occurs.
-    version_key: int = Field(default=16, ge=0)
+    version_key: int = Field(default=17, ge=0)
     #: Per-attempt connect timeout and short-RPC timeout (daemon-thread bounded).
     connect_timeout_seconds: float = Field(default=30.0, gt=0)
     rpc_timeout_seconds: float = Field(default=30.0, gt=0)

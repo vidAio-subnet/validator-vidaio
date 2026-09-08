@@ -319,7 +319,7 @@ class BittensorAdapterConfig:
     hotkey_seed_env: str = "VIDAIO_HOTKEY_SEED"
     #: Explicit convergence fence. Keep synchronized with EPOCH_LOG_SCHEMA_VERSION;
     #: zero is reserved for dependency-free report/test overlays.
-    version_key: int = 16
+    version_key: int = 17
     connect_timeout_seconds: float = 30.0
     rpc_timeout_seconds: float = 30.0
     #: A successful non-CR SDK response is only the submitter's claim.  Observe
@@ -836,6 +836,27 @@ class BittensorChainAdapter:
     def current_block(self) -> int:
         """Last observed head; 0 until the first successful refresh."""
         return self._block
+
+    def best_head_block(self) -> int:
+        """Fresh bounded read for the round-commit/epoch-selection SQL fence.
+
+        The outer deadline also bounds contention for the transport generation;
+        a timed-out read never returns a cached height to the SQL caller.
+        """
+        def read() -> int:
+            with self._transport_call() as transport:
+                value = transport.current_block()
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError("invalid fresh best-head height")
+            return value
+
+        try:
+            return _run_with_timeout(read, self._config.rpc_timeout_seconds, "best_head_block")
+        except Exception as exc:
+            self._note_raise()
+            raise ChainStateUnavailable(
+                f"cannot read fresh best head: {type(exc).__name__}: {exc}"
+            ) from exc
 
     def finalized_block(self) -> int:
         """Return the latest GRANDPA-finalized height from the live socket.

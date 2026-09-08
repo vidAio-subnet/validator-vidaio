@@ -356,6 +356,7 @@ def _commit_round(conn: sqlite3.Connection, round_id: str, digests, *, at: str) 
     miner_manager.commit_round(
         conn,
         round_id,
+        commit_block=1,
         scores={},
         decay=0.75,
         packets=[

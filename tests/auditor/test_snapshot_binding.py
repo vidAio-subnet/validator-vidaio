@@ -28,7 +28,6 @@ from vidaio.auditor import (
     METAGRAPH_TRACK_MISMATCH,
     SNAPSHOT_UNVERIFIED,
     UNKNOWN_TRACK,
-    Auditor,
     AuditorConfig,
     AuditStatus,
     InMemoryBundleSource,
@@ -36,7 +35,8 @@ from vidaio.auditor import (
     SamplePolicy,
     persist_bundle,
 )
-from vidaio.authority import EpochFinalizer, build_audit_manifest
+from vidaio.authority import build_audit_manifest
+from tests.auditor.fakes import FakeChronologyAuditor as Auditor, FakeEpochFinalizer as EpochFinalizer
 from vidaio.chain.adapter import ChainStateUnavailable
 from vidaio.epoch.log import EpochLog, MinerCensusEntry, weight_vector_digest
 from vidaio.tokenomics import TokenomicsConfig, quantize_u16
@@ -53,6 +53,7 @@ from tests.auditor.fakes import (
     make_packet,
     metagraph_chain,
     scored_item,
+    with_round_membership,
 )
 
 CFG = TokenomicsConfig()
@@ -67,6 +68,7 @@ def _burn_log(miners, manifest, *, epoch_id=100, close_block=CLOSE_BLOCK, prior_
     auditor's DEFENSE-IN-DEPTH track binding on bytes that dodged the finalizer) constructs the
     log directly. The burn vector is the real ``build_weight_vector`` output for these miners
     (an out-of-protocol track takes zero share ⇒ ``{burn_uid: 1.0}``)."""
+    manifest = with_round_membership(manifest, close_block=close_block)
     shares = build_weight_vector(CFG, list(miners), burn_uid=BURN_UID)
     u16 = quantize_u16(shares)
     return EpochLog.model_construct(
@@ -150,15 +152,15 @@ def test_zero_weight_miner_with_tampered_identity_is_disputed(tmp_path) -> None:
         logged = replace(true, **TAMPERED) if uid == 6 else true
         packet = make_packet(
             challenge_id="c1", item_id=f"i{uid}", miner_hotkey=logged.hotkey, score=s,
-            cycle_sequence=0, metrics={"compression_rate": 0.1, "vmaf": 93.0, "final_score": s},
+            cycle_sequence=1, metrics={"compression_rate": 0.1, "vmaf": 93.0, "final_score": s},
         )
         b = make_fake_bundle(
             store, challenge_id="c1", item_id=f"i{uid}", miner_hotkey=logged.hotkey,
-            packet=packet, dispatch_ordering_key=0,
+            packet=packet, dispatch_ordering_key=1,
         )
         persist_bundle(store, b)
         source.add(b)
-        items.append(replace(scored_item(b, uid, score=s, seq=0), hotkey=logged.hotkey))
+        items.append(replace(scored_item(b, uid, score=s, seq=1), hotkey=logged.hotkey))
         log_miners.append(logged)
         true_miners.append(true)
     manifest = build_audit_manifest(items, store=store)
@@ -190,16 +192,16 @@ def _burn_only_epoch(store, source, *, spoof_uid=None, exclude_all=True):
             logged = replace(logged, excluded=True)
         packet = make_packet(
             challenge_id="c1", item_id=f"i{uid}", miner_hotkey=logged.hotkey, score=s,
-            cycle_sequence=0, excluded=exclude_all,
+            cycle_sequence=1, excluded=exclude_all,
             metrics={"compression_rate": 0.1, "vmaf": 93.0, "final_score": s},
         )
         b = make_fake_bundle(
             store, challenge_id="c1", item_id=f"i{uid}", miner_hotkey=logged.hotkey,
-            packet=packet, dispatch_ordering_key=0,
+            packet=packet, dispatch_ordering_key=1,
         )
         persist_bundle(store, b)
         source.add(b)
-        items.append(replace(scored_item(b, uid, score=s, seq=0), hotkey=logged.hotkey,
+        items.append(replace(scored_item(b, uid, score=s, seq=1), hotkey=logged.hotkey,
                              excluded_cycle=exclude_all))
         log_miners.append(logged)
         true_miners.append(true)
@@ -289,15 +291,15 @@ def test_burn_only_tampered_nonpaying_track_is_disputed(tmp_path) -> None:
         # Committed evidence commits the real PAYING track "compression".
         packet = make_packet(
             challenge_id="c1", item_id=f"i{uid}", miner_hotkey=f"hk{uid}", score=s,
-            cycle_sequence=0, metrics={"compression_rate": 0.1, "vmaf": 93.0, "final_score": s},
+            cycle_sequence=1, metrics={"compression_rate": 0.1, "vmaf": 93.0, "final_score": s},
         )
         b = make_fake_bundle(
             store, challenge_id="c1", item_id=f"i{uid}", miner_hotkey=f"hk{uid}",
-            packet=packet, committed_track="compression", dispatch_ordering_key=0,
+            packet=packet, committed_track="compression", dispatch_ordering_key=1,
         )
         persist_bundle(store, b)
         source.add(b)
-        items.append(scored_item(b, uid, score=s, seq=0, committed_track="compression"))
+        items.append(scored_item(b, uid, score=s, seq=1, committed_track="compression"))
         # The LOG snapshot declares a NON-PAYING track (absent from track_weights) ⇒ zero
         # inference share ⇒ the vector collapses to the burn.
         miners.append(folded_miner(uid, score=s, track="unknown"))
@@ -375,12 +377,12 @@ def _unknown_bundle(store, source, uid, score, track):
     """A committed bundle whose committed_track + DAG_REVEAL track + packet track are ``track``."""
     packet = make_packet(
         challenge_id="c1", item_id=f"i{uid}", miner_hotkey=f"hk{uid}", score=score,
-        cycle_sequence=0, track=track,
+        cycle_sequence=1, track=track,
         metrics={"compression_rate": 0.1, "vmaf": 93.0, "final_score": score},
     )
     b = make_fake_bundle(
         store, challenge_id="c1", item_id=f"i{uid}", miner_hotkey=f"hk{uid}",
-        packet=packet, committed_track=track, dispatch_ordering_key=0,
+        packet=packet, committed_track=track, dispatch_ordering_key=1,
     )
     persist_bundle(store, b)
     source.add(b)

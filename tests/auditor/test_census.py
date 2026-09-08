@@ -22,7 +22,6 @@ from dataclasses import replace
 
 from vidaio.audit.store import LocalFsStore
 from vidaio.auditor import (
-    Auditor,
     AuditorConfig,
     AuditStatus,
     BURN_UID_MISMATCH,
@@ -33,7 +32,8 @@ from vidaio.auditor import (
     SamplePolicy,
     persist_bundle,
 )
-from vidaio.authority import EpochFinalizer, build_audit_manifest
+from vidaio.authority import build_audit_manifest
+from tests.auditor.fakes import FakeChronologyAuditor as Auditor, FakeEpochFinalizer as EpochFinalizer
 from vidaio.epoch.log import AuditManifest, EpochLog, MinerCensusEntry, weight_vector_digest
 from vidaio.tokenomics import TokenomicsConfig, quantize_u16
 
@@ -70,15 +70,15 @@ def _honest(store, source, scores: dict[int, float], *, epoch_id: int = 100):
     for uid, sc in scores.items():
         packet = make_packet(
             challenge_id="c1", item_id=f"i{uid}", miner_hotkey=f"hk{uid}", score=sc,
-            cycle_sequence=0, metrics={"compression_rate": 0.1, "vmaf": 93.0, "final_score": sc},
+            cycle_sequence=1, metrics={"compression_rate": 0.1, "vmaf": 93.0, "final_score": sc},
         )
         b = make_fake_bundle(
             store, challenge_id="c1", item_id=f"i{uid}", miner_hotkey=f"hk{uid}",
-            packet=packet, dispatch_ordering_key=0,
+            packet=packet, dispatch_ordering_key=1,
         )
         persist_bundle(store, b)
         source.add(b)
-        items.append(scored_item(b, uid, score=sc, seq=0))
+        items.append(scored_item(b, uid, score=sc, seq=1))
         miners.append(make_miner(uid, fold(0.0, [sc])))
     manifest = build_audit_manifest(items, store=store)
     fin = EpochFinalizer(CFG, scorer_version=SCORER)

@@ -567,11 +567,11 @@ def test_from_json_refuses_burn_uid_seated_as_evidence_identity() -> None:
     data["miners"] = [
         {
             "uid": 7, "hotkey": "hk7", "coldkey": "ck7", "ip": "10.0.0.7",
-            "track": "compression", "accumulate_score": 0.0, "excluded": False,
+            "track": "compression", "accumulate_score": 0.0, "excluded": False, "alpha_stake": 0.0,
         }
     ]
     data["miner_census"] = [
-        {"uid": 7, "hotkey": "hk7", "coldkey": "ck7", "ip": "10.0.0.7"}
+        {"uid": 7, "hotkey": "hk7", "coldkey": "ck7", "ip": "10.0.0.7", "alpha_stake": 0.0}
     ]
     data["audit_manifest"]["fold_cursors"] = {"7": None}
     with pytest.raises(EpochLogInvalid, match="seated as a census miner"):
@@ -580,19 +580,19 @@ def test_from_json_refuses_burn_uid_seated_as_evidence_identity() -> None:
 
 def test_foreign_epoch_log_schema_is_refused() -> None:
     """an internal review: `schema_version` is ENFORCED. Current-shape bytes LABELLED a FOREIGN
-    schema (14, 15, or 17) is refused (EpochLogInvalid), so validators on a different code version
-    cannot converge on a foreign-schema log; only the code's own EPOCH_LOG_SCHEMA_VERSION (16)
+    schema (14, 15, 16, or 18) is refused (EpochLogInvalid), so validators on a different code version
+    cannot converge on a foreign-schema log; only the code's own EPOCH_LOG_SCHEMA_VERSION (17)
     is accepted."""
     import json
 
     valid = json.loads(_valid_log().to_json())
-    assert valid["schema_version"] == EPOCH_LOG_SCHEMA_VERSION == 16
-    for bad in (14, 15, 17):
+    assert valid["schema_version"] == EPOCH_LOG_SCHEMA_VERSION == 17
+    for bad in (14, 15, 16, 18):
         data = dict(valid, schema_version=bad)
         with pytest.raises(EpochLogInvalid, match="schema_version"):
             EpochLog.from_json(json.dumps(data).encode())
-    # the exact code schema (16) still parses cleanly
-    assert EpochLog.from_json(json.dumps(valid).encode()).schema_version == 16
+    # the exact code schema (17) still parses cleanly
+    assert EpochLog.from_json(json.dumps(valid).encode()).schema_version == 17
 
 
 def _v14_competition_input() -> CompetitionInput:

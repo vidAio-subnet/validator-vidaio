@@ -34,6 +34,7 @@ from vidaio.epoch import (
     CycleScore,
     EarningInput,
     EpochLog,
+    RoundCommitInput,
 )
 from vidaio.services.artifact_auth import (
     ArtifactClientAuth,
@@ -205,11 +206,20 @@ def _build_log(
     observation: AvailabilityObservation,
 ) -> tuple[EpochLog, AvailabilityInput]:
     evidence = _input(observation)
+    anchor = observation.attempt.request.metadata.commitment_anchor
+    assert anchor is not None
     manifest = build_audit_manifest(
         [],
         availability_evidence=[evidence],
         availability_verify_fn=_verify,
         prior_fold_cursors={},
+        round_commits=(RoundCommitInput(
+            round_id=f"round-{anchor.dispatch_ordering_key}",
+            challenge_id=evidence.challenge_id,
+            commit_block=150,
+            anchor_block=anchor.block,
+            ordering_key=anchor.dispatch_ordering_key,
+        ),),
     )
     miner = MinerSnapshot(
         uid=observation.attempt.uid,

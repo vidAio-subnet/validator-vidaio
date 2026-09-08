@@ -27,6 +27,15 @@ class MinerSnapshot:
     track: str
     accumulate_score: float
     excluded: bool = False
+    alpha_stake: float = 0.0
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.alpha_stake, bool)
+            or not math.isfinite(self.alpha_stake)
+            or self.alpha_stake < 0.0
+        ):
+            raise ValueError("alpha_stake must be finite and >= 0")
 
 
 @dataclass(frozen=True, slots=True)

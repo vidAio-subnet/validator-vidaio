@@ -119,6 +119,9 @@ class AuditorConfig(BaseModel):
     #: Subnet whose authority commitment account is independently archive-read.
     challenge_anchor_netuid: int = Field(default=85, ge=0)
 
+    #: Operational finding only: slow rounds never become fraud solely due to age.
+    round_commit_max_blocks: int = Field(default=2880, ge=0, strict=True)
+
     #: Needed to validate the one permitted no-miner-receipt case: the strict
     #: validator-attributed zero convention. Production wires the same scoring
     #: section as the worker.

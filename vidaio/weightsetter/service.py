@@ -630,6 +630,7 @@ class WeightSetter(BaseService):
             self.log.exception("startup reconciliation failed; continuing")
         while not self.stopping.is_set():
             started = self._monotonic_clock()
+            self._hold_retry_soon = False
             try:
                 await self.attempt_once()
             except Exception:
@@ -651,9 +652,21 @@ class WeightSetter(BaseService):
                     " unaffected and the accepted intent stays durable"
                 )
             elapsed = max(self._monotonic_clock() - started, 0.0)
-            await self._wait_for_next_attempt(
-                max(self.config.attempt_interval_seconds - elapsed, 0.0)
-            )
+            await self._wait_for_next_attempt(self._next_attempt_delay(elapsed))
+
+    def _next_attempt_delay(self, elapsed: float) -> float:
+        """Full cadence, or the short stale-snapshot retry after a snapshot HOLD.
+
+        Only the shared-snapshot HOLD (authority unreachable / pointer behind the
+        chain) shortens the wait: nothing was written, so retrying soon is free and
+        catches the finalizer's publish minutes after an epoch close instead of one
+        full cadence later. Tamper REFUSEs, chain-state and commit-reveal HOLDs
+        keep the full cadence.
+        """
+        interval = self.config.attempt_interval_seconds
+        if getattr(self, "_hold_retry_soon", False):
+            interval = min(interval, self.config.stale_snapshot_retry_seconds)
+        return max(interval - elapsed, 0.0)
 
     async def _wait_for_next_attempt(self, delay_seconds: float) -> None:
         """Poll CR reads; wake accepted-only retries without metagraph scans."""
@@ -1139,10 +1152,15 @@ class WeightSetter(BaseService):
             return False
         except SharedSnapshotError as exc:
             self.metric_chain_state_skips.labels(reason="snapshot_unavailable").inc()
+            self._hold_retry_soon = True
             self.log.warning(
                 "shared epoch snapshot unavailable — SKIPPING this attempt, nothing"
-                " submitted (HOLD; never fall back to local sampling — that diverges)",
-                extra=log_fields(error=f"{type(exc).__name__}: {exc}"),
+                " submitted (HOLD; never fall back to local sampling — that diverges);"
+                " retrying on the short stale-snapshot cadence",
+                extra=log_fields(
+                    error=f"{type(exc).__name__}: {exc}",
+                    retry_in_seconds=self.config.stale_snapshot_retry_seconds,
+                ),
             )
             return False
         except Exception as exc:

@@ -22,6 +22,7 @@ from vidaio.epoch.log import (
     AuditManifest,
     EpochLog,
     MinerCensusEntry,
+    RoundCommitInput,
 )
 from vidaio.tokenomics import (
     MinerSnapshot,
@@ -40,6 +41,12 @@ DECAY = TokenomicsConfig().ewma_decay
 #: metagraph identities agree with the log by construction).
 CLOSE_BLOCK = 360_000
 
+# Producer-side fixture provenance. Audit-time code never adds or repairs an
+# index: the real archive-only membership verifier sees these saved bytes.
+_BUNDLES: dict[str, AuditBundle] = {}
+_LOGS: dict[str, EpochLog] = {}
+_DISPATCHES: dict[LocalFsStore, dict[str, int]] = {}
+
 
 def fold(prior: float, scores) -> float:
     """EWMA-fold ``scores`` over ``prior`` at the default decay (test convenience)."""
@@ -51,7 +58,7 @@ def fold(prior: float, scores) -> float:
 
 def make_packet(
     *, challenge_id: str, item_id: str, miner_hotkey: str, score: float | None = None,
-    metrics: dict[str, float] | None = None, cycle_sequence: int = 0,
+    metrics: dict[str, float] | None = None, cycle_sequence: int = 1,
     excluded: bool = False, **overrides: Any,
 ) -> bytes:
     metrics = metrics or dict(HONEST_METRICS)
@@ -90,7 +97,7 @@ def make_fake_bundle(
     miner_hotkey: str,
     packet: bytes | None = None,
     committed_track: str = "compression",
-    dispatch_ordering_key: int = 0,
+    dispatch_ordering_key: int | None = None,
 ) -> AuditBundle:
     """Store a full artifact set (arbitrary bytes) and return its bundle.
 
@@ -102,11 +109,16 @@ def make_fake_bundle(
     case (packet sequence reassigned, but the committed dispatch order fixed) can be
     exercised.
     """
-    from vidaio.challenge.commitment import ChallengeCommitment
+    from vidaio.challenge.commitment import ChallengeAnchor, ChallengeCommitment
+
+    orders = _DISPATCHES.setdefault(store, {})
+    if dispatch_ordering_key is None:
+        dispatch_ordering_key = orders.get(challenge_id, max(orders.values(), default=0) + 1)
+    orders[challenge_id] = dispatch_ordering_key
 
     dag_bytes = ChallengeCommitment.preimage_payload(
-        f"asset-{item_id}",
-        sha256_hex(b"dag-" + item_id.encode()),
+        f"asset-{challenge_id}",
+        sha256_hex(b"dag-" + challenge_id.encode()),
         1,
         SCORER,
         committed_track,
@@ -117,11 +129,13 @@ def make_fake_bundle(
             challenge_id=challenge_id, item_id=item_id, miner_hotkey=miner_hotkey,
             cycle_sequence=dispatch_ordering_key,
         )
-    return build_bundle(
+    bundle = build_bundle(
         challenge_id=challenge_id,
         item_id=item_id,
         miner_hotkey=miner_hotkey,
         commitment_hash=sha256_hex(dag_bytes),
+        challenge_anchor=ChallengeAnchor(netuid=85, dispatch_ordering_key=dispatch_ordering_key,
+            commitment_hash=sha256_hex(dag_bytes), block=1),
         stage=LifecycleStage.POST_RETIREMENT,
         challenge_input=store.put(f"in-{item_id}".encode(), ArtifactKind.CHALLENGE_INPUT),
         miner_output=store.put(f"out-{item_id}".encode(), ArtifactKind.MINER_OUTPUT),
@@ -133,6 +147,8 @@ def make_fake_bundle(
         backend_versions=BACKENDS,
         created_at="2026-08-21T12:00:00+00:00",
     )
+    _BUNDLES[bundle.bundle_digest()] = bundle
+    return bundle
 
 
 def refs_for(
@@ -156,7 +172,7 @@ def scored_item(
     uid: int,
     *,
     score: float = HONEST_SCORE,
-    seq: int = 0,
+    seq: int | None = None,
     source: str = "inference",
     committed_track: str = "compression",
 ) -> ScoredItem:
@@ -176,7 +192,7 @@ def scored_item(
         committed_track=committed_track,
         source=source,
         score=score,
-        cycle_sequence=seq,
+        cycle_sequence=bundle.challenge_anchor.dispatch_ordering_key if seq is None else seq,
     )
 
 
@@ -227,7 +243,7 @@ def metagraph_chain(
         _neurons=[
             ChainNeuron(
                 uid=m.uid, hotkey=m.hotkey, coldkey=m.coldkey, ip=m.ip,
-                alpha_stake=0.0, emission=0.0,
+                alpha_stake=m.alpha_stake, emission=0.0,
             )
             for m in miners
         ],
@@ -235,7 +251,18 @@ def metagraph_chain(
     )
 
 
-class MetagraphAuditor(Auditor):
+class FakeChronologyAuditor(Auditor):
+    """Media-free chronology seam, preserving explicit metagraph behavior."""
+
+    def _challenge_chronology(self, bundle, store):
+        if (not self._config.require_external_challenge_anchors
+                and _BUNDLES.get(bundle.bundle_digest()) == bundle):
+            from vidaio.auditor.chronology import ChronologyKind, ChronologyResult
+            return ChronologyResult(ChronologyKind.PASS, detail="media-free fixture chronology seam")
+        return super()._challenge_chronology(bundle, store)
+
+
+class MetagraphAuditor(FakeChronologyAuditor):
     """Test Auditor that auto-wires its close-block metagraph from the audited log's OWN
     honest identities when no explicit ``chain`` is injected.
 
@@ -283,6 +310,7 @@ def rebuild_log(log: EpochLog, **overrides) -> EpochLog:
         created_at=log.created_at,
         prior_log_digest=log.prior_log_digest,
         burn_uid=log.burn_uid,
+        payout_min_alpha_stake=log.payout_min_alpha_stake,
         competition_result=log.competition_result,
         reward_window_state=log.reward_window_state,
         miners=log.miners,
@@ -325,7 +353,7 @@ def honest_log(
     v1 — retention removed — owner decision; an internal review.
     Competition arguments default absent so legacy callers build inference-only logs.)
     """
-    finalizer = EpochFinalizer(TokenomicsConfig(), scorer_version=SCORER)
+    finalizer = FakeEpochFinalizer(TokenomicsConfig(), scorer_version=SCORER)
     return finalizer.build_log(
         epoch_id=epoch_id,
         close_block=close_block,
@@ -334,3 +362,37 @@ def honest_log(
         audit_manifest=manifest,
         now=NOW,
     )
+
+
+def with_round_membership(manifest, *, close_block, prior_log=None):
+    """Attest synthetic completion at close from actual fake-bundle anchors."""
+    entries = {}
+    for refs in manifest.per_uid.values():
+        for ref in refs:
+            if ref.source != "inference" or ref.kind is not AuditFileKind.AUDIT_BUNDLE:
+                continue
+            bundle = _BUNDLES[ref.digest]
+            anchor = bundle.challenge_anchor
+            entries[ref.challenge_id] = RoundCommitInput(
+                round_id=f"fixture-{ref.challenge_id}", challenge_id=ref.challenge_id,
+                commit_block=close_block, anchor_block=anchor.block,
+                ordering_key=anchor.dispatch_ordering_key,
+            )
+    prior_cursor = prior_log.audit_manifest.round_commit_cursor if prior_log else None
+    cursor = max([row.ordering_key for row in entries.values()] +
+        ([] if prior_cursor is None else [prior_cursor]), default=None)
+    return manifest.model_copy(update={"round_commits": tuple(entries.values()),
+        "round_commit_cursor": cursor})
+
+
+class FakeEpochFinalizer(EpochFinalizer):
+    """Fixture producer which explicitly attests canonical v17 membership."""
+
+    def build_log(self, **kwargs):
+        prior = _LOGS.get(kwargs.get("prior_log_digest"))
+        manifest = kwargs["audit_manifest"]
+        kwargs["audit_manifest"] = with_round_membership(
+            manifest, close_block=kwargs["close_block"], prior_log=prior)
+        log = super().build_log(**kwargs)
+        _LOGS[log.log_digest()] = log
+        return log

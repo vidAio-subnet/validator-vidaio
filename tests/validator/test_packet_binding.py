@@ -214,7 +214,7 @@ async def test_the_scored_item_id_is_the_validators_own_id(
     # and it is derived from the DISPATCH, reproducible without any miner input
     assert (
         validator.task_id_for(
-            await validator.challenge_client.next_challenge("compression"), 1
+            validator.challenge_client.item_for("compression"), 1
         )
         == challenge_item_id
     )

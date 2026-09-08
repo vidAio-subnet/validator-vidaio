@@ -33,7 +33,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -43,6 +43,7 @@ from vidaio.audit.canonical import (
     sha256_hex,
 )
 from vidaio.audit.commitments import COMMITMENT_DOMAIN
+from vidaio.audit.store import ArtifactKind, ArtifactRef
 from vidaio.challenge.dag import TRACK_RULES
 from vidaio.tokenomics.quantize import quantize_u16
 from vidaio.tokenomics.state import (
@@ -162,7 +163,8 @@ GIT_SHA1_HEX_PATTERN = r"^[0-9a-f]{40}$"
 #: producers/auditors would disagree on the same close-block metagraph, so this
 #: semantic consensus change receives a lockstep fleet fence despite no JSON field
 #: being added.
-EPOCH_LOG_SCHEMA_VERSION = 16
+# v17: canonical content-component evidence and exact close-block alpha stake.
+EPOCH_LOG_SCHEMA_VERSION = 17
 
 
 class EpochLogInvalid(Exception):
@@ -776,6 +778,58 @@ class CompetitionInput(BaseModel):
         }
 
 
+class ContentRoundInput(BaseModel):
+    """Canonical complete round roster, including singleton and skipped components."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    challenge_id: str
+    item_id: str
+    track: str
+    round_json: str
+    template_bundle: ArtifactRef
+    round_digest: str = Field(pattern=SHA256_HEX_PATTERN)
+
+    @model_validator(mode="after")
+    def _canonical_binding(self) -> "ContentRoundInput":
+        import json
+
+        if self.template_bundle.kind is not ArtifactKind.AUDIT_BUNDLE:
+            raise EpochLogInvalid("content template must reference an audit bundle")
+        raw = self.round_json.encode("utf-8")
+        obj = json.loads(raw)
+        if not isinstance(obj, dict) or canonical_json_bytes(obj) != raw:
+            raise EpochLogInvalid("content round evidence must be canonical JSON")
+        if sha256_hex(raw) != self.round_digest:
+            raise EpochLogInvalid("content round digest does not bind its canonical bytes")
+        for key in ("challenge_id", "item_id", "track"):
+            if obj.get(key) != getattr(self, key):
+                raise EpochLogInvalid(f"content round {key} does not bind its index")
+        return self
+
+    def _sort_key(self) -> tuple[str, str, str]:
+        return self.challenge_id, self.item_id, self.track
+
+
+class RoundCommitInput(BaseModel):
+    """One challenge's membership in an atomically committed ordinary round.
+
+    The epoch anchor authenticates this authority declaration. Existing archived
+    challenge evidence independently binds ``anchor_block`` and ``ordering_key``;
+    the commit observation selects the epoch, never the EWMA order.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    round_id: str = Field(min_length=1, max_length=128)
+    challenge_id: str = Field(min_length=1, max_length=128)
+    commit_block: int = Field(ge=0, strict=True)
+    anchor_block: int = Field(ge=0, strict=True)
+    ordering_key: int = Field(ge=1, strict=True)
+
+    def _sort_key(self) -> tuple[int, str, str]:
+        return self.ordering_key, self.round_id, self.challenge_id
+
+
 class AuditManifest(BaseModel):
     """The audit manifest: which audit files back each weight (the auditor's index).
 
@@ -799,6 +853,15 @@ class AuditManifest(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
+    content_rounds: tuple[ContentRoundInput, ...] = ()
+    #: Unpublished v17 amendment (OWNER D-030): a common canonical index for
+    #: media, availability and all-skip content contexts. Original signed evidence
+    #: and score packets are unchanged.
+    round_commits: tuple[RoundCommitInput, ...] = ()
+    #: Greatest published ordinary challenge dispatch key, including all-skip
+    #: contexts. Retained through carry-only epochs independently of UID cursors.
+    # A v16 predecessor may have cursor zero; new dispatch keys remain positive.
+    round_commit_cursor: int | None = Field(default=None, ge=0, strict=True)
     per_uid: dict[int, tuple[AuditFileRef, ...]] = Field(default_factory=dict)
     baseline_bundles: tuple[AuditFileRef, ...] = ()
     score_packet_merkle_root: str | None = Field(
@@ -815,6 +878,33 @@ class AuditManifest(BaseModel):
     #: committed dispatch ordering key folded in this or any predecessor epoch. Entries remain
     #: as tombstones across idle, exclusion, deregistration, hotkey reuse, and empty epochs.
     fold_cursors: dict[int, int | None] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _round_commit_index(self) -> "AuditManifest":
+        challenges: set[str] = set()
+        ordering_keys: set[int] = set()
+        blocks: dict[str, int] = {}
+        for entry in self.round_commits:
+            if entry.challenge_id in challenges or entry.ordering_key in ordering_keys:
+                raise EpochLogInvalid("round_commits requires unique challenges and dispatch keys")
+            challenges.add(entry.challenge_id)
+            ordering_keys.add(entry.ordering_key)
+            if entry.round_id in blocks and blocks[entry.round_id] != entry.commit_block:
+                raise EpochLogInvalid("one round must have one atomic commit_block")
+            blocks[entry.round_id] = entry.commit_block
+        if ordering_keys and (
+            self.round_commit_cursor is None
+            or self.round_commit_cursor < max(ordering_keys)
+        ):
+            raise EpochLogInvalid("round_commit_cursor must cover every indexed dispatch key")
+        return self
+
+    @model_validator(mode="after")
+    def _unique_content_rounds(self) -> "AuditManifest":
+        keys = [(entry.challenge_id, entry.track) for entry in self.content_rounds]
+        if len(keys) != len(set(keys)):
+            raise EpochLogInvalid("content_rounds must have one complete roster per challenge/track domain")
+        return self
 
     @model_validator(mode="after")
     def _competition_evidence_complete(self) -> "AuditManifest":
@@ -970,6 +1060,12 @@ class AuditManifest(BaseModel):
 
     def _canonical_obj(self) -> dict[str, Any]:
         return {
+            "content_rounds": [entry.model_dump(mode="json") for entry in sorted(self.content_rounds, key=lambda entry: entry._sort_key())],
+            "round_commits": [
+                entry.model_dump(mode="json")
+                for entry in sorted(self.round_commits, key=lambda entry: entry._sort_key())
+            ],
+            "round_commit_cursor": self.round_commit_cursor,
             "per_uid": {
                 str(uid): [
                     r.model_dump(mode="json")
@@ -1026,6 +1122,7 @@ class MinerCensusEntry(BaseModel):
     hotkey: str
     coldkey: str
     ip: str
+    alpha_stake: float = Field(default=0.0, ge=0, allow_inf_nan=False)
 
     @classmethod
     def from_miner(cls, miner: MinerSnapshot) -> "MinerCensusEntry":
@@ -1034,6 +1131,7 @@ class MinerCensusEntry(BaseModel):
             hotkey=miner.hotkey,
             coldkey=miner.coldkey,
             ip=miner.ip,
+            alpha_stake=miner.alpha_stake,
         )
 
 
@@ -1043,6 +1141,7 @@ def _census_obj(entry: MinerCensusEntry) -> dict[str, Any]:
         "hotkey": entry.hotkey,
         "coldkey": entry.coldkey,
         "ip": entry.ip,
+        "alpha_stake": entry.alpha_stake,
     }
 
 
@@ -1059,6 +1158,7 @@ def _miner_obj(m: MinerSnapshot) -> dict[str, Any]:
         "hotkey": m.hotkey,
         "coldkey": m.coldkey,
         "ip": m.ip,
+        "alpha_stake": m.alpha_stake,
         "track": m.track,
         "accumulate_score": m.accumulate_score,
         "excluded": m.excluded,
@@ -1074,6 +1174,7 @@ def _miner_from_obj(d: dict[str, Any]) -> MinerSnapshot:
         track=d["track"],
         accumulate_score=float(d["accumulate_score"]),
         excluded=bool(d["excluded"]),
+        alpha_stake=float(d.get("alpha_stake", 0.0)),
     )
 
 
@@ -1236,7 +1337,11 @@ class EpochLog(BaseModel):
 
     model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
 
-    schema_version: int = EPOCH_LOG_SCHEMA_VERSION
+    _accepted_schema: ClassVar[int] = EPOCH_LOG_SCHEMA_VERSION
+    schema_version: int = Field(default=EPOCH_LOG_SCHEMA_VERSION, strict=True)
+    #: v17 has not been deployed; D-030 makes the rule mandatory in its canonical
+    #: shape. Authenticated v16 history retains the assignment-era rule and bytes.
+    round_membership: Literal["commit/1"] = "commit/1"
     epoch_id: int
     close_block: int
     scorer_version: str
@@ -1262,6 +1367,11 @@ class EpochLog(BaseModel):
     #: cross-subsidising an empty/below-floor pool.  It is also the sole recipient in a
     #: genuinely empty epoch and is always exempt from measurement-evidence coverage.
     burn_uid: int | None = None
+    #: v17 (owner D-025): the inference payout floor the finalizer APPLIED —
+    #: ``tokenomics.payout_min_alpha_stake``, alpha on the hotkey at ``close_block``.
+    #: Archived so an auditor re-derives this vector from the log alone; a later
+    #: policy change never rewrites history. Authenticated v16 history implies 0.
+    payout_min_alpha_stake: float = Field(default=0.0, ge=0, allow_inf_nan=False)
 
     #: Newly completed, packet-score-derived economic result applied at this epoch close.
     competition_result: CompetitionResult | None = None
@@ -1289,7 +1399,7 @@ class EpochLog(BaseModel):
         # DIFFERENT code version must NOT converge on a foreign-schema log). A log whose
         # schema_version is not the code's own EPOCH_LOG_SCHEMA_VERSION is refused at the shared
         # construction / from_json boundary (EpochLogInvalid) — the mixed-version fence.
-        if self.schema_version != EPOCH_LOG_SCHEMA_VERSION:
+        if self.schema_version != self._accepted_schema:
             raise EpochLogInvalid(
                 f"schema_version {self.schema_version} != EPOCH_LOG_SCHEMA_VERSION "
                 f"{EPOCH_LOG_SCHEMA_VERSION} — a log on a foreign schema is refused (a "
@@ -1471,6 +1581,9 @@ class EpochLog(BaseModel):
                 )
             economic_identity = (miner.hotkey, miner.coldkey, miner.ip)
             census_identity = (entry.hotkey, entry.coldkey, entry.ip)
+            if self.schema_version >= 17:
+                economic_identity += (miner.alpha_stake,)
+                census_identity += (entry.alpha_stake,)
             if economic_identity != census_identity:
                 raise EpochLogInvalid(
                     f"economic miner uid {miner.uid} identity {economic_identity!r} does not "
@@ -1683,6 +1796,7 @@ class EpochLog(BaseModel):
         """The plain-python canonical shape; every collection in a deterministic order."""
         return {
             "schema_version": self.schema_version,
+            "round_membership": self.round_membership,
             "epoch_id": self.epoch_id,
             "close_block": self.close_block,
             "scorer_version": self.scorer_version,
@@ -1690,6 +1804,7 @@ class EpochLog(BaseModel):
             "prior_log_digest": self.prior_log_digest,
             "gap_epochs": list(self.gap_epochs),
             "burn_uid": self.burn_uid,
+            "payout_min_alpha_stake": self.payout_min_alpha_stake,
             "competition_result": _competition_obj(self.competition_result),
             "reward_window_state": _reward_window_obj(self.reward_window_state),
             "miner_census": [
@@ -1715,23 +1830,50 @@ class EpochLog(BaseModel):
         return sha256_hex(self.to_json())
 
     @classmethod
+    def from_history_json(
+        cls, data: bytes | str, *, expected_digest: str, expected_epoch_id: int
+    ) -> "EpochLog":
+        """Decode authenticated history only; never a current submission parser.
+
+        The caller supplies the independently anchored/indexed predecessor digest.
+        V16 keeps its version, original canonical bytes and therefore log digest.
+        """
+        import json
+
+        raw = data.encode("utf-8") if isinstance(data, str) else data
+        if sha256_hex(raw) != expected_digest:
+            raise EpochLogInvalid("historical log does not match the authenticated digest")
+        obj = json.loads(raw)
+        schema = obj.get("schema_version")
+        if type(schema) is not int or schema not in (16, 17):
+            raise EpochLogInvalid("only authenticated schema-v16/v17 history is supported")
+        reader = _HistoryEpochLogV16 if schema == 16 else EpochLog
+        log = reader.from_json(raw)
+        if log.epoch_id != expected_epoch_id or log.to_json() != raw:
+            raise EpochLogInvalid("historical log epoch/canonical bytes do not match")
+        return log
+
+    @classmethod
     def from_json(cls, data: bytes | str) -> "EpochLog":
         """Reconstruct an `EpochLog` from canonical bytes (re-runs every invariant)."""
         import json
 
         obj = json.loads(data)
-        schema_version = int(obj["schema_version"])
+        schema_version = obj["schema_version"]
+        if type(schema_version) is not int:
+            raise EpochLogInvalid("schema_version must be an integer")
         # Reject a legacy shape before indexing required fields. Otherwise a genuine
         # older payload fails with a raw KeyError rather than the domain-level
         # mixed-schema fence, which makes callers unable to distinguish incompatibility from a
         # corrupt object-store read.
-        if schema_version != EPOCH_LOG_SCHEMA_VERSION:
+        if schema_version != cls._accepted_schema:
             raise EpochLogInvalid(
                 f"schema_version {schema_version} != EPOCH_LOG_SCHEMA_VERSION "
                 f"{EPOCH_LOG_SCHEMA_VERSION} — a log on a foreign schema is refused"
             )
         manifest_obj = obj["audit_manifest"]
         canonical_top_fields = {
+            *( ("payout_min_alpha_stake", "round_membership") if schema_version == 17 else () ),
             "schema_version",
             "epoch_id",
             "close_block",
@@ -1750,6 +1892,7 @@ class EpochLog(BaseModel):
             "audit_manifest",
         }
         canonical_manifest_fields = {
+            *( ("content_rounds", "round_commits", "round_commit_cursor") if schema_version == 17 else () ),
             "per_uid",
             "baseline_bundles",
             "score_packet_merkle_root",
@@ -1898,6 +2041,21 @@ class EpochLog(BaseModel):
                 f"schema-v{EPOCH_LOG_SCHEMA_VERSION} epoch log is missing required "
                 "canonical field(s): " + ", ".join(missing_current)
             )
+        if schema_version == 17:
+            if obj.get("round_membership") != "commit/1":
+                raise EpochLogInvalid("schema-v17 requires round_membership=commit/1")
+            if not {"round_commits", "round_commit_cursor"}.issubset(manifest_obj):
+                raise EpochLogInvalid("schema-v17 manifest requires round_commits and round_commit_cursor")
+            for entry in (*obj["miner_census"], *obj["miners"]):
+                if "alpha_stake" not in entry:
+                    raise EpochLogInvalid("schema-v17 census and miners require alpha_stake")
+            if "content_rounds" not in obj["audit_manifest"]:
+                raise EpochLogInvalid("schema-v17 manifest requires content_rounds")
+            floor = obj.get("payout_min_alpha_stake")
+            if type(floor) not in (int, float) or isinstance(floor, bool):
+                raise EpochLogInvalid(
+                    "schema-v17 epoch log requires a numeric payout_min_alpha_stake"
+                )
         competition_input = (
             None
             if competition_input_obj is None
@@ -1988,6 +2146,9 @@ class EpochLog(BaseModel):
             )
         )
         manifest = AuditManifest(
+            content_rounds=tuple(ContentRoundInput(**entry) for entry in manifest_obj.get("content_rounds", [])),
+            round_commits=tuple(RoundCommitInput(**entry) for entry in manifest_obj.get("round_commits", [])),
+            round_commit_cursor=manifest_obj.get("round_commit_cursor"),
             per_uid={
                 int(uid): tuple(AuditFileRef(**r) for r in refs)
                 for uid, refs in manifest_obj.get("per_uid", {}).items()
@@ -2037,6 +2198,7 @@ class EpochLog(BaseModel):
         )
         return cls(
             schema_version=schema_version,
+            round_membership=obj.get("round_membership", "assignment/1"),
             epoch_id=int(obj["epoch_id"]),
             close_block=int(obj["close_block"]),
             scorer_version=obj["scorer_version"],
@@ -2044,6 +2206,7 @@ class EpochLog(BaseModel):
             prior_log_digest=obj.get("prior_log_digest"),
             gap_epochs=tuple(int(g) for g in obj["gap_epochs"]),
             burn_uid=obj["burn_uid"],
+            payout_min_alpha_stake=float(obj.get("payout_min_alpha_stake", 0.0)),
             competition_result=_competition_from_obj(obj["competition_result"]),
             reward_window_state=_reward_window_from_obj(obj["reward_window_state"]),
             miner_census=tuple(
@@ -2057,6 +2220,25 @@ class EpochLog(BaseModel):
             weight_vector_digest=obj["weight_vector_digest"],
             audit_manifest=manifest,
         )
+
+
+class _HistoryEpochLogV16(EpochLog):
+    """Internal, authenticated history view; never accepted by current readers."""
+
+    _accepted_schema: ClassVar[int] = 16
+    schema_version: Literal[16] = 16
+    round_membership: Literal["assignment/1"] = "assignment/1"
+
+    def _canonical_obj(self) -> dict[str, Any]:
+        obj = super()._canonical_obj()
+        obj["audit_manifest"].pop("content_rounds")
+        obj["audit_manifest"].pop("round_commits")
+        obj["audit_manifest"].pop("round_commit_cursor")
+        obj.pop("round_membership")
+        obj.pop("payout_min_alpha_stake")
+        for entry in (*obj["miner_census"], *obj["miners"]):
+            entry.pop("alpha_stake")
+        return obj
 
 
 @dataclass(frozen=True, slots=True)

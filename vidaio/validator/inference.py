@@ -114,7 +114,7 @@ import random
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Protocol, runtime_checkable
 
@@ -134,6 +134,11 @@ from vidaio.scoring import (
     duplicate_order_key,
     mint_duplicate_packet,
 )
+from vidaio.scoring.content_duplicate_evidence import (
+    ContentMember, ContentRoundEvidence, ContentDuplicateWitness, InvalidContentEvidence,
+    derive_edges, derive_components, validate_member_packet, mint_content_duplicate_packet,
+)
+from vidaio.scoring.result import config_digest
 from vidaio.services.artifact_auth import (
     ArtifactClientAuth,
     CallableHotkeySigner,
@@ -1594,7 +1599,9 @@ class InferenceValidator(BaseService):
 
             scores: dict[int, float] = {}
             evidence: list[PacketEvidence] = []
+            content_rounds: list[dict[str, object]] = []
             availability: list[AvailabilityObservation] = []
+            round_contexts: list[dict[str, object]] = []
             for track in sorted(by_track):
                 track_scores = await self._run_track(
                     track,
@@ -1603,6 +1610,8 @@ class InferenceValidator(BaseService):
                     round_id=round_id,
                     evidence=evidence,
                     availability=availability,
+                    content_rounds=content_rounds,
+                    round_contexts=round_contexts,
                 )
                 scores.update(track_scores)
 
@@ -1610,20 +1619,25 @@ class InferenceValidator(BaseService):
             # + warrant tracks + EWMA folds + packet evidence + the ledger stamp
             # that makes this round readable. Nothing this round did is
             # observable before this call, and everything is after it.
-            purged = miner_manager.commit_round(
-                self.conn,
-                round_id,
-                scores=scores,
-                decay=self.tokenomics.ewma_decay,
-                packets=[e.as_row() for e in evidence],
-                availability_observations=[o.as_row() for o in availability],
-                committed_at=miner_manager.utc_now_iso(),
-                registry=miner_manager.RegistryUpdate(
-                    neurons=tuple(miners),
-                    block=block,
-                    tracks=probed,
-                ),
-            )
+            from vidaio.validator.round_membership import RoundCommitDeferred
+
+            while True:
+                try:
+                    purged = miner_manager.commit_round(
+                        self.conn, round_id, scores=scores, decay=self.tokenomics.ewma_decay,
+                        packets=[e.as_row() for e in evidence], content_rounds=content_rounds,
+                        availability_observations=[o.as_row() for o in availability],
+                        committed_at=miner_manager.utc_now_iso(),
+                        registry=miner_manager.RegistryUpdate(neurons=tuple(miners), block=block, tracks=probed),
+                        read_best_head=self.chain.best_head_block, challenges=round_contexts,
+                    )
+                    break
+                except RoundCommitDeferred as exc:
+                    self.log.info("round commit waits for fresh head beyond sealed close",
+                                  extra=log_fields(round_id=round_id, detail=str(exc)))
+                    # The failed attempt released SQL before this await. Cancellation
+                    # still drains fetched challenges through the existing finally.
+                    await asyncio.sleep(1.0)
             self.m_packets_persisted.inc(len(evidence))
             if purged:
                 self.log.info(
@@ -1668,6 +1682,8 @@ class InferenceValidator(BaseService):
         round_id: str,
         evidence: list[PacketEvidence],
         availability: list[AvailabilityObservation],
+        content_rounds: list[dict[str, object]] | None = None,
+        round_contexts: list[dict[str, object]] | None = None,
     ) -> dict[int, float]:
         cfg = self.config
         try:
@@ -1699,6 +1715,10 @@ class InferenceValidator(BaseService):
             fetched_at=miner_manager.utc_now_iso(),
             owner=self._last_fetch_owner,
         )
+        if round_contexts is not None and item.commitment_anchor is not None:
+            round_contexts.append({"challenge_id": challenge_id, "track": track,
+                                   "anchor_block": item.commitment_anchor.block,
+                                   "ordering_key": item.commitment_anchor.dispatch_ordering_key})
 
         scores: dict[int, float] = {}
         responses = await self._dispatch_all(
@@ -1729,6 +1749,7 @@ class InferenceValidator(BaseService):
                     else None
                 ),
             )
+            measured_packets: list[PacketEvidence] = []
             for uid, response in dedup.kept:
                 packet = await self._score_one(
                     item,
@@ -1740,9 +1761,17 @@ class InferenceValidator(BaseService):
                 )
                 if packet is None:
                     continue  # scoring infra failed / packet unbound — miner unharmed
+                measured_packets.append(packet)
+            # Group only after the worker measured and archived the exact survivors.
+            # Nothing from this track enters the round fold before content decisions.
+            measured_packets, content_round = self._apply_content_duplicates(item, measured_packets, report)
+            if content_round is not None and content_rounds is not None:
+                content_rounds.append(content_round)
+            for packet in measured_packets:
                 evidence.append(packet)
-                scores[uid] = packet.score
-                report.scored[uid] = packet.score
+                scores[packet.uid] = packet.score
+                if report.zeroed.get(packet.uid) != "duplicate_content":
+                    report.scored[packet.uid] = packet.score
                 self.m_scored.labels(track=track).inc()
             # A duplicate changes EWMA only after both real signed outputs have
             # been archived into a canonical witness. Any missing/invalid evidence
@@ -2908,6 +2937,129 @@ class InferenceValidator(BaseService):
             reference_original_ref=reference_original_ref,
             miner_receipt_json=loser_receipt.model_dump_json(),
         )
+
+    def _apply_content_duplicates(
+        self, item: ChallengeItem, packets: list[PacketEvidence], report: RoundReport,
+    ) -> tuple[list[PacketEvidence], dict[str, object] | None]:
+        """Stage component decisions; an unavailable component has no EWMA input."""
+        measured: dict[int, tuple[PacketEvidence, ItemScore]] = {}
+        members: list[ContentMember] = []
+        skipped: set[int] = set()
+
+        def skip(uids: tuple[int, ...] | list[int], error: Exception) -> None:
+            for uid in uids:
+                skipped.add(uid)
+                report.non_punitive_skips[uid] = "duplicate_evidence_unavailable"
+                report.scored.pop(uid, None)
+                report.zeroed.pop(uid, None)
+                if uid not in report.scoring_failed:
+                    report.scoring_failed.append(uid)
+            self.log.error("content component lacked independently auditable evidence; skipped non-punitively",
+                extra=log_fields(uids=list(uids), error=str(error), violation="DUPLICATE_EVIDENCE_UNAVAILABLE"))
+
+        for evidence in packets:
+            packet = ItemScore.model_validate_json(evidence.packet_json)
+            # Legacy/fake passthrough and measured gate failures retain their old path.
+            # A gate-passed ZERO (e.g. VMAF below threshold) has nothing to win and must
+            # never become the salted minimum that zeroes positive same-content outputs.
+            if (not packet.gate_passed or packet.score <= 0.0
+                    or getattr(packet, "canonical_content_digest", None) is None):
+                continue
+            try:
+                if (self._store is None or item.commitment_anchor is None
+                        or not evidence.audit_ref or not evidence.miner_output_ref
+                        or not evidence.challenge_input_ref or not evidence.reference_original_ref
+                        or not evidence.miner_receipt_json or packet.breakdown is None):
+                    raise InvalidContentEvidence("content candidate has incomplete archived signed measurement")
+                member = ContentMember(
+                    uid=evidence.uid, hotkey=evidence.miner_hotkey,
+                    score_packet=ArtifactRef(kind=ArtifactKind.SCORE_PACKET, digest=evidence.packet_digest,
+                        byte_size=len(evidence.packet_json.encode()), backend_key=evidence.audit_ref),
+                    output=ArtifactRef.model_validate_json(evidence.miner_output_ref),
+                    receipt=MinerArtifactReceipt.model_validate_json(evidence.miner_receipt_json),
+                    canonical_content_digest=packet.canonical_content_digest,
+                    content_fingerprint=packet.content_fingerprint, encoded_size=packet.encoded_size,
+                    canonicalization_plan_digest=packet.canonicalization_plan_digest)
+                members.append(member)
+                measured[evidence.uid] = (evidence, packet)
+            except (ValueError, TypeError) as exc:
+                skip([evidence.uid], exc)
+        if not members:
+            return [packet for packet in packets if packet.uid not in skipped], None
+        roster = tuple(sorted(members, key=lambda member: member.uid))
+        first = measured[roster[0].uid][0]
+        try:
+            context = ContentRoundEvidence(
+                challenge_id=item.dispatch.challenge_id, item_id=item.dispatch.challenge_id, track=item.track,
+                commitment_anchor=item.commitment_anchor,
+                challenge_input=ArtifactRef.model_validate_json(first.challenge_input_ref),
+                reference_original=ArtifactRef.model_validate_json(first.reference_original_ref),
+                committed_scorer_version=self.scoring_pin(), scoring_config_digest=config_digest(self.scoring),
+                roster=roster, edges=derive_edges(roster), components=derive_components(roster))
+        except (ValueError, TypeError) as exc:
+            skip([member.uid for member in roster], exc)
+            return [packet for packet in packets if packet.uid not in skipped], None
+
+        skipped_components: set[tuple[int, ...]] = set()
+        for component in context.components:
+            try:
+                for uid in component:
+                    member = next(member for member in roster if member.uid == uid)
+                    evidence, packet = measured[uid]
+                    validate_member_packet(member, packet, context)
+                    if (ArtifactRef.model_validate_json(evidence.challenge_input_ref) != context.challenge_input
+                            or ArtifactRef.model_validate_json(evidence.reference_original_ref) != context.reference_original):
+                        raise InvalidContentEvidence("component mixes archived challenge/reference inputs")
+                    for ref in (member.score_packet, member.output, context.challenge_input, context.reference_original):
+                        if not self._store.exists(ref):
+                            raise AuditStoreFailure("component references unavailable archived media or packet")
+            except Exception as exc:
+                skipped_components.add(component)
+                skip(component, exc)
+
+        # An archive failure changes the round's skipped-component set. Re-mint
+        # survivors against that final set; earlier blobs are harmless uncommitted
+        # artifacts. At most one additional component is removed per repeat.
+        replacements: dict[int, PacketEvidence] = {}
+        while True:
+            context = ContentRoundEvidence.model_validate({**context.model_dump(),
+                "skipped_components": tuple(sorted(skipped_components))})
+            replacements = {}
+            failed: set[tuple[int, ...]] = set()
+            for component in context.components:
+                if component in skipped_components or len(component) == 1:
+                    continue
+                winner = context.winner(component)
+                staged: dict[int, PacketEvidence] = {}
+                try:
+                    for uid in component:
+                        if uid == winner:
+                            continue
+                        witness = ContentDuplicateWitness(round_evidence=context, component_uids=component,
+                            winner_uid=winner, loser_uid=uid)
+                        packet = mint_content_duplicate_packet(witness=witness, config=self.scoring)
+                        packet_json = packet.to_json()
+                        digest = hashlib.sha256(packet_json.encode()).hexdigest()
+                        audit_ref = self._archive_packet(packet_json, digest)
+                        if audit_ref is None:
+                            raise AuditStoreFailure("content zeros require archived witness packets")
+                        staged[uid] = replace(measured[uid][0], packet_digest=digest, packet_json=packet_json,
+                            scorer_version=packet.scorer_version or "", score=0.0, audit_ref=audit_ref)
+                except Exception as exc:
+                    failed.add(component)
+                    skip(component, exc)
+                else:
+                    replacements.update(staged)
+            if not failed:
+                break
+            skipped_components.update(failed)
+        for uid in replacements:
+            report.zeroed[uid] = "duplicate_content"
+            self.log.warning("same-content duplicate zero backed by complete signed component evidence",
+                extra=log_fields(uid=uid, track=item.track, reason="duplicate_content", round_digest=context.digest()))
+        result = [replacements.get(packet.uid, packet) for packet in packets if packet.uid not in skipped]
+        return result, {"challenge_id": context.challenge_id, "item_id": context.item_id, "track": context.track,
+                        "round_json": context.to_json(), "round_digest": context.digest()}
 
     async def _score_one(
         self,

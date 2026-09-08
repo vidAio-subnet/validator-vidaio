@@ -50,6 +50,8 @@ from vidaio.epoch.log import (
     CompetitionInput,
     CycleScore,
     EarningInput,
+    ContentRoundInput,
+    RoundCommitInput,
     EpochLog,
     EpochLogInvalid,
     MinerCensusEntry,
@@ -343,6 +345,9 @@ def build_audit_manifest(
     commitment_source: ChallengeCommitmentSource | None = None,
     competition_input: CompetitionInput | None = None,
     availability_evidence: Iterable[AvailabilityInput] = (),
+    content_rounds: Iterable[ContentRoundInput] = (),
+    round_commits: Iterable[RoundCommitInput] = (),
+    prior_round_commit_cursor: int | None = None,
     availability_verify_fn: Callable[[str, bytes, str], bool] | None = None,
 ) -> AuditManifest:
     """Assemble the `AuditManifest` from the epoch's scored items (the contract).
@@ -398,6 +403,19 @@ def build_audit_manifest(
     packet/bundle worklists and never enters the inference EWMA fold.
     """
     items = list(scored_items)
+    content_rows = list(content_rounds)
+    commit_rows = tuple(sorted(round_commits, key=lambda row: row.ordering_key))
+    if (prior_round_commit_cursor is not None and commit_rows
+            and commit_rows[0].ordering_key <= prior_round_commit_cursor):
+        raise AuditFileMissingError(
+            "newly committed challenge is at/below the published round cursor"
+        )
+    round_commit_cursor = (
+        commit_rows[-1].ordering_key if commit_rows else prior_round_commit_cursor
+    )
+    if store is not None:
+        for row in content_rows:
+            _require_stored(store, row.template_bundle.digest, ArtifactKind.AUDIT_BUNDLE, row.item_id)
     availability_rows = list(availability_evidence)
     priors = dict(prior_accumulate or {})
     fold_cursors = {
@@ -545,6 +563,9 @@ def build_audit_manifest(
         baseline_bundles=tuple(baseline),
         score_packet_merkle_root=root,
         earning_inputs=earning_inputs,
+        content_rounds=tuple(sorted(content_rows, key=lambda row: (row.challenge_id, row.item_id, row.track))),
+        round_commits=commit_rows,
+        round_commit_cursor=round_commit_cursor,
         availability_inputs=tuple(availability_inputs),
         competition_input=competition_input,
         competition_bundles={
@@ -732,6 +753,8 @@ class EpochFinalizer:
             prior_log_digest=prior_log_digest,
             gap_epochs=gap_epochs,
             burn_uid=log_burn_uid,
+            # D-025: archive the exact floor this vector was built with.
+            payout_min_alpha_stake=self._config.payout_min_alpha_stake,
             competition_result=competition_result,
             reward_window_state=reward_window_state,
             miners=tuple(snapshots),

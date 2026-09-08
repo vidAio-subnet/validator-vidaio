@@ -135,10 +135,12 @@ def build_competition_commitment(commitment: CompetitionCommitment) -> Commitmen
 
 
 def reward_parameter_digest(config: TokenomicsConfig) -> str:
-    """SHA-256 of the exact canonical tokenomics policy used for emissions."""
+    """Preserve the competition policy commitment across inference-only additions."""
     policy = {
         "domain": REWARD_POLICY_DOMAIN,
-        "tokenomics": config.model_dump(mode="json"),
+        # This new eligibility knob must not invalidate already-anchored
+        # competition policies. Preserve every existing policy field verbatim.
+        "tokenomics": config.model_dump(mode="json", exclude={"payout_min_alpha_stake"}),
         "competition_podium_split": list(PODIUM_SPLIT),
     }
     return sha256_hex(canonical_json_bytes(policy))

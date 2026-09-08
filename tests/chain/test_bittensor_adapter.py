@@ -387,6 +387,61 @@ def make_adapter(transport: FakeTransport, **cfg_overrides) -> BittensorChainAda
     return BittensorChainAdapter(cfg, transport=transport)
 
 
+def test_best_head_read_is_fresh_and_does_not_substitute_cached_or_finalized():
+    transport = FakeTransport(block=120, finalized_block=110)
+    adapter = make_adapter(transport)
+    adapter._block = 90
+    assert adapter.best_head_block() == 120
+    transport._block = 121
+    assert adapter.best_head_block() == 121
+    assert adapter.current_block() == 90
+    assert adapter.finalized_block() == 110
+
+
+@pytest.mark.parametrize("bad", [True, -1, 1.5, "120"])
+def test_best_head_read_refuses_invalid_height_without_cache_fallback(bad):
+    transport = FakeTransport()
+    transport.current_block = lambda: bad
+    adapter = make_adapter(transport)
+    adapter._block = 100
+    with pytest.raises(ChainStateUnavailable):
+        adapter.best_head_block()
+
+
+def test_best_head_read_deadline_includes_transport_lock_contention():
+    import time
+    adapter = make_adapter(FakeTransport(), rpc_timeout_seconds=.05)
+    generation = adapter._main_generation
+    generation.lock.acquire()
+    started = time.monotonic()
+    try:
+        with pytest.raises(ChainStateUnavailable):
+            adapter.best_head_block()
+        assert time.monotonic() - started < .5
+    finally:
+        generation.lock.release()
+
+
+def test_report_best_head_is_live_bounded_and_failure_never_uses_cache():
+    import httpx
+    from vidaio.chain.client import HttpChainAdapter
+    replies = iter([{"block": 120}, {"block": 121}, {"block": True}])
+    timeouts = []
+    def handle(request):
+        timeouts.append(request.extensions["timeout"])
+        assert request.url.path == "/neurons"
+        return httpx.Response(200, json=next(replies))
+    with httpx.Client(transport=httpx.MockTransport(handle)) as client:
+        adapter = HttpChainAdapter("http://report.invalid", validator_hotkey="test", client=client, timeout_seconds=.2)
+        adapter._block = 90
+        assert adapter.best_head_block() == 120
+        assert adapter.best_head_block() == 121
+        assert adapter.current_block() == 90
+        with pytest.raises(ChainStateUnavailable):
+            adapter.best_head_block()
+        assert all(item["read"] == .2 for item in timeouts)
+
+
 def make_read_only_adapter(
     transport: FakeTransport,
     *,
@@ -886,7 +941,7 @@ def test_bittensor_adapter_config_rejects_invalid_startup_values(kwargs, match):
 
 def test_bittensor_adapter_default_version_fences_current_schema():
     config = BittensorAdapterConfig(validator_hotkey="hk")
-    assert config.version_key == 16
+    assert config.version_key == 17
     assert config.weight_readback_attempts == 5
     assert config.weight_readback_delay_seconds == 12.0
 

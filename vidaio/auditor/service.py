@@ -118,6 +118,7 @@ from vidaio.auditor.report import (
     FOLD_CURSOR_MISMATCH,
     METAGRAPH_DEDUP_MISMATCH,
     METAGRAPH_TRACK_MISMATCH,
+    PAYOUT_POLICY_MISMATCH,
     PREDECESSOR_CHAIN_BROKEN,
     PREDECESSOR_UNVERIFIED,
     REWARD_WINDOW_MISMATCH,
@@ -512,6 +513,11 @@ class Auditor:
         genesis unit tests (production ALWAYS passes the loop-derived value).
         """
         snapshot_digest = epoch_log.log_digest()
+        historical_view = getattr(recomputer, "for_epoch_log", None)
+        if callable(historical_view):
+            recomputer = historical_view(epoch_log)
+        from vidaio.auditor.content_cache import EpochRecomputer
+        recomputer = EpochRecomputer(recomputer)
         try:
             sampled = sample_items(
                 epoch_log.audit_manifest,
@@ -692,8 +698,14 @@ class Auditor:
         # The snapshot-binding + time-base + census + burn verdicts ride the same earning-verdicts
         # channel (a FAIL disputes, a SKIP holds INCONCLUSIVE) — never counted toward the media
         # coverage floor (their sources are not media strata).
+        from vidaio.auditor.content_evidence import audit_manifest_rounds
+        content_verdicts = audit_manifest_rounds(self, epoch_log, store, recomputer, prior_log=prior_log)
+        from vidaio.auditor.round_membership import audit_round_membership
+        round_verdicts = audit_round_membership(self, epoch_log, store, prior_log, is_genesis)
         earning_verdicts = (
             earning_verdicts
+            + content_verdicts
+            + round_verdicts
             + snapshot_verdicts
             + timebase_verdicts
             + census_verdicts
@@ -1736,8 +1748,17 @@ class Auditor:
                 ),
             )
         try:
+            # D-025: re-derive with the floor the log ARCHIVED, never this auditor's
+            # current policy — a later policy change must not rewrite history. The
+            # optional floor did not exist in authenticated v16 history (implies 0).
+            archived_floor = (
+                0.0 if log.schema_version == 16 else float(log.payout_min_alpha_stake)
+            )
+            tokenomics = self._config.tokenomics.model_copy(
+                update={"payout_min_alpha_stake": archived_floor}
+            )
             shares = build_weight_vector(
-                self._config.tokenomics,
+                tokenomics,
                 miners,
                 burn_uid=log.burn_uid,
                 reward_state=reward_window_state,
@@ -1755,6 +1776,22 @@ class Auditor:
             )
 
         if recomputed_u16 == log.weight_u16 and recomputed_digest == published:
+            policy_floor = float(self._config.tokenomics.payout_min_alpha_stake)
+            if log.schema_version >= 17 and archived_floor != policy_floor:
+                # The vector follows from the ARCHIVED floor, so the log is honest;
+                # the divergence from this auditor's configured policy is surfaced as
+                # a report-only note (decision 24), never as a fault.
+                return WeightVerdict(
+                    recomputed_weight_vector_digest=recomputed_digest,
+                    published_weight_vector_digest=published,
+                    verdict=ItemVerdictKind.PASS,
+                    code=PAYOUT_POLICY_MISMATCH,
+                    detail=(
+                        f"the log archived payout_min_alpha_stake={archived_floor!r} but "
+                        f"this auditor's configured policy is {policy_floor!r}; the vector "
+                        "follows from the archived floor (report-only)"
+                    ),
+                )
             return WeightVerdict(
                 recomputed_weight_vector_digest=recomputed_digest,
                 published_weight_vector_digest=published,
@@ -1928,6 +1965,7 @@ class Auditor:
                 neuron.hotkey != m.hotkey
                 or neuron.coldkey != m.coldkey
                 or neuron.ip != m.ip
+                or (log.schema_version >= 17 and neuron.alpha_stake != m.alpha_stake)
             ):
                 verdicts.append(
                     self._snapshot_verdict(
@@ -1935,7 +1973,7 @@ class Auditor:
                         m,
                         ItemVerdictKind.FAIL,
                         IDENTITY_MISMATCH,
-                        f"zero-weight uid {m.uid} identity does not match the close-block "
+                        f"zero-weight uid {m.uid} identity or alpha stake does not match the close-block "
                         f"metagraph: log states {m.hotkey!r}/{m.coldkey!r}/{m.ip!r} but the "
                         f"metagraph binds {neuron.hotkey!r}/{neuron.coldkey!r}/{neuron.ip!r} — "
                         "a tampered identity seated in the census",
@@ -2027,13 +2065,14 @@ class Auditor:
             neuron.hotkey != miner.hotkey
             or neuron.coldkey != miner.coldkey
             or neuron.ip != miner.ip
+            or (log.schema_version >= 17 and neuron.alpha_stake != miner.alpha_stake)
         ):
             return self._snapshot_verdict(
                 uid,
                 miner,
                 ItemVerdictKind.FAIL,
                 IDENTITY_MISMATCH,
-                f"uid {uid} identity does not match the close-block metagraph: log states "
+                f"uid {uid} identity or alpha stake does not match the close-block metagraph: log states "
                 f"hotkey/coldkey/ip {miner.hotkey!r}/{miner.coldkey!r}/{miner.ip!r} but the "
                 f"metagraph binds {neuron.hotkey!r}/{neuron.coldkey!r}/{neuron.ip!r} — a "
                 "relabelled/tampered identity",
@@ -2354,6 +2393,9 @@ class Auditor:
                 entry = census_by_uid[uid]
                 expected_identity = (neuron.hotkey, neuron.coldkey, neuron.ip)
                 actual_identity = (entry.hotkey, entry.coldkey, entry.ip)
+                if log.schema_version >= 17:
+                    expected_identity += (neuron.alpha_stake,)
+                    actual_identity += (entry.alpha_stake,)
                 if actual_identity != expected_identity:
                     verdicts.append(
                         self._census_verdict(
@@ -2378,7 +2420,7 @@ class Auditor:
                 miner.hotkey,
                 miner.coldkey,
                 miner.ip,
-            ):
+            ) or (log.schema_version >= 17 and entry.alpha_stake != miner.alpha_stake):
                 verdicts.append(
                     ItemVerdict(
                         source=_CENSUS_SOURCE,
@@ -2588,13 +2630,20 @@ class Auditor:
         be True.
         """
         identity_miners = [
-            replace(m, coldkey=metagraph[m.uid].coldkey, ip=metagraph[m.uid].ip)
+            replace(
+                m, coldkey=metagraph[m.uid].coldkey, ip=metagraph[m.uid].ip,
+                alpha_stake=metagraph[m.uid].alpha_stake,
+            )
             for m in log.miners
             if m.uid in metagraph
         ]
         return dedup_excluded(
             identity_miners,
             minimum_payout_score=self._config.tokenomics.minimum_payout_score,
+            # D-025: the ARCHIVED floor, not this auditor's current policy.
+            payout_min_alpha_stake=(
+                float(log.payout_min_alpha_stake) if log.schema_version >= 17 else 0.0
+            ),
         )
 
     def _reconstructed_miners(self, log: EpochLog, metagraph: dict[int, object] | None):
@@ -2615,7 +2664,7 @@ class Auditor:
             for uid, w in log.weight_shares.items()
             if w > 0.0 and uid != log.burn_uid
         }
-        if not nonzero:
+        if not nonzero and not log.miners:
             # burn/empty epoch: nothing snapshot-derivable. The raw log miners are returned
             # here, but this reconstruct is only reached from `_weight_verdict` AFTER the
             # per-uid snapshot verdicts carry no FAIL/SKIP
@@ -2642,6 +2691,7 @@ class Auditor:
                     hotkey=neuron.hotkey,
                     coldkey=neuron.coldkey,
                     ip=neuron.ip,
+                    alpha_stake=neuron.alpha_stake,
                     track=track,
                     excluded=m.uid in excluded_set,
                 )

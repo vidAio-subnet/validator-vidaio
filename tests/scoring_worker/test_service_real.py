@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+from pathlib import Path
 import shutil
 
 import httpx
@@ -117,7 +118,68 @@ async def test_compression_scores_end_to_end(
     assert item.canonicalization_plan_digest is not None
     assert len(item.canonicalization_plan_digest) == 64
     assert item.content_digest == clips.candidate_digest
+    assert item.canonical_content_digest is not None
+    assert len(item.canonical_content_digest) == 64
+    assert item.content_fingerprint is not None and len(item.content_fingerprint) == 32
+    assert item.encoded_size == Path(clips.candidate).stat().st_size
     assert item.skips == []
+
+
+async def test_content_evidence_uses_the_exact_stream_the_metrics_measure(
+    client, clips, backends, monkeypatch
+) -> None:
+    from vidaio.scoring_worker import service
+    observed = {}
+    metric_candidates = []
+    original_content = service.compute_canonical_content
+    original_metric = backends.vmaf_primary.compute
+
+    def content(path, **kwargs):
+        result = original_content(path, **kwargs)
+        observed.update(path=str(path), digest=sha256_file(path), result=result)
+        return result
+
+    def metric(reference, candidate, **kwargs):
+        metric_candidates.append((candidate, sha256_file(candidate)))
+        return original_metric(reference, candidate, **kwargs)
+
+    monkeypatch.setattr(service, "compute_canonical_content", content)
+    monkeypatch.setattr(backends.vmaf_primary, "compute", metric)
+    response = await client.post("/score", json=_compression_body(clips))
+    assert response.status_code == 200, response.text
+    item = ItemScore.from_json(response.json()["item_score_json"])
+    assert metric_candidates
+    assert all(pair == (observed["path"], observed["digest"]) for pair in metric_candidates)
+    assert item.canonical_content_digest == observed["digest"]
+    assert item.content_fingerprint == observed["result"].content_fingerprint
+    assert item.content_digest == clips.candidate_digest
+
+
+@pytest.mark.parametrize("failure,error,status", [
+    ("unavailable", "canonical_content_unavailable", 422),
+    ("cancelled", "scoring_timeout", 504),
+    ("wrong_count", "canonical_content_frame_count_mismatch", 422),
+])
+async def test_content_failure_or_cancellation_never_fabricates_packet(
+    client, clips, monkeypatch, failure, error, status
+) -> None:
+    from dataclasses import replace
+    from vidaio.scoring_worker import service
+    original = service.compute_canonical_content
+
+    def broken(path, **kwargs):
+        if failure == "cancelled":
+            raise service.ContentFingerprintCancelled("test cancellation")
+        if failure == "unavailable":
+            raise service.ContentFingerprintUnavailable("test unavailable")
+        result = original(path, **kwargs)
+        return replace(result, frame_count=result.frame_count + 1)
+
+    monkeypatch.setattr(service, "compute_canonical_content", broken)
+    response = await client.post("/score", json=_compression_body(clips))
+    assert response.status_code == status
+    assert response.json()["detail"]["error"] == error
+    assert "item_score_json" not in response.json()
 
 
 async def test_same_pair_scores_byte_identical_packets(

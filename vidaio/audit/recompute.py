@@ -52,9 +52,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import MappingProxyType
-from typing import Any, Callable, Literal, Mapping, Protocol, Sequence
+from typing import Any, Callable, Annotated, Literal, Mapping, Protocol, Sequence
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from vidaio.audit.bundle import AuditBundle, LifecycleStage
 from vidaio.audit.commitments import verify_merkle_proof
@@ -142,6 +142,7 @@ BACKEND_VERSION_MISMATCH = "BACKEND_VERSION_MISMATCH"
 MERKLE_EXCLUSION = "MERKLE_EXCLUSION"
 RECOMPUTE_ERROR = "RECOMPUTE_ERROR"
 METRIC_SET_MISMATCH = "METRIC_SET_MISMATCH"
+CONTENT_EVIDENCE_MISMATCH = "CONTENT_EVIDENCE_MISMATCH"
 SCORE_MISMATCH = "SCORE_MISMATCH"
 IDENTITY_MISMATCH = "IDENTITY_MISMATCH"
 PACKET_INCONSISTENT = "PACKET_INCONSISTENT"
@@ -178,6 +179,7 @@ _ORCHESTRATOR_ZERO_PREFIX = f"{_ORCHESTRATOR_ZERO_SCORER_NAME}+"
 _DUPLICATE_SCORER_NAME = "validator-exact-duplicate/1"
 _DUPLICATE_SCORER_PREFIX = f"{_DUPLICATE_SCORER_NAME}+"
 _DUPLICATE_WITNESS_METRIC = "duplicate_witness"
+_CONTENT_SCORER_PREFIX = "validator-content-duplicate/1+"
 _DUPLICATE_SELECTION_RULE = "anchor_hash_hotkey/1"
 _DUPLICATE_EVIDENCE_RULE = "sha256_exact_output/1"
 _DUPLICATE_ORDER_DOMAIN = b"vidaio:duplicate-order:anchor-hash-hotkey:v1\x00"
@@ -247,6 +249,17 @@ class ScorePacketShape(BaseModel):
     skips: list[Any] = Field(default_factory=list)
     miner_hotkey: str | None
     content_digest: str | None
+    canonical_content_digest: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    content_fingerprint: tuple[Annotated[str, Field(pattern=r"^[0-9a-f]{16}$")], ...] | None = Field(default=None, min_length=32, max_length=32)
+    encoded_size: int | None = Field(default=None, strict=True, gt=0)
+
+    @model_validator(mode="after")
+    def _complete_content_evidence(self) -> "ScorePacketShape":
+        fields = (self.canonical_content_digest, self.content_fingerprint, self.encoded_size)
+        if any(value is not None for value in fields) and not all(value is not None for value in fields):
+            raise ValueError("canonical content evidence must be complete or absent")
+        return self
+
     breakdown: dict[str, Any] | None
     metrics: dict[str, Any]
     scorer_version: str
@@ -295,6 +308,11 @@ class DuplicateWitnessShape(BaseModel):
 class RecomputedScore(BaseModel):
     model_config = ConfigDict(frozen=True)
 
+    canonical_content_digest: str | None = None
+    content_fingerprint: tuple[str, ...] | None = None
+    encoded_size: int | None = None
+    canonicalization_plan_digest: str | None = None
+
     metrics: dict[str, float]
     scorer_version: str
     #: Versions detected by the independent scoring composition.  The verifier
@@ -311,6 +329,10 @@ class RecomputedScore(BaseModel):
     #: weakening any metric comparison or accepting non-numeric gate flips.
     violations: list[dict[str, Any]] = Field(default_factory=list)
     breakdown: dict[str, Any] | None = None
+
+
+class ContentRecomputeUnavailable(Exception):
+    """Complete content evidence cannot be fetched; never a fabricated result."""
 
 
 class ScoreRecomputer(Protocol):
@@ -559,6 +581,28 @@ def _expected_packet_scorer(
     worker, track, and locked scoring config. Legacy validator-zero packets are
     refused because authority-observed failures are not reproducible proof.
     """
+    if packet.scorer_version.startswith(_CONTENT_SCORER_PREFIX):
+        try:
+            raw = packet.metrics["content_duplicate_witness"]
+            witness = json.loads(raw)
+            if canonical_json_bytes(witness).decode() != raw:
+                raise ValueError("content witness is not canonical JSON")
+            context = witness["round_evidence"]
+            if (context["committed_scorer_version"] != committed_scorer
+                    or context["track"] != committed_track or packet.track != committed_track
+                    or context["scoring_config_digest"] != packet.scoring_config_digest):
+                raise ValueError("content witness differs from committed scorer/track/config")
+            digest = sha256_hex(canonical_json_bytes({
+                "convention": "validator-content-duplicate/1",
+                "committed_scorer_version": committed_scorer, "track": committed_track,
+                "scoring_config_digest": packet.scoring_config_digest,
+                "evidence_rule": "canonical_content/1", "selection_rule": "anchor_hash_hotkey/1",
+                "fingerprint_version": 1, "hamming_max": 6,
+                "matched_frames_min": 30, "size_delta_percent": 1,
+            }))
+            return f"{_CONTENT_SCORER_PREFIX}{digest[:12]}", ""
+        except (KeyError, TypeError, ValueError) as exc:
+            return None, f"invalid content witness identity: {exc}"
     if packet.scorer_version.startswith(_DUPLICATE_SCORER_PREFIX):
         witness, error = _parse_duplicate_witness(packet)
         if witness is None:
@@ -1613,7 +1657,12 @@ def verify_bundle(
         for k in (ArtifactKind.CHALLENGE_INPUT, ArtifactKind.MINER_OUTPUT)
     ):
         try:
-            if packet.scorer_version.startswith(_DUPLICATE_SCORER_PREFIX):
+            if packet.scorer_version.startswith(_CONTENT_SCORER_PREFIX):
+                content_recompute = getattr(recomputer, "recompute_content_duplicate", None)
+                if not callable(content_recompute):
+                    raise RuntimeError("content zero requires complete archived-component recomputation")
+                recomputed = content_recompute(bundle, artifacts, store)
+            elif packet.scorer_version.startswith(_DUPLICATE_SCORER_PREFIX):
                 duplicate_recompute = getattr(recomputer, "recompute_duplicate", None)
                 if (
                     not callable(duplicate_recompute)
@@ -1647,11 +1696,23 @@ def verify_bundle(
                 )
             else:
                 recomputed = recomputer.recompute(bundle, artifacts)
+        except ContentRecomputeUnavailable as exc:
+            checks.append(_skip("score_recompute", ARTIFACT_MISSING, str(exc), strict=strict))
         except Exception as exc:  # scoring engine failure is itself a finding
             checks.append(
                 _fail("score_recompute", RECOMPUTE_ERROR, f"recompute failed: {exc}")
             )
         else:
+            # Schema-v17 canonical identity is exact, never a metric tolerance.
+            # Legacy packets retain absent fields and their historical semantics.
+            if packet.canonical_content_digest is not None or recomputed.canonical_content_digest is not None:
+                fields = ("canonical_content_digest", "content_fingerprint", "encoded_size", "canonicalization_plan_digest")
+                changed = [name for name in fields if getattr(packet, name) != getattr(recomputed, name)]
+                checks.append(
+                    _fail("canonical_content_recompute", CONTENT_EVIDENCE_MISMATCH,
+                          "archived media canonical evidence differs: " + ", ".join(changed))
+                    if changed else _ok("canonical_content_recompute")
+                )
             # 7a. The recomputer must be running the pinned scorer version.
             if recomputed.scorer_version == bundle.scorer_version:
                 checks.append(_ok("scorer_version_recompute"))

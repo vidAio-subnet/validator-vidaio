@@ -9,7 +9,7 @@ committed bytes does that — and the auditor only re-runs it when it SAMPLES me
 positive compression rate the auditor RE-RUNS libvmaf on the committed media and a substituted
 score cannot survive it.
 
-This is the end-to-end substantiation of an internal review (see also
+This authenticated schema-v16 fixture is the end-to-end substantiation of an internal review (see also
 ``the development-tree stack runner``'s ``run_auditor`` rationale): a compression epoch whose committed
 packet's score has been substituted to a value that is *self-consistent* — the earning re-fold,
 the weight vector and every structural binding all re-derive CLEAN — is NONETHELESS caught as
@@ -34,13 +34,19 @@ from tests.auditor.conftest import (
 )
 from tests.auditor.fakes import (
     BURN_UID,
+    CLOSE_BLOCK,
     NOW,
+    SCORER,
     MetagraphAuditor,
     folded_miner,
-    honest_log,
     scored_item,
 )
 from vidaio.audit.recompute import SCORE_MISMATCH
+from vidaio.audit.canonical import canonical_json_bytes, sha256_hex
+from vidaio.epoch import EpochLog
+from vidaio.authority import EpochFinalizer
+from vidaio.tokenomics import TokenomicsConfig
+from vidaio.scoring_worker.service import historical_v16_scorer_version
 from vidaio.audit.store import LocalFsStore
 from vidaio.auditor import (
     AuditorConfig,
@@ -108,8 +114,28 @@ def _committed_epoch(store: LocalFsStore, clips, item, *, packet_bytes: bytes, c
 
     item_scored = scored_item(bundle, _UID, score=cycle_score, seq=0)
     manifest = build_audit_manifest([item_scored], store=store)  # merkle root + inclusion proof
-    log = honest_log([folded_miner(_UID, cycle_score)], manifest)
+    # This real-media fixture deliberately exercises authenticated v16 history;
+    # it does not use the current17 synthetic bundle/membership fixture producer.
+    log = EpochFinalizer(TokenomicsConfig(), scorer_version=SCORER).build_log(
+        epoch_id=100, close_block=CLOSE_BLOCK,
+        snapshots=(folded_miner(_UID, cycle_score),), burn_uid=BURN_UID,
+        audit_manifest=manifest, now=NOW,
+    )
 
+    # This test preserves the authenticated schema16 sampling contract. Current17
+    # additionally requires an independently checked complete content-round index.
+    legacy = json.loads(log.to_json())
+    legacy["schema_version"] = 16
+    legacy.pop("payout_min_alpha_stake")  # v17-only archived floor (D-025); v16 implies 0
+    legacy.pop("round_membership")
+    legacy["audit_manifest"].pop("content_rounds")
+    legacy["audit_manifest"].pop("round_commits")
+    legacy["audit_manifest"].pop("round_commit_cursor")
+    for entry in legacy["miners"] + legacy["miner_census"]:
+        entry.pop("alpha_stake")
+    archived = canonical_json_bytes(legacy)
+    log = EpochLog.from_history_json(archived, expected_digest=sha256_hex(archived),
+                                    expected_epoch_id=log.epoch_id)
     source = InMemoryBundleSource()
     source.add(bundle)
     return log, source
@@ -152,6 +178,10 @@ def test_honest_compression_score_is_clean_at_rate_positive(
         worker_config, real_media_backends, scoring_config, clips,
         challenge_id=_CHALLENGE_ID, item_id=_ITEM_ID, miner_hotkey=_HOTKEY,
     )
+    item = item.model_copy(update={
+        "scorer_version": historical_v16_scorer_version(worker_config, scoring_config),
+        "canonical_content_digest": None, "content_fingerprint": None, "encoded_size": None,
+    })
     assert item.gate_passed and item.score > 0.0  # a real, non-zero committed score
     log, source = _committed_epoch(
         store, clips, item,
@@ -179,6 +209,10 @@ def test_substituted_compression_score_is_caught_at_rate_positive(
         worker_config, real_media_backends, scoring_config, clips,
         challenge_id=_CHALLENGE_ID, item_id=_ITEM_ID, miner_hotkey=_HOTKEY,
     )
+    item = item.model_copy(update={
+        "scorer_version": historical_v16_scorer_version(worker_config, scoring_config),
+        "canonical_content_digest": None, "content_fingerprint": None, "encoded_size": None,
+    })
     substituted = 0.99
     assert abs(item.score - substituted) > 0.1  # the real libvmaf score is nowhere near 0.99
     log, source = _committed_epoch(
@@ -209,6 +243,10 @@ def test_the_same_substitution_is_unreachable_at_rate_zero(
         worker_config, real_media_backends, scoring_config, clips,
         challenge_id=_CHALLENGE_ID, item_id=_ITEM_ID, miner_hotkey=_HOTKEY,
     )
+    item = item.model_copy(update={
+        "scorer_version": historical_v16_scorer_version(worker_config, scoring_config),
+        "canonical_content_digest": None, "content_fingerprint": None, "encoded_size": None,
+    })
     substituted = 0.99
     log, source = _committed_epoch(
         store, clips, item,

@@ -241,6 +241,62 @@ tolerance is unchanged.
 
 ## Operations
 
+### Round completion and epoch membership (schema v17)
+
+An in-flight inference round does not delay an epoch. Its media scores,
+availability observations and distinct-content round evidence enter the first
+published epoch satisfying `prior_published_close < commit_block <= close_block`.
+The lower bound is the last published close, including across declared outage
+gaps. Dispatch order and the per-UID fold cursors remain unchanged.
+
+The round writer reads a fresh chain best head inside a short SQL transaction
+and records that observed `commit_block` atomically with all round evidence. The
+finalizer captures its inputs under the same SQL exclusion and persists a
+`sealed_close` watermark. A later writer waits until a real observed head exceeds
+that watermark; it never invents a height. SQL completion can precede reference
+release, so incomplete or unreleased audit evidence still HOLDs publication.
+The existing `require_open_anchor_window` and declared-gap rules still apply.
+
+The authenticated log declares `round_membership: "commit/1"`. Its canonical
+`audit_manifest.round_commits` binds each represented challenge to its round,
+commit block, dispatch anchor and ordering key. `round_commit_cursor` preserves
+the greatest represented dispatch key through empty epochs, including rounds
+whose content evidence produces no payable score. Both auditor modes verify the
+index against archived media, signed availability observations and content
+templates; they enforce `anchor_block <= commit_block <= close_block`, the strict
+prior-close boundary and no repeated dispatch. Commit height is an authenticated
+authority declaration, not independent proof of the physical SQL commit instant.
+`ROUND_COMMIT_STALE` reports a delay above `auditor.round_commit_max_blocks`
+(default 2880 blocks) without making a slow round DISPUTED.
+
+The auditor's exact-once unit is the archived, chain-anchored challenge/dispatch
+key. A later epoch may reuse a `round_id` spelling for a different anchored
+challenge; an all-skip context omitted together with its entire index entry is
+not discoverable from the log alone. There is no independently committed SQL
+round roster or external dispatched-roster oracle here. Neither a grouping-label
+change nor omission of a truly all-skip context moves value: labels cause no
+fold, zero or skip, and every payable fold must bind to an anchored challenge
+that passes the cumulative cursor and strict window checks exactly once.
+
+Payable state starts from the previous published same-hotkey carry, then folds
+only admitted cycles in dispatch order using the unchanged EWMA. A new or returning
+identity starts at zero; an old private accumulator cannot revive expired work.
+Out-of-window old-identity evidence remains archived without a punitive zero.
+Competition, byte-duplicate and distinct-content matching rules are unchanged.
+
+**v16 to v17 upgrade gate:** quiesce dispatch, let every in-flight round commit,
+and let the v16 finalizer publish the completed work before migrating. Verify
+that no in-flight or committed-but-unpublished legacy rounds remain using the
+read-only cutover preflight described in the project design record. Migration
+0012 backfills already-published historical rows with their assignment block;
+it cannot recover an unpublished round's real historical commit height. Selected
+legacy evidence without commit context therefore HOLDs with the instruction to
+quiesce and finalize on v16 first. The affected row IDs appear in the diagnostic;
+`vidaio_authority_finalizer_legacy_context_hold` becomes 1 and health is degraded
+without exhausting the finalizer's fatal retry budget. Coordinate the schema17
+authority and reader release; authenticated v16 history retains its original bytes and assignment-era
+membership. The cutover itself requires a separate owner GO.
+
 ### Outage gaps (epoch schema v16) — what a spine does after downtime
 
 An epoch can only be anchored inside its un-grindable window (`close_block + K`

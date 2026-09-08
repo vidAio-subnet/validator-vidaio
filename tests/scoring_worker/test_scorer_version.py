@@ -99,6 +99,40 @@ def test_pipeline_contract_version_pins_miner_input_perceptual_basis() -> None:
     assert SCORING_PIPELINE_VERSION == 4
 
 
+def test_content_fingerprint_algorithm_version_is_identity_bound(monkeypatch) -> None:
+    from vidaio.scoring_worker import service
+    assert service.CONTENT_FINGERPRINT_VERSION == 1
+    base = scorer_identity_digest(ScoringWorkerConfig(), ScoringConfig())
+    monkeypatch.setattr(service, "CONTENT_FINGERPRINT_VERSION", 2)
+    assert scorer_identity_digest(ScoringWorkerConfig(), ScoringConfig()) != base
+
+
+def test_authenticated_history_has_exact_old_identity_and_live_rejects_it(monkeypatch) -> None:
+    from vidaio.audit.canonical import canonical_json_bytes, sha256_hex
+    from vidaio.scoring.result import config_digest
+    from vidaio.scoring_worker import service
+    config, scoring = ScoringWorkerConfig(), ScoringConfig()
+    attestation = {"fixture": "identical-old-runtime"}
+    payload = {
+        "pipeline_version": 4,
+        "scoring_config_digest": config_digest(scoring),
+        "perceptual_checks": config.perceptual_checks,
+        "perceptual_cpu": config.perceptual_cpu.model_dump(mode="json"),
+        "pieapp_device": config.pieapp_device,
+        "vmaf_model_primary": config.vmaf_model_primary,
+        "vmaf_model_secondary": config.vmaf_model_secondary,
+        "payout_runtime_commitment": service.runtime_commitment_digest(attestation),
+    }
+    legacy = service.historical_v16_scorer_version(config, scoring, runtime_attestation=attestation)
+    assert legacy == f"{config.scorer_version}+{sha256_hex(canonical_json_bytes(payload))[:12]}"
+    current = effective_scorer_version(config, scoring, runtime_attestation=attestation)
+    with pytest.raises(ScoreRejected):
+        check_scorer_version(legacy, current)
+    monkeypatch.setattr(service, "CONTENT_FINGERPRINT_VERSION", 2)
+    monkeypatch.setattr(service, "SCORING_PIPELINE_VERSION", 99)
+    assert service.historical_v16_scorer_version(config, scoring, runtime_attestation=attestation) == legacy
+
+
 def test_version_moves_when_a_scoring_lever_moves() -> None:
     config = ScoringWorkerConfig()
     base = effective_scorer_version(config, ScoringConfig())

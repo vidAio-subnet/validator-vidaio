@@ -172,6 +172,20 @@ EARNING_STATE_UNVERIFIED = "EARNING_STATE_UNVERIFIED"
 METAGRAPH_DEDUP_MISMATCH = "METAGRAPH_DEDUP_MISMATCH"
 METAGRAPH_TRACK_MISMATCH = "METAGRAPH_TRACK_MISMATCH"
 
+#: Schema v17 (owner D-025): the log ARCHIVES the inference payout floor it applied
+#: (`payout_min_alpha_stake`). The auditor re-derives the vector from that archived
+#: value, so an honest log stays PASS even when this auditor's own configured policy
+#: differs; the divergence is surfaced on the PASS verdict as this report-only code
+#: (decision 24) so operators notice un-coordinated policy changes without a false
+#: DISPUTED.
+PAYOUT_POLICY_MISMATCH = "PAYOUT_POLICY_MISMATCH"
+
+# D-030 commit-window membership is enforced in both auditor modes. A slow
+# authority-declared commit is a PASS finding only, with no economic penalty.
+ROUND_COMMIT_MISMATCH = "ROUND_COMMIT_MISMATCH"
+ROUND_COMMIT_UNVERIFIED = "ROUND_COMMIT_UNVERIFIED"
+ROUND_COMMIT_STALE = "ROUND_COMMIT_STALE"
+
 #: The close-block metagraph binding could not be COMPLETED for a nonzero-weight uid —
 #: the metagraph read failed / is unavailable, or the committed track is unresolvable
 #:. NOT a provable fault: recorded as a SKIP so the epoch rolls up

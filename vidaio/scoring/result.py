@@ -12,7 +12,7 @@ import hashlib
 import math
 from typing import Annotated, Union
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_serializer, model_validator
 
 from vidaio.scoring.compression import CompressionBreakdown
 from vidaio.scoring.config import ScoringConfig
@@ -68,6 +68,31 @@ class ItemScore(BaseModel):
     pieapp_start_frame: int | None = None
     scoring_config_digest: str | None = None
 
+    # Additive decoded-content evidence. Old packets omit all three fields so
+    # their serialized bytes and encoded ``content_digest`` remain unchanged.
+    canonical_content_digest: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    content_fingerprint: tuple[Annotated[str, Field(pattern=r"^[0-9a-f]{16}$")], ...] | None = Field(
+        default=None, min_length=32, max_length=32
+    )
+    encoded_size: int | None = Field(default=None, strict=True, gt=0)
+
+    @model_validator(mode="after")
+    def _complete_content_evidence(self) -> "ItemScore":
+        present = tuple(value is not None for value in (
+            self.canonical_content_digest, self.content_fingerprint, self.encoded_size
+        ))
+        if any(present) and not all(present):
+            raise ValueError("canonical content evidence must contain all three fields")
+        return self
+
+    @model_serializer(mode="wrap")
+    def _serialize_compatible(self, handler):
+        value = handler(self)
+        for name in ("canonical_content_digest", "content_fingerprint", "encoded_size"):
+            if getattr(self, name) is None:
+                value.pop(name, None)
+        return value
+
     @field_validator("score")
     @classmethod
     def _score_bounded(cls, value: float) -> float:
@@ -97,6 +122,9 @@ def compose_item_score(
     skips: list[GateSkip] | None = None,
     miner_hotkey: str | None = None,
     content_digest: str | None = None,
+    canonical_content_digest: str | None = None,
+    content_fingerprint: tuple[str, ...] | None = None,
+    encoded_size: int | None = None,
     metrics: dict[str, float | int | str | None] | None = None,
     backend_versions: dict[str, str] | None = None,
     canonicalization_plan_digest: str | None = None,
@@ -122,6 +150,9 @@ def compose_item_score(
         track=track,
         miner_hotkey=miner_hotkey,
         content_digest=content_digest,
+        canonical_content_digest=canonical_content_digest,
+        content_fingerprint=content_fingerprint,
+        encoded_size=encoded_size,
         score=score,
         gate_passed=gate_passed,
         violations=violations,

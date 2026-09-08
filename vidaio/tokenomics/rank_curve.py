@@ -82,7 +82,8 @@ def dedup_losers(candidates: Iterable[MinerSnapshot]) -> set[int]:
 
 
 def dedup_excluded(
-    miners: Iterable[MinerSnapshot], *, minimum_payout_score: float = 0.0
+    miners: Iterable[MinerSnapshot], *, minimum_payout_score: float = 0.0,
+    payout_min_alpha_stake: float = 0.0,
 ) -> set[int]:
     """The uids the IP/coldkey dedup would EXCLUDE — the auditor's independent
     re-derivation of the ``excluded`` flag from the close-block metagraph identities
@@ -101,12 +102,14 @@ def dedup_excluded(
         if not is_excluded(m.accumulate_score)
         and m.accumulate_score >= minimum_payout_score
         and m.accumulate_score > 0.0
+        and m.alpha_stake >= payout_min_alpha_stake
     ]
     return dedup_losers(candidates)
 
 
 def eligible_for_ranking(
-    miners: Iterable[MinerSnapshot], *, minimum_payout_score: float = 0.0
+    miners: Iterable[MinerSnapshot], *, minimum_payout_score: float = 0.0,
+    payout_min_alpha_stake: float = 0.0,
 ) -> list[MinerSnapshot]:
     """Exclusion + sentinel + absolute-score gate, then IP/coldkey dedup.
 
@@ -122,6 +125,7 @@ def eligible_for_ranking(
             and not is_excluded(m.accumulate_score)
             and m.accumulate_score >= minimum_payout_score
             and m.accumulate_score > 0.0
+            and m.alpha_stake >= payout_min_alpha_stake
         ),
         key=lambda m: m.uid,
     )
@@ -162,7 +166,8 @@ def inference_shares(config: TokenomicsConfig, miners: Iterable[MinerSnapshot]) 
     deterministic (config track order, uid order within tracks).
     """
     eligible = eligible_for_ranking(
-        miners, minimum_payout_score=config.minimum_payout_score
+        miners, minimum_payout_score=config.minimum_payout_score,
+        payout_min_alpha_stake=config.payout_min_alpha_stake,
     )
     by_track: dict[str, list[MinerSnapshot]] = {}
     for miner in eligible:

@@ -34,6 +34,17 @@ from typing import Callable, Sequence
 DEFAULT_LOOKBACK_SECONDS = 24 * 3600.0
 
 
+def _height_column(membership: str) -> str:
+    if membership not in {"commit", "assignment"}:
+        raise ValueError("unknown round membership")
+    return "r.commit_block" if membership == "commit" else "r.block"
+
+
+def _round_fields(membership: str) -> str:
+    # Explicit history mode works against original schema16 copies, before0012.
+    return ", r.block AS round_block" + (", r.commit_block" if membership == "commit" else "")
+
+
 def _as_utc_iso(value: datetime | str | None) -> str | None:
     """Normalize a cutoff to the canonical UTC ISO form rows are stored in.
 
@@ -101,6 +112,8 @@ class ScorePacketEvidence:
         *,
         until: datetime | str | None = None,
         through_block: int | None = None,
+        after_block: int | None = None,
+        membership: str = "commit",
     ) -> list[sqlite3.Row]:
         """Full committed evidence rows inside an optional inclusive time window.
 
@@ -108,8 +121,9 @@ class ScorePacketEvidence:
         leaking into a catch-up finalization. Both packet and round timestamps are
         bounded, and partial rounds remain excluded.
         """
+        height = _height_column(membership)
         sql = (
-            "SELECT p.* FROM score_packets p JOIN rounds r ON r.round_id = p.round_id"
+            "SELECT p.*" + _round_fields(membership) + " FROM score_packets p JOIN rounds r ON r.round_id = p.round_id"
             " WHERE r.committed_at IS NOT NULL"
         )
         params: list[object] = []
@@ -126,9 +140,47 @@ class ScorePacketEvidence:
                 raise ValueError(
                     f"through_block must be non-negative, got {through_block}"
                 )
-            sql += " AND r.block <= ?"
+            sql += f" AND {height} <= ?"
             params.append(through_block)
+        if after_block is not None:
+            if after_block < 0:
+                raise ValueError("after_block must be non-negative")
+            sql += f" AND {height} > ?"
+            params.append(after_block)
         return self._conn.execute(sql + " ORDER BY p.created_at, p.uid", params).fetchall()
+
+    def content_rounds(self, *, through_block: int | None = None, after_block: int | None = None,
+                       membership: str = "commit") -> list[sqlite3.Row]:
+        """Full original candidate rosters, including committed all-skip rounds."""
+        height = _height_column(membership)
+        sql = ("SELECT c.*" + _round_fields(membership) + " FROM content_round_evidence c JOIN rounds r ON r.round_id=c.round_id"
+               " WHERE r.committed_at IS NOT NULL")
+        params: list[object] = []
+        if through_block is not None:
+            if through_block < 0:
+                raise ValueError("through_block must be non-negative")
+            sql += f" AND {height} <= ?"
+            params.append(through_block)
+        if after_block is not None:
+            if after_block < 0:
+                raise ValueError("after_block must be non-negative")
+            sql += f" AND {height} > ?"
+            params.append(after_block)
+        return self._conn.execute(sql + " ORDER BY c.created_at,c.challenge_id,c.item_id,c.track", params).fetchall()
+
+    def round_commits(self, *, through_block: int | None = None,
+                      after_block: int | None = None) -> list[sqlite3.Row]:
+        """Every completed dispatch context, including a round with no fold rows."""
+        sql = ("SELECT c.*, r.commit_block FROM round_challenges c JOIN rounds r ON r.round_id=c.round_id"
+               " WHERE r.committed_at IS NOT NULL AND r.commit_block IS NOT NULL")
+        params: list[object] = []
+        for operator, bound in (("<=", through_block), (">", after_block)):
+            if bound is not None:
+                if bound < 0:
+                    raise ValueError("round bound must be non-negative")
+                sql += f" AND r.commit_block {operator} ?"
+                params.append(bound)
+        return self._conn.execute(sql + " ORDER BY c.ordering_key,c.challenge_id", params).fetchall()
 
     def has_uncommitted_round(self) -> bool:
         """True when a partial round is detectable — its evidence is excluded."""
@@ -162,7 +214,22 @@ class ScorePacketEvidence:
             " ORDER BY p.reference_original_ref",
             (challenge_id,),
         ).fetchall()
-        return [str(row["ref"]) for row in rows]
+        refs = {str(row["ref"]) for row in rows}
+        # Even an all-skipped content component must release its archived holdout
+        # after retirement so its original measurements remain reproducible.
+        import json
+        from vidaio.audit.canonical import canonical_json_bytes
+
+        content_rows = self._conn.execute(
+            "SELECT c.round_json FROM content_round_evidence c"
+            " JOIN rounds r ON r.round_id = c.round_id"
+            " WHERE r.committed_at IS NOT NULL AND c.challenge_id = ?",
+            (challenge_id,),
+        ).fetchall()
+        for row in content_rows:
+            context = json.loads(row["round_json"])
+            refs.add(canonical_json_bytes(context["reference_original"]).decode())
+        return sorted(refs)
 
 
 class AvailabilityFoldEvidence:
@@ -177,14 +244,17 @@ class AvailabilityFoldEvidence:
         *,
         until: datetime | str | None = None,
         through_block: int | None = None,
+        after_block: int | None = None,
+        membership: str = "commit",
     ) -> list[sqlite3.Row]:
         """Committed observations in deterministic fold order.
 
         The authority resolves each row's actual ordering key from the immutable
         pre-dispatch challenge commitment, just as it does for media score packets.
         """
+        height = _height_column(membership)
         sql = (
-            "SELECT a.* FROM availability_folds a"
+            "SELECT a.*" + _round_fields(membership) + " FROM availability_folds a"
             " JOIN rounds r ON r.round_id = a.round_id"
             " WHERE r.committed_at IS NOT NULL"
         )
@@ -202,8 +272,13 @@ class AvailabilityFoldEvidence:
                 raise ValueError(
                     f"through_block must be non-negative, got {through_block}"
                 )
-            sql += " AND r.block <= ?"
+            sql += f" AND {height} <= ?"
             params.append(through_block)
+        if after_block is not None:
+            if after_block < 0:
+                raise ValueError("after_block must be non-negative")
+            sql += f" AND {height} > ?"
+            params.append(after_block)
         return self._conn.execute(
             sql + " ORDER BY a.created_at, a.uid, a.item_id", params
         ).fetchall()

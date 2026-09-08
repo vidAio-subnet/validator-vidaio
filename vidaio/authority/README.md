@@ -46,6 +46,29 @@ tampering surface.
 
 ### The finalizer: honest by construction
 
+Schema17 finalization admits completed rounds in
+`prior_published_close < commit_block <= close_block`; an in-flight round does
+not block the close. A fresh best-head observation and the finalizer's durable
+`sealed_close` watermark share a short SQL exclusion, so a later round writer
+cannot enter an already-captured window. Media, availability and content inputs
+come from that one snapshot. Unreleased or missing evidence still HOLDs, and the
+anchor-window and declared-gap protections remain in force.
+
+The canonical `round_membership: "commit/1"`, manifest `round_commits` index and
+cumulative `round_commit_cursor` let both auditor modes rederive window membership
+and dispatch order from archived evidence. This binds an authority declaration
+of commit height; it does not prove physical SQL timing independently. Payable
+snapshots use only the prior published same-identity carry plus current admitted
+cycles, never an out-of-window private accumulator. The EWMA and duplicate rules
+are unchanged. See [VALIDATING.md](../../docs/VALIDATING.md#round-completion-and-epoch-membership-schema-v17).
+
+Before the v16-to-v17 migration, quiesce dispatch and publish all completed legacy
+work on v16. The read-only cutover preflight must find no in-flight or unpublished
+committed rounds. A selected legacy row without commit context HOLDs with a
+specific remediation; assignment-block backfill is only valid for already
+published history. See the project design record. Migration and
+deployment require a separate owner GO.
+
 `build_audit_manifest(scored_items, store=..., competition_input=...)` groups each
 inference earning row under its uid (two refs: an AUDIT_BUNDLE binding + the SCORE_PACKET
 blob) and collects calibration rows into `baseline_bundles`. When a store is supplied it

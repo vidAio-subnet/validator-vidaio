@@ -21,6 +21,8 @@ class TokenomicsConfig(BaseModel):
     ewma_decay: float = 0.75
     top_n_per_track: int = 5
     minimum_payout_score: float = 0.10
+    # Inference eligibility only; never scales a score or a competition award.
+    payout_min_alpha_stake: float = 0.0
 
     idle_inference_share: float = 0.80
     idle_burn_share: float = 0.20
@@ -39,6 +41,11 @@ class TokenomicsConfig(BaseModel):
 
     @model_validator(mode="after")
     def _validate(self) -> "TokenomicsConfig":
+        if (
+            not math.isfinite(self.payout_min_alpha_stake)
+            or self.payout_min_alpha_stake < 0.0
+        ):
+            raise ValueError("payout_min_alpha_stake must be finite and >= 0")
         if not 0.0 <= self.burn_proportion <= 1.0:
             raise ValueError("burn_proportion must be in [0, 1]")
         if self.alpha_stake_weigh_factor < 0.0:

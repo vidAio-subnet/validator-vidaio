@@ -58,7 +58,7 @@ def test_reward_parameter_digest_binds_hard_coded_podium_split() -> None:
     config = TokenomicsConfig()
     expected_policy = {
         "domain": REWARD_POLICY_DOMAIN,
-        "tokenomics": config.model_dump(mode="json"),
+        "tokenomics": config.model_dump(mode="json", exclude={"payout_min_alpha_stake"}),
         "competition_podium_split": [0.70, 0.20, 0.10],
     }
     assert reward_parameter_digest(config) == sha256_hex(
@@ -73,6 +73,19 @@ def test_reward_parameter_digest_binds_result_window_duration() -> None:
     assert reward_parameter_digest(production) != reward_parameter_digest(
         testnet_acceptance
     )
+
+
+def test_inference_floor_preserves_pre_v17_competition_policy_digest() -> None:
+    # These are the deployed policy bytes' digests before the new config field.
+    for enabled, digest in (
+        (False, "0447462af3091e51b0b46aaab6367aae25ff66e42c52b102135389ccec05f28c"),
+        (True, "65b4104e973e550d598f2a693b5660134f27e607f0780e8c88467f0cd1e3172e"),
+    ):
+        for floor in (0.0, 50.0, 100.0):
+            config = TokenomicsConfig(
+                competition_emissions_enabled=enabled, payout_min_alpha_stake=floor,
+            )
+            assert reward_parameter_digest(config) == digest
 
 
 def test_publication_payload() -> None:

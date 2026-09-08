@@ -442,7 +442,9 @@ class ScoringAuthority(BaseService):
             EPOCH_LOG_MEMBER,
             expected_digest=latest.log_digest,
         )
-        log = EpochLog.from_json(data)
+        log = EpochLog.from_history_json(
+            data, expected_digest=latest.log_digest, expected_epoch_id=latest.epoch_id
+        )
         if log.epoch_id != latest.epoch_id or log.close_block != latest.close_block:
             raise EpochLogInvalid(
                 "authority predecessor index metadata does not match its immutable log bytes: "

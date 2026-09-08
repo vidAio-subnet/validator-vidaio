@@ -38,6 +38,7 @@ from vidaio.audit.recompute import (
     _ORCHESTRATOR_ZERO_PREFIX,
     ArtifactPayload,
     RecomputedScore,
+    ContentRecomputeUnavailable,
     _orchestrator_zero_identity,
 )
 from vidaio.audit.store import ArtifactKind
@@ -161,6 +162,7 @@ class RealScoreRecomputer:
             # The build/test marker-policy opt-out never permits an attestation
             # whose concrete packet backend map says something else.
             require_attested_backend_versions(attestation, backends.versions)
+        self._runtime_attestation = attestation
         self._scorer_version = effective_scorer_version(
             config,
             self._scoring_config,
@@ -197,6 +199,31 @@ class RealScoreRecomputer:
     @property
     def scorer_version(self) -> str:
         return self._scorer_version
+
+    def for_epoch_log(self, log):
+        """Use the exact predecessor identity only for authenticated v16 history.
+
+        This returns a separate observer instance; the live recomputer and worker
+        identity remain unchanged. No packet-selected arbitrary scorer is accepted.
+        """
+        from copy import copy
+        from vidaio.epoch.log import _HistoryEpochLogV16
+        from vidaio.scoring_worker.service import historical_v16_scorer_version
+
+        if not isinstance(log, _HistoryEpochLogV16):
+            return self
+        historical = copy(self)
+        historical._historical_v16 = True
+        historical._scorer_version = historical_v16_scorer_version(
+            self._config, self._scoring_config,
+            runtime_attestation=self._runtime_attestation,
+        )
+        return historical
+
+    @property
+    def requires_content_evidence(self) -> bool:
+        """Real current canonicalizers always produce content evidence on measured media."""
+        return self._backends.canonicalizer is not None and not getattr(self, "_historical_v16", False)
 
     # -- honest-refusal probe ---------------------------------------------------------
 
@@ -351,6 +378,10 @@ class RealScoreRecomputer:
             if isinstance(v, numbers.Real) and not isinstance(v, bool)
         }
         return RecomputedScore(
+            canonical_content_digest=(None if getattr(self, "_historical_v16", False) else item.canonical_content_digest),
+            content_fingerprint=(None if getattr(self, "_historical_v16", False) else item.content_fingerprint),
+            encoded_size=(None if getattr(self, "_historical_v16", False) else item.encoded_size),
+            canonicalization_plan_digest=item.canonicalization_plan_digest,
             metrics=metrics,
             scorer_version=item.scorer_version or self._scorer_version,
             backend_versions=dict(item.backend_versions),
@@ -387,6 +418,30 @@ class RealScoreRecomputer:
         except Exception:
             return False
         return is_duplicate_identity(packet.get("scorer_version"))
+
+    def recompute_content_duplicate(self, bundle, artifacts, store, *, member_recomputer=None) -> RecomputedScore:
+        """Rerun every original signed member before reproducing a content zero."""
+        from vidaio.auditor.content_evidence import verify_round, validate_zero_packet
+        from vidaio.scoring.content_duplicate_evidence import content_witness_from_packet
+
+        packet = self._packet(artifacts)
+        witness = content_witness_from_packet(packet)
+        validate_zero_packet(packet, bundle, witness)
+        context = witness.round_evidence
+        revealed = self._committed_reveal(bundle, artifacts)
+        if (revealed.scorer_version != context.committed_scorer_version
+                or revealed.track != context.track
+                or config_digest(self._scoring_config) != context.scoring_config_digest):
+            raise RuntimeError("content witness differs from committed scorer/track/config")
+        results = verify_round(context, bundle, store, member_recomputer or self)
+        selected = next(result for result in results if result.uids == witness.component_uids)
+        if selected.status == "unavailable":
+            raise ContentRecomputeUnavailable(selected.detail)
+        if selected.status != "verified":
+            raise RuntimeError("content component evidence cannot be independently verified: " + selected.detail)
+        return RecomputedScore(metrics={}, scorer_version=packet["scorer_version"],
+                               backend_versions={}, score=0.0, gate_passed=False,
+                               violations=packet["violations"], breakdown=None)
 
     def recompute_duplicate(
         self,

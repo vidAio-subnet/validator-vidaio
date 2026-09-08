@@ -646,6 +646,10 @@ def resolve_burn_uid(chain: object, *, report_fallback: int | None = None) -> in
 class ChainAdapter(Protocol):
     def current_block(self) -> int: ...
 
+    def best_head_block(self) -> int:
+        """Fresh best head, never a cached snapshot or lagging finalized head."""
+        ...
+
     def neurons(self) -> list[ChainNeuron]: ...
 
     def refresh(self) -> None:
@@ -733,6 +737,10 @@ class InMemoryChain:
     block_seconds: float = 12.0
 
     def current_block(self) -> int:
+        return self._block
+
+    def best_head_block(self) -> int:
+        """The in-memory chain's explicitly advanced head is its current state."""
         return self._block
 
     def neurons(self) -> list[ChainNeuron]:

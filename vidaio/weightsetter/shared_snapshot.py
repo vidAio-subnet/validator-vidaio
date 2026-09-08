@@ -511,6 +511,13 @@ _EPOCH_LOG_TOP_LEVEL_FIELDS = frozenset(
 )
 
 
+def _top_level_fields(schema_version: int) -> frozenset[str]:
+    """Exact top-level shape per authenticated schema (v17 archives the payout floor)."""
+    if schema_version == 17:
+        return _EPOCH_LOG_TOP_LEVEL_FIELDS | {"payout_min_alpha_stake", "round_membership"}
+    return _EPOCH_LOG_TOP_LEVEL_FIELDS
+
+
 def _lower_hex_digest(value: object) -> bool:
     return (
         isinstance(value, str)
@@ -525,7 +532,7 @@ def _bounded_error(exc: Exception) -> str:
 
 
 def _raw_packet_commitment(
-    manifest: object,
+    manifest: object, *, schema_version: int = EPOCH_LOG_SCHEMA_VERSION,
 ) -> tuple[tuple[str, ...] | None, str | None]:
     """Best-effort packet commitment extraction; malformed evidence stays unresolved.
 
@@ -536,6 +543,7 @@ def _raw_packet_commitment(
     if not isinstance(manifest, dict):
         return None, None
     expected_keys = {
+        *(("content_rounds", "round_commits", "round_commit_cursor") if schema_version == 17 else ()) ,
         "per_uid",
         "baseline_bundles",
         "score_packet_merkle_root",
@@ -579,6 +587,32 @@ def _raw_packet_commitment(
 def parse_authority_submission(
     data: bytes, pointer: EpochPointer
 ) -> AuthoritySubmissionView:
+    """Strict current-schema submission boundary; history never enters weights."""
+    return _parse_authority_submission(data, pointer, expected_schema=EPOCH_LOG_SCHEMA_VERSION)
+
+
+def parse_authority_history_submission(
+    data: bytes, pointer: EpochPointer
+) -> AuthoritySubmissionView:
+    """Audit/history-only v16/v17 view after the caller authenticates the anchor.
+
+    Preserve the original bytes and require their exact pointer digest. This API
+    is deliberately separate from the current weight-submission boundary.
+    """
+    if sha256_hex(data) != pointer.snapshot_digest:
+        raise SnapshotDigestMismatch("historical submission bytes differ from authenticated pointer")
+    try:
+        schema = json.loads(data)["schema_version"]
+    except Exception as exc:
+        raise SnapshotDigestMismatch("historical submission schema is unreadable") from exc
+    if type(schema) is not int or schema not in (16, 17):
+        raise SnapshotDigestMismatch("only authenticated v16/v17 history is supported")
+    return _parse_authority_submission(data, pointer, expected_schema=schema)
+
+
+def _parse_authority_submission(
+    data: bytes, pointer: EpochPointer, *, expected_schema: int
+) -> AuthoritySubmissionView:
     """Parse only chain-feasibility/authentication fields from canonical log bytes."""
     try:
         obj = json.loads(data)
@@ -586,7 +620,7 @@ def parse_authority_submission(
         raise SnapshotDigestMismatch(
             f"epoch {pointer.epoch_id} log bytes are not JSON: {type(exc).__name__}: {exc}"
         ) from exc
-    if not isinstance(obj, dict) or set(obj) != _EPOCH_LOG_TOP_LEVEL_FIELDS:
+    if not isinstance(obj, dict) or set(obj) != _top_level_fields(expected_schema):
         fields = sorted(obj) if isinstance(obj, dict) else type(obj).__name__
         raise SnapshotDigestMismatch(
             f"epoch {pointer.epoch_id} log does not have the exact schema-v"
@@ -606,10 +640,10 @@ def parse_authority_submission(
     schema = obj["schema_version"]
     epoch_id = obj["epoch_id"]
     close_block = obj["close_block"]
-    if type(schema) is not int or schema != EPOCH_LOG_SCHEMA_VERSION:
+    if type(schema) is not int or schema != expected_schema:
         raise SnapshotDigestMismatch(
             f"epoch {pointer.epoch_id} schema_version {schema!r} is not "
-            f"{EPOCH_LOG_SCHEMA_VERSION}"
+            f"{expected_schema}"
         )
     if type(epoch_id) is not int or epoch_id < 0 or epoch_id != pointer.epoch_id:
         raise SnapshotDigestMismatch(
@@ -709,6 +743,7 @@ def parse_authority_submission(
             "hotkey",
             "coldkey",
             "ip",
+            *(("alpha_stake",) if expected_schema == 17 else ()),
         }:
             raise SnapshotDigestMismatch(
                 f"epoch {epoch_id} miner_census[{position}] has an invalid shape"
@@ -758,7 +793,7 @@ def parse_authority_submission(
             f"{missing}"
         )
 
-    packet_digests, packet_root = _raw_packet_commitment(obj["audit_manifest"])
+    packet_digests, packet_root = _raw_packet_commitment(obj["audit_manifest"], schema_version=expected_schema)
     return AuthoritySubmissionView(
         epoch_id=epoch_id,
         close_block=close_block,
@@ -1014,12 +1049,21 @@ class SharedSnapshotProvider:
         legacy callers fail closed on an unavailable/tampered predecessor.
         """
         pointer = self._pointer_for(epoch_id)
-        resolved = self._resolve_from_pointer(pointer)
-        # ``allow_economic_disagreement`` defaults false above, so a missing strict
-        # log is impossible. Keep the assertion local instead of widening the public
-        # return type used by standalone audit/history callers.
-        assert resolved.log is not None
-        return resolved.log
+        # Historical logs cannot enter the current submission parser. Authenticate
+        # the same finalized object/pointer/chain root, then use the explicit v16/v17
+        # history reader, preserving legacy bytes at the transition.
+        data = self._fetch_authenticated_bytes(pointer)
+        try:
+            log = EpochLog.from_history_json(
+                data,
+                expected_digest=pointer.snapshot_digest,
+                expected_epoch_id=pointer.epoch_id,
+            )
+        except Exception as exc:
+            raise SnapshotDigestMismatch(f"invalid authenticated historical log: {exc}") from exc
+        if log.close_block != pointer.close_block:
+            raise SnapshotDigestMismatch("historical log close block differs from its pointer")
+        return log
 
     # -- resolve = fetch pointer -> mirror bytes -> verify -> parse -------------
 
@@ -1111,12 +1155,7 @@ class SharedSnapshotProvider:
             )
         return epoch_id, close_block
 
-    def _resolve_from_pointer(
-        self,
-        pointer: EpochPointer,
-        *,
-        allow_economic_disagreement: bool = False,
-    ) -> _ResolvedEpoch:
+    def _fetch_authenticated_bytes(self, pointer: EpochPointer) -> bytes:
         if not pointer.finalized:
             raise SnapshotUnavailable(
                 f"epoch {pointer.epoch_id} pointer is not finalized yet"
@@ -1155,6 +1194,16 @@ class SharedSnapshotProvider:
             ) from exc
 
         self._verify_digest_chain(pointer, data)
+
+        return data
+
+    def _resolve_from_pointer(
+        self,
+        pointer: EpochPointer,
+        *,
+        allow_economic_disagreement: bool = False,
+    ) -> _ResolvedEpoch:
+        data = self._fetch_authenticated_bytes(pointer)
 
         # This parser is the submission boundary. It validates only authentication,
         # canonical/current schema identity, exact chain-expressible u16 bytes, pointer

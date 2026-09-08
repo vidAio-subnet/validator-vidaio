@@ -101,6 +101,7 @@ def test_snapshot_at_uses_close_block_state_not_live_head(conn):
         scores={1: 0.8},
         decay=DECAY,
         committed_at=t1,
+        commit_block=10,
         registry=miner_manager.RegistryUpdate(
             neurons=(neuron,), block=10, tracks={1: "compression"}
         ),
@@ -114,6 +115,7 @@ def test_snapshot_at_uses_close_block_state_not_live_head(conn):
         scores={1: 0.4},
         decay=DECAY,
         committed_at=t2,
+        commit_block=20,
         registry=miner_manager.RegistryUpdate(neurons=(neuron,), block=20),
     )
 
@@ -123,6 +125,11 @@ def test_snapshot_at_uses_close_block_state_not_live_head(conn):
     pinned = miner_manager.snapshot_at(conn, [neuron], 15, NOW)
     assert len(pinned) == 1
     assert pinned[0].accumulate_score == pytest.approx(score_at_t1)
+    # Payout stake comes from the supplied exact-close-block chain view, never
+    # the last scored round's mutable registry/head value.
+    from dataclasses import replace
+    close_neuron = replace(neuron, alpha_stake=7.25)
+    assert miner_manager.snapshot_at(conn, [close_neuron], 15, NOW)[0].alpha_stake == 7.25
 
 
 def test_snapshot_at_rejects_a_recycled_hotkey(conn):
@@ -134,6 +141,7 @@ def test_snapshot_at_rejects_a_recycled_hotkey(conn):
         scores={1: 0.8},
         decay=DECAY,
         committed_at=NOW.isoformat(),
+        commit_block=10,
         registry=miner_manager.RegistryUpdate(
             neurons=(original,), block=10, tracks={1: "compression"}
         ),

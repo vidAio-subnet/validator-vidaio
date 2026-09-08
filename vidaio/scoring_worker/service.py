@@ -134,10 +134,17 @@ from vidaio.scoring.backends_real import (
     MetricLogTooLarge,
     NotConfiguredError,
     PieAppTorchBackend,
+    current_process_scope,
     detect_tool_versions,
     use_media_scratch,
     use_metric_log_limit,
     use_process_scope,
+)
+from vidaio.scoring.content_fingerprint import (
+    CONTENT_FINGERPRINT_VERSION,
+    ContentFingerprintCancelled,
+    ContentFingerprintUnavailable,
+    compute_canonical_content,
 )
 from vidaio.scoring.result import ItemScore, config_digest
 from vidaio.scoring_worker.config import ScoringWorkerConfig
@@ -310,6 +317,7 @@ def scorer_identity_digest(
     )
     payload = {
         "pipeline_version": SCORING_PIPELINE_VERSION,
+        "content_fingerprint_version": CONTENT_FINGERPRINT_VERSION,
         "scoring_config_digest": config_digest(scoring_config),
         "perceptual_checks": config.perceptual_checks,
         "perceptual_cpu": config.perceptual_cpu.model_dump(mode="json"),
@@ -338,6 +346,37 @@ def effective_scorer_version(
         f"{config.scorer_version}+"
         f"{scorer_identity_digest(config, scoring_config, runtime_attestation=runtime_attestation)[:12]}"
     )
+
+
+def historical_v16_scorer_version(
+    config: ScoringWorkerConfig,
+    scoring_config: ScoringConfig,
+    *,
+    runtime_attestation: Mapping[str, Any] | None = None,
+) -> str:
+    """The exact predecessor identity, only for authenticated v16 audit history.
+
+    This is not an alternate live worker identity or a configurable bypass.
+    Historical readers must first authenticate schema 16 and then require exact
+    equality with the archived identity. Freeze pipeline 4 and the old payload
+    here; adding current evidence must not relabel historical scored packets.
+    """
+    attestation = (
+        dict(runtime_attestation)
+        if runtime_attestation is not None
+        else payout_runtime_attestation(config, scoring_config)
+    )
+    payload = {
+        "pipeline_version": 4,
+        "scoring_config_digest": config_digest(scoring_config),
+        "perceptual_checks": config.perceptual_checks,
+        "perceptual_cpu": config.perceptual_cpu.model_dump(mode="json"),
+        "pieapp_device": config.pieapp_device,
+        "vmaf_model_primary": config.vmaf_model_primary,
+        "vmaf_model_secondary": config.vmaf_model_secondary,
+        "payout_runtime_commitment": runtime_commitment_digest(attestation),
+    }
+    return f"{config.scorer_version}+{sha256_hex(canonical_json_bytes(payload))[:12]}"
 
 
 def check_scorer_version(requested: str | None, effective: str) -> None:
@@ -599,6 +638,25 @@ def _score_in_dir(
     canon_ref_info = backends.probe.probe(canon_ref)
     canon_cand_info = backends.probe.probe(canon_cand)
     canon_input_info = backends.probe.probe(canon_input)
+    # This exact candidate Y4M is also passed to the metric backends below.
+    # Fake passthrough backends have no canonical stream and must not invent one.
+    content_evidence = None
+    encoded_size = None
+    if backends.canonicalizer is not None:
+        scope = current_process_scope()
+        try:
+            content_evidence = compute_canonical_content(
+                canon_cand, cancelled=(lambda: scope.cancelled) if scope else None
+            )
+        except ContentFingerprintCancelled as exc:
+            raise MediaWorkCancelled(str(exc)) from exc
+        except ContentFingerprintUnavailable as exc:
+            raise ScoreRejected(422, {"error": "canonical_content_unavailable", "detail": str(exc)}) from exc
+        if content_evidence.frame_count != canon_cand_info.frame_count:
+            raise ScoreRejected(422, {"error": "canonical_content_frame_count_mismatch"})
+        encoded_size = Path(output_path).stat().st_size
+        if encoded_size != cand_info.byte_size:
+            raise ScoreRejected(422, {"error": "canonical_content_encoded_size_mismatch"})
     extra_violations = validate_stream(canon_ref_info, canon_cand_info)
     # libvmaf (and PieAPP) require same-geometry inputs; with mismatched dims the
     # metrics are unmeasurable and the gates fail closed on the missing values.
@@ -763,6 +821,9 @@ def _score_in_dir(
         # by construction equals the digest the request claimed. Never re-read
         # from the caller-named path.
         content_digest=snapshot.output.digest,
+        canonical_content_digest=(content_evidence.canonical_content_digest if content_evidence else None),
+        content_fingerprint=(content_evidence.content_fingerprint if content_evidence else None),
+        encoded_size=encoded_size,
         metrics=metrics,
         backend_versions=dict(backends.versions),
         canonicalization_plan_digest=plan_digest_value,

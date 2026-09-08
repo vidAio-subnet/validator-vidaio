@@ -122,6 +122,18 @@ class HttpChainAdapter:
         """Last observed block; 0 until the first successful refresh."""
         return self._block
 
+    def best_head_block(self) -> int:
+        """Bounded fresh chainsim head, independent of the cached metagraph."""
+        try:
+            response = self._client.get(self._url("/neurons"), timeout=self._timeout)
+            response.raise_for_status()
+            block = response.json()["block"]
+            if isinstance(block, bool) or not isinstance(block, int) or block < 0:
+                raise ValueError("invalid fresh best-head height")
+            return block
+        except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+            raise ChainStateUnavailable(f"cannot read fresh report head: {type(exc).__name__}: {exc}") from exc
+
     def neurons(self) -> list[ChainNeuron]:
         """The cached neuron snapshot.
 

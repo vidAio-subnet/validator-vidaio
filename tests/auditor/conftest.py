@@ -181,6 +181,30 @@ def score_compression_item(
     return _score_sync(request, config, scoring_config, backends, scorer_version)
 
 
+def real_bundle_reveal(
+    item: ItemScore,
+    *,
+    item_id: str,
+    committed_track: str = "compression",
+    dispatch_ordering_key: int = 0,
+) -> bytes:
+    """The DAG_REVEAL preimage ``build_real_bundle`` stores for ``item_id``.
+
+    Its sha256 is the bundle's ``commitment_hash`` — exposed so a caller can mint the
+    pre-dispatch chain anchor / miner receipt for the SAME commitment before building.
+    """
+    from vidaio.challenge.commitment import ChallengeCommitment
+
+    return ChallengeCommitment.preimage_payload(
+        f"asset-{item_id}",
+        sha256_hex(b"dag-" + item_id.encode()),
+        8675309,
+        item.scorer_version or "scorer",
+        committed_track,
+        dispatch_ordering_key,
+    )
+
+
 def build_real_bundle(
     store: LocalFsStore,
     clips: ClipPair,
@@ -192,6 +216,8 @@ def build_real_bundle(
     miner_hotkey: str = "hk-audit",
     committed_track: str = "compression",
     dispatch_ordering_key: int = 0,
+    challenge_anchor: object | None = None,
+    miner_receipt: object | None = None,
 ) -> AuditBundle:
     """Store the real artifact set for a scored item and return its bundle.
 
@@ -200,18 +226,18 @@ def build_real_bundle(
     challenge-commitment preimage carrying the pre-dispatch committed ``track`` +
     ``dispatch_ordering_key``, so the auditor's earning path can bind
     the committed fold order/track to the anchored commitment.
-    """
-    from vidaio.challenge.commitment import ChallengeCommitment
 
+    ``challenge_anchor`` / ``miner_receipt`` (optional) make the bundle a fully
+    anchored, miner-signed production shape: the anchor's ``commitment_hash`` must be
+    ``sha256_hex(real_bundle_reveal(...))`` for the same ``item_id`` / track / key.
+    """
     ref_bytes = Path(clips.reference).read_bytes()
     cand_bytes = Path(clips.candidate).read_bytes()
-    dag_bytes = ChallengeCommitment.preimage_payload(
-        f"asset-{item_id}",
-        sha256_hex(b"dag-" + item_id.encode()),
-        8675309,
-        item.scorer_version or "scorer",
-        committed_track,
-        dispatch_ordering_key,
+    dag_bytes = real_bundle_reveal(
+        item,
+        item_id=item_id,
+        committed_track=committed_track,
+        dispatch_ordering_key=dispatch_ordering_key,
     )
     packet = (
         packet_bytes if packet_bytes is not None else item.to_json().encode("utf-8")
@@ -238,6 +264,8 @@ def build_real_bundle(
         score_packet=score_packet,
         reference_original=reference_original,
         dag_reveal=dag_reveal,
+        challenge_anchor=challenge_anchor,
+        miner_receipt=miner_receipt,
         scorer_version=item.scorer_version
         or effective_scorer_version(
             ScoringWorkerConfig(), scoring_config=ScoringConfig()

@@ -9,6 +9,8 @@ here at the source, not only in tests/chain.
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from vidaio.tokenomics import max_normalize_u16, quantize_u16
@@ -93,7 +95,27 @@ def test_max_normalize_u16_matches_pinned_sdk_boundary_vectors():
     assert tuple(max_normalize_u16(vector) for vector in vectors) == expected
 
 
-def test_max_normalize_u16_differential_against_pinned_bittensor_sdk():
+@pytest.fixture
+def preserve_application_logging():
+    # Importing the optional SDK changes existing third-party loggers to
+    # CRITICAL and removes their handlers. This numeric comparison must not
+    # silence the application warnings exercised by subsequent test modules.
+    loggers = [logging.getLogger(), *(
+        value for value in logging.root.manager.loggerDict.values()
+        if isinstance(value, logging.Logger)
+    )]
+    original = [(logger, logger.level, list(logger.handlers)) for logger in loggers]
+    try:
+        yield
+    finally:
+        for logger, level, handlers in original:
+            logger.setLevel(level)
+            logger.handlers[:] = handlers
+
+
+def test_max_normalize_u16_differential_against_pinned_bittensor_sdk(
+    preserve_application_logging,
+):
     bt = pytest.importorskip("bittensor", reason="optional pinned chain extra")
     pytest.importorskip("numpy", reason="bittensor emit helper input")
     from bittensor.utils.weight_utils import convert_and_normalize_weights_and_uids

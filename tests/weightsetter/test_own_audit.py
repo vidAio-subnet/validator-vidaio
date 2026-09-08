@@ -19,10 +19,38 @@ from vidaio.weightsetter.own_audit import OwnAuditGate
 from tests.weightsetter.weightsetter_support import (
     NOW,
     SCORER,
-    AuthorityHarness,
-    make_item,
+    AuthorityHarness as _AuthorityHarness,
     make_miner,
 )
+
+
+class AuthorityHarness(_AuthorityHarness):
+    """Own-audit fixtures publish explicit membership from registered bundle anchors."""
+
+    def __init__(self, tmp_path, *, burn_uid: int = 0) -> None:
+        from tests.auditor.fakes import FakeEpochFinalizer
+
+        super().__init__(tmp_path, burn_uid=burn_uid)
+        self.finalizer = FakeEpochFinalizer(TokenomicsConfig(), scorer_version=SCORER)
+
+
+def make_item(uid, store, *, seq: int = 1):
+    """One scored cycle with a positive, independently archived challenge/key binding."""
+    from tests.auditor.fakes import make_fake_bundle, make_packet, scored_item
+    from vidaio.auditor.service import persist_bundle
+
+    challenge_id, item_id = f"c{seq}", f"i{uid}s{seq}"
+    packet = make_packet(
+        challenge_id=challenge_id, item_id=item_id, miner_hotkey=f"hk{uid}",
+        score=0.8, cycle_sequence=seq,
+        metrics={"compression_rate": 0.125, "vmaf": 93.42, "final_score": 0.8},
+    )
+    bundle = make_fake_bundle(
+        store, challenge_id=challenge_id, item_id=item_id, miner_hotkey=f"hk{uid}",
+        packet=packet, dispatch_ordering_key=seq,
+    )
+    persist_bundle(store, bundle)
+    return scored_item(bundle, uid, score=0.8)
 
 
 class _UnsupportedRecomputer:
@@ -244,9 +272,9 @@ async def _finalize_chain(a):
                 track="compression", accumulate_score=succ_acc,
             )
         ],
-        # A NEW cycle at a strictly higher committed key (seq=1) — a genuine second earning,
+        # A NEW challenge at a strictly higher committed key (seq=2) — a genuine second earning,
         # not a re-fold of epoch-1's packet (the monotonic ordering_key invariant, round-22 #1).
-        items=[make_item(1, a.store, seq=1)],
+        items=[make_item(1, a.store, seq=2)],
         prior_accumulate={1: prior_acc},
         prior_log_digest=genesis.log.log_digest(),
     )
@@ -376,18 +404,18 @@ def _fold(prior: float, scores) -> float:
     return v
 
 
-def _persisted_bundle(store, uid: int, item_id: str, score: float):
+def _persisted_bundle(store, uid: int, item_id: str, score: float, *, seq: int = 1):
     """A resolvable committed bundle in the STORE (so the gate's over_store auditor resolves it)."""
     from tests.auditor.fakes import make_fake_bundle, make_packet
     from vidaio.auditor.service import persist_bundle
 
     packet = make_packet(
-        challenge_id="c1", item_id=item_id, miner_hotkey=f"hk{uid}", score=score,
-        cycle_sequence=0, metrics={"compression_rate": 0.1, "vmaf": 93.0, "final_score": score},
+        challenge_id=f"c{seq}", item_id=item_id, miner_hotkey=f"hk{uid}", score=score,
+        cycle_sequence=seq, metrics={"compression_rate": 0.1, "vmaf": 93.0, "final_score": score},
     )
     b = make_fake_bundle(
-        store, challenge_id="c1", item_id=item_id, miner_hotkey=f"hk{uid}",
-        packet=packet, dispatch_ordering_key=0,
+        store, challenge_id=f"c{seq}", item_id=item_id, miner_hotkey=f"hk{uid}",
+        packet=packet, dispatch_ordering_key=seq,
     )
     persist_bundle(store, b)
     return b
@@ -399,7 +427,8 @@ def _scored(b, uid: int, score: float):
     return ScoredItem(
         uid=uid, hotkey=f"hk{uid}", challenge_id=b.challenge_id, item_id=b.item_id,
         bundle_digest=b.bundle_digest(), packet_digest=b.score_packet.digest,
-        committed_track="compression", score=score, cycle_sequence=0,
+        committed_track="compression", score=score,
+        cycle_sequence=b.challenge_anchor.dispatch_ordering_key,
     )
 
 
@@ -412,11 +441,10 @@ def _implicit_carry_logs(store):
     exact case round-12's earning_inputs-only check missed. Built with `top_n_per_track=5`, so
     the five fresh tops (uids 11..15 @0.9) fill the podium and the carried-forward uid 6 (@0.1)
     ranks below the cutoff => zero weight but a positive accumulator with no EarningInput."""
-    from tests.auditor.fakes import BURN_UID, make_miner as fake_miner
+    from tests.auditor.fakes import BURN_UID, FakeEpochFinalizer, make_miner as fake_miner
     from vidaio.authority import build_audit_manifest
-    from vidaio.authority.finalizer import EpochFinalizer
 
-    fin = EpochFinalizer(TokenomicsConfig(), scorer_version=SCORER)
+    fin = FakeEpochFinalizer(TokenomicsConfig(), scorer_version=SCORER)
     # E1 (genesis): uids 1..5 @0.9 + uid 6 @0.1 (a below-cutoff loser that ends E1 with a
     # positive accumulator). Each has an EarningInput folded from a zero carry-in.
     e1_items, e1_miners = [], []
@@ -437,7 +465,7 @@ def _implicit_carry_logs(store):
     # forward with NO new item (implicit carry-forward, stays a zero-weight loser).
     e2_items, e2_miners = [], []
     for uid in range(11, 16):
-        b = _persisted_bundle(store, uid, f"e2i{uid}", 0.9)
+        b = _persisted_bundle(store, uid, f"e2i{uid}", 0.9, seq=2)
         e2_items.append(_scored(b, uid, 0.9))
         e2_miners.append(fake_miner(uid, _fold(0.0, [0.9])))
     e2_miners.append(fake_miner(6, carried))  # positive accumulator, NO EarningInput
@@ -448,6 +476,8 @@ def _implicit_carry_logs(store):
         epoch_id=2, close_block=7199, snapshots=tuple(e2_miners), burn_uid=BURN_UID,
         audit_manifest=e2_manifest, now=NOW,
         prior_log_digest=e1.log_digest(),
+        prior_earning={m.uid: (m.hotkey, m.accumulate_score) for m in e1.miners},
+        prior_fold_cursors=e1.audit_manifest.fold_cursors,
     )
     return e1, e2
 
@@ -543,6 +573,9 @@ async def test_gate_reports_disputed_substituted_weight(tmp_path) -> None:
         manifest = manifest.model_copy(
             update={"fold_cursors": {**manifest.fold_cursors, 2: None}}
         )
+        from tests.auditor.fakes import with_round_membership
+
+        manifest = with_round_membership(manifest, close_block=14399)
         # This case intentionally builds an inference-only epoch.
         log = EpochLog(
             epoch_id=4, close_block=14399, scorer_version=SCORER, created_at=NOW,

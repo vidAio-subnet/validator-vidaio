@@ -19,6 +19,13 @@ class WeightSetterConfig(BaseModel):
     #: How often a weight-set is attempted (design spec §01: 72 min against a ~20 min tempo).
     attempt_interval_seconds: float = Field(default=72 * 60.0, gt=0)
     reconciliation_interval_seconds: float = Field(default=300.0, gt=0)
+    #: Retry delay after an attempt HOLDs because the shared authority snapshot is
+    #: unavailable or its latest pointer lags the chain's latest finalized epoch.
+    #: A HOLD writes nothing, so a short retry only costs authority/chain reads and
+    #: the tempo gate still bounds writes. Without it the 72-minute cadence is
+    #: phase-locked about one minute after every epoch close — ahead of the
+    #: finalizer's publish — and loses that race every epoch (mainnet 2026-09-06).
+    stale_snapshot_retry_seconds: float = Field(default=300.0, gt=0)
     reveal_grace_seconds: float = Field(default=72 * 60.0, ge=0)
 
     #: Timeout around anchor_commitment. set_weights is deliberately not caller-
@@ -32,7 +39,7 @@ class WeightSetterConfig(BaseModel):
 
     #: Fleet convergence fence, synchronized with EPOCH_LOG_SCHEMA_VERSION.
     #: Report/test overlays may explicitly use zero; live defaults never do.
-    version_key: int = Field(default=16, ge=0)
+    version_key: int = Field(default=17, ge=0)
 
     #: This validator's hotkey. Used ONLY to read our own weight vector back off
     #: the chain when a set_weights attempt was ambiguous (a timeout leaves us

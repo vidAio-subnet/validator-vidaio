@@ -395,6 +395,7 @@ Section: `weightsetter` (schema `config.py::WeightSetterConfig`,
 | Key | Default | Meaning |
 |---|---|---|
 | `attempt_interval_seconds` | `4320` (72 min) | Attempt cadence (spec §01, against a ~20 min tempo gate — most attempts tempo-gate, which is metered as reschedule, not failure) |
+| `stale_snapshot_retry_seconds` | `300` | Retry delay after a HOLD caused by an unavailable or lagging shared snapshot (authority pointer behind the chain's latest finalized epoch). A HOLD writes nothing; without the short retry the 72-min cadence phase-locks one minute after every epoch close, ahead of the finalizer, and misses every epoch |
 | `chain_timeout_seconds` | `180` | Timeout around `anchor_commitment` (does NOT bound `set_weights` — the real adapter's inclusion wait must not be caller-cancelled) |
 | `chain_retry_attempts` | `3` | Bounded retry envelope for chain writes |
 | `chain_retry_base_delay_seconds` | `1.0` | Retry backoff base (exponential) |

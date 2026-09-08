@@ -32,7 +32,7 @@ from vidaio.auditor import (
     SamplePolicy,
     persist_bundle,
 )
-from vidaio.authority import EpochFinalizer, ScoredItem, build_audit_manifest
+from vidaio.authority import ScoredItem, build_audit_manifest as _build_audit_manifest
 from vidaio.epoch.log import (
     AuditManifest,
     CycleScore,
@@ -50,6 +50,8 @@ from tests.auditor.fakes import (
     NOW,
     SCORER,
     MetagraphAuditor,
+    FakeEpochFinalizer as EpochFinalizer,
+    with_round_membership,
     make_fake_bundle,
     make_miner,
     make_packet,
@@ -59,6 +61,10 @@ from tests.auditor.fakes import (
 DECAY = TokenomicsConfig().ewma_decay
 CFG = TokenomicsConfig()
 NO_SAMPLE = SamplePolicy(sample_rate=0.0, min_samples=0)  # earning-only, no media recompute
+
+
+def build_audit_manifest(*args, **kwargs):
+    return with_round_membership(_build_audit_manifest(*args, **kwargs), close_block=360_000)
 
 
 def _census(miners):
@@ -83,14 +89,14 @@ def _fold(prior: float, scores) -> float:
     return v
 
 
-def _bundle(store, source, uid, item_id, score, *, seq=0, excluded=False):
+def _bundle(store, source, uid, item_id, score, *, seq=1, excluded=False):
     packet = make_packet(
-        challenge_id="c1", item_id=item_id, miner_hotkey=f"hk{uid}", score=score,
+        challenge_id=f"c{seq}", item_id=item_id, miner_hotkey=f"hk{uid}", score=score,
         cycle_sequence=seq, excluded=excluded,
         metrics={"compression_rate": 0.1, "vmaf": 93.0, "final_score": score},
     )
     b = make_fake_bundle(
-        store, challenge_id="c1", item_id=item_id, miner_hotkey=f"hk{uid}", packet=packet,
+        store, challenge_id=f"c{seq}", item_id=item_id, miner_hotkey=f"hk{uid}", packet=packet,
         dispatch_ordering_key=seq,
     )
     persist_bundle(store, b)  # resolvable + stored (the finalizer probes it)
@@ -98,7 +104,7 @@ def _bundle(store, source, uid, item_id, score, *, seq=0, excluded=False):
     return b
 
 
-def _scored(b, uid, score, *, seq=0, excluded=False):
+def _scored(b, uid, score, *, seq=1, excluded=False):
     return ScoredItem(
         uid=uid, hotkey=f"hk{uid}", challenge_id=b.challenge_id, item_id=b.item_id,
         bundle_digest=b.bundle_digest(), packet_digest=b.score_packet.digest,
@@ -133,7 +139,7 @@ def _honest_genesis(store, source, per_uid_scores: dict[int, float]):
         burn_uid=BURN_UID,
         audit_manifest=manifest, now=NOW,
     )
-    return log, manifest, miners
+    return log, log.audit_manifest, miners
 
 
 # --- the crux: substituted accumulate_score + honest packets is CAUGHT ----------------
@@ -214,7 +220,7 @@ def test_substituted_bundle_backing_a_foreign_packet_is_disputed(tmp_path) -> No
     sub = ScoredItem(
         uid=1, hotkey="hk1", challenge_id=b1.challenge_id, item_id=b1.item_id,
         bundle_digest=b99.bundle_digest(), packet_digest=b1.score_packet.digest,
-        committed_track="compression", score=0.8, cycle_sequence=0,
+        committed_track="compression", score=0.8, cycle_sequence=1,
     )
     miner = make_miner(1, _fold(0.0, [0.8]))  # accumulate follows honestly from 0.8
     manifest = build_audit_manifest([sub], store=store)
@@ -243,19 +249,19 @@ def test_earning_bundle_with_null_miner_is_disputed(tmp_path) -> None:
     source = InMemoryBundleSource()
     # A valid-looking hk1 packet, but the bundle wrapping it pins NO miner (None).
     packet = make_packet(
-        challenge_id="c1", item_id="i1", miner_hotkey="hk1", score=0.8, cycle_sequence=0,
+        challenge_id="c1", item_id="i1", miner_hotkey="hk1", score=0.8, cycle_sequence=1,
         metrics={"compression_rate": 0.1, "vmaf": 93.0, "final_score": 0.8},
     )
     b = make_fake_bundle(
         store, challenge_id="c1", item_id="i1", miner_hotkey=None, packet=packet,
-        dispatch_ordering_key=0,
+        dispatch_ordering_key=1,
     )
     persist_bundle(store, b)
     source.add(b)
     item = ScoredItem(
         uid=1, hotkey="hk1", challenge_id="c1", item_id="i1",
         bundle_digest=b.bundle_digest(), packet_digest=b.score_packet.digest,
-        committed_track="compression", score=0.8, cycle_sequence=0,
+        committed_track="compression", score=0.8, cycle_sequence=1,
     )
     manifest = build_audit_manifest([item], store=store)
     fin = EpochFinalizer(CFG, scorer_version=SCORER)
@@ -283,19 +289,19 @@ def test_earning_packet_minted_for_foreign_miner_is_disputed(tmp_path) -> None:
     # The packet inside is minted for hk99; everything OUTER (bundle, ScoredItem, snapshot)
     # is uid 1 / hk1. Only reading the packet's internal identity exposes the reassignment.
     packet = make_packet(
-        challenge_id="c1", item_id="i1", miner_hotkey="hk99", score=0.8, cycle_sequence=0,
+        challenge_id="c1", item_id="i1", miner_hotkey="hk99", score=0.8, cycle_sequence=1,
         metrics={"compression_rate": 0.1, "vmaf": 93.0, "final_score": 0.8},
     )
     b = make_fake_bundle(
         store, challenge_id="c1", item_id="i1", miner_hotkey="hk1", packet=packet,
-        dispatch_ordering_key=0,
+        dispatch_ordering_key=1,
     )
     persist_bundle(store, b)
     source.add(b)
     item = ScoredItem(
         uid=1, hotkey="hk1", challenge_id="c1", item_id="i1",
         bundle_digest=b.bundle_digest(), packet_digest=b.score_packet.digest,
-        committed_track="compression", score=0.8, cycle_sequence=0,
+        committed_track="compression", score=0.8, cycle_sequence=1,
     )
     manifest = build_audit_manifest([item], store=store)
     fin = EpochFinalizer(CFG, scorer_version=SCORER)
@@ -364,7 +370,7 @@ def _multi_cycle_log(store, source, *, scores_by_seq):
         epoch_id=100, close_block=360_000, snapshots=(miner,),
         burn_uid=BURN_UID, audit_manifest=manifest, now=NOW,
     )
-    return log, manifest
+    return log, log.audit_manifest
 
 
 def test_reordered_cycle_scores_fold_is_caught(tmp_path) -> None:
@@ -373,15 +379,15 @@ def test_reordered_cycle_scores_fold_is_caught(tmp_path) -> None:
     value cross-check (the packet at seq 0 records 0.1, not 0.9)."""
     store = LocalFsStore(tmp_path / "s")
     source = InMemoryBundleSource()
-    log, manifest = _multi_cycle_log(store, source, scores_by_seq={0: 0.1, 1: 0.9})
+    log, manifest = _multi_cycle_log(store, source, scores_by_seq={1: 0.1, 2: 0.9})
     packets = {c.ordering_key: c.packet_digest for c in manifest.earning_for(1).cycle_scores}
 
     # Reorder the VALUES while keeping ordering keys ascending: claim seq0->0.9, seq1->0.1
     # (the reverse fold) — but committed packet seq0 records 0.1, so it FAILs.
     swapped = EarningInput(
         cycle_scores=(
-            CycleScore(packet_digest=packets[0], ordering_key=0, score=0.9),
-            CycleScore(packet_digest=packets[1], ordering_key=1, score=0.1),
+            CycleScore(packet_digest=packets[1], ordering_key=1, score=0.9),
+            CycleScore(packet_digest=packets[2], ordering_key=2, score=0.1),
         )
     )
     tampered = manifest.model_copy(update={"earning_inputs": {1: swapped}})
@@ -407,7 +413,7 @@ def test_unbacked_padded_zero_is_rejected(tmp_path) -> None:
     """An extra 0.0 cycle (extra decay) that no committed packet backs must FAIL."""
     store = LocalFsStore(tmp_path / "s")
     source = InMemoryBundleSource()
-    log, manifest = _multi_cycle_log(store, source, scores_by_seq={0: 0.8})
+    log, manifest = _multi_cycle_log(store, source, scores_by_seq={1: 0.8})
     real = manifest.earning_for(1).cycle_scores[0]
 
     from vidaio.audit.canonical import sha256_hex
@@ -416,11 +422,11 @@ def test_unbacked_padded_zero_is_rejected(tmp_path) -> None:
         cycle_scores=(
             real,
             # a 0.0 at seq 1 referencing a packet that is NOT one of uid 1's committed leaves
-            CycleScore(packet_digest=sha256_hex(b"ghost-packet"), ordering_key=1, score=0.0),
+            CycleScore(packet_digest=sha256_hex(b"ghost-packet"), ordering_key=2, score=0.0),
         )
     )
     tampered = manifest.model_copy(
-        update={"earning_inputs": {1: padded}, "fold_cursors": {1: 1}}
+        update={"earning_inputs": {1: padded}, "fold_cursors": {1: 2}}
     )
     miner = make_miner(1, _fold(0.0, [0.8, 0.0]))  # the extra-decayed value
     shares = build_weight_vector(CFG, (miner,), burn_uid=BURN_UID)
@@ -442,12 +448,12 @@ def test_substituted_exclusion_sentinel_is_rejected(tmp_path) -> None:
     """A -1 exclusion cycle over a packet that records NO exclusion must FAIL."""
     store = LocalFsStore(tmp_path / "s")
     source = InMemoryBundleSource()
-    log, manifest = _multi_cycle_log(store, source, scores_by_seq={0: 0.8})
+    log, manifest = _multi_cycle_log(store, source, scores_by_seq={1: 0.8})
     real = manifest.earning_for(1).cycle_scores[0]
 
     # Claim the committed (non-excluded) packet at seq 0 is a -1 exclusion.
     substituted = EarningInput(
-        cycle_scores=(CycleScore(packet_digest=real.packet_digest, ordering_key=0, score=-1.0),)
+        cycle_scores=(CycleScore(packet_digest=real.packet_digest, ordering_key=1, score=-1.0),)
     )
     tampered = manifest.model_copy(update={"earning_inputs": {1: substituted}})
     # accumulate -1 = excluded -> zero weight, so give the uid a real weight another way:
@@ -463,13 +469,13 @@ def test_evidenced_exclusion_then_recovery_passes(tmp_path) -> None:
     """A -1 exclusion BACKED by a committed exclusion packet, then recovery, verifies."""
     store = LocalFsStore(tmp_path / "s")
     source = InMemoryBundleSource()
-    b0 = _bundle(store, source, 1, "i0", 0.5, seq=0)
-    bx = _bundle(store, source, 1, "ix", 0.0, seq=1, excluded=True)  # committed exclusion
-    b2 = _bundle(store, source, 1, "i2", 0.8, seq=2)
+    b0 = _bundle(store, source, 1, "i0", 0.5, seq=1)
+    bx = _bundle(store, source, 1, "ix", 0.0, seq=2, excluded=True)  # committed exclusion
+    b2 = _bundle(store, source, 1, "i2", 0.8, seq=3)
     items = [
-        _scored(b0, 1, 0.5, seq=0),
-        _scored(bx, 1, 0.0, seq=1, excluded=True),
-        _scored(b2, 1, 0.8, seq=2),
+        _scored(b0, 1, 0.5, seq=1),
+        _scored(bx, 1, 0.0, seq=2, excluded=True),
+        _scored(b2, 1, 0.8, seq=3),
     ]
     acc = _fold(0.0, [0.5, -1.0, 0.8])
     miner = make_miner(1, acc)
@@ -488,7 +494,7 @@ def test_dropped_committed_cycle_is_caught(tmp_path) -> None:
     """Omitting a committed low-score cycle to keep accumulate high must FAIL."""
     store = LocalFsStore(tmp_path / "s")
     source = InMemoryBundleSource()
-    log, manifest = _multi_cycle_log(store, source, scores_by_seq={0: 0.9, 1: 0.1})
+    log, manifest = _multi_cycle_log(store, source, scores_by_seq={1: 0.9, 2: 0.1})
     keep = manifest.earning_for(1).cycle_scores[0]  # only the high cycle
 
     dropped = EarningInput(cycle_scores=(keep,))
@@ -525,28 +531,28 @@ def test_reordered_fold_via_authority_sequences_is_caught(tmp_path) -> None:
     # Item A: CHALLENGE-committed dispatch key 0 (folds FIRST), honest score 0.1. Item B:
     # committed key 1 (folds SECOND), honest score 0.9. The honest fold is [0.1, 0.9].
     # The authority wants the REVERSE fold [0.9, 0.1] (a different accumulator), so it
-    # stamps packet B's cycle_sequence=0 and packet A's cycle_sequence=1 (the ordering it
+    # stamps packet B's cycle_sequence=1 and packet A's cycle_sequence=2 (the ordering it
     # controls at scoring) — but the committed dispatch keys in the DAG_REVEALs are fixed.
     pa = make_packet(challenge_id="c1", item_id="iA", miner_hotkey="hk1", score=0.1,
-                     cycle_sequence=1, metrics={"compression_rate": 0.1, "vmaf": 93.0, "final_score": 0.1})
-    pb = make_packet(challenge_id="c1", item_id="iB", miner_hotkey="hk1", score=0.9,
-                     cycle_sequence=0, metrics={"compression_rate": 0.1, "vmaf": 93.0, "final_score": 0.9})
+                     cycle_sequence=2, metrics={"compression_rate": 0.1, "vmaf": 93.0, "final_score": 0.1})
+    pb = make_packet(challenge_id="c2", item_id="iB", miner_hotkey="hk1", score=0.9,
+                     cycle_sequence=1, metrics={"compression_rate": 0.1, "vmaf": 93.0, "final_score": 0.9})
     ba = make_fake_bundle(store, challenge_id="c1", item_id="iA", miner_hotkey="hk1",
-                          packet=pa, dispatch_ordering_key=0)  # committed FIRST
-    bb = make_fake_bundle(store, challenge_id="c1", item_id="iB", miner_hotkey="hk1",
-                          packet=pb, dispatch_ordering_key=1)  # committed SECOND
+                          packet=pa, dispatch_ordering_key=1)  # committed FIRST
+    bb = make_fake_bundle(store, challenge_id="c2", item_id="iB", miner_hotkey="hk1",
+                          packet=pb, dispatch_ordering_key=2)  # committed SECOND
     for b in (ba, bb):
         persist_bundle(store, b)
         source.add(b)
 
     # Build the honest manifest (per_uid refs), then override the earning input with the
     # authority's reordered fold: B first (ordering_key 0), A second (ordering_key 1).
-    items = [_scored(ba, 1, 0.1, seq=1), _scored(bb, 1, 0.9, seq=0)]
+    items = [_scored(ba, 1, 0.1, seq=2), _scored(bb, 1, 0.9, seq=1)]
     manifest = build_audit_manifest(items, store=store)
     reordered = EarningInput(
         cycle_scores=(
-            CycleScore(packet_digest=bb.score_packet.digest, ordering_key=0, score=0.9),
-            CycleScore(packet_digest=ba.score_packet.digest, ordering_key=1, score=0.1),
+            CycleScore(packet_digest=bb.score_packet.digest, ordering_key=1, score=0.9),
+            CycleScore(packet_digest=ba.score_packet.digest, ordering_key=2, score=0.1),
         )
     )
     tampered = manifest.model_copy(update={"earning_inputs": {1: reordered}})
@@ -579,9 +585,9 @@ def test_substituted_track_in_earning_path_is_caught(tmp_path) -> None:
     source = InMemoryBundleSource()
 
     packet = make_packet(challenge_id="c1", item_id="iT", miner_hotkey="hk1", score=0.8,
-                         cycle_sequence=0)  # the packet itself declares track=compression
+                         cycle_sequence=1)  # the packet itself declares track=compression
     b = make_fake_bundle(store, challenge_id="c1", item_id="iT", miner_hotkey="hk1",
-                         packet=packet, committed_track="compression", dispatch_ordering_key=0)
+                         packet=packet, committed_track="compression", dispatch_ordering_key=1)
     persist_bundle(store, b)
     source.add(b)
 
@@ -590,7 +596,7 @@ def test_substituted_track_in_earning_path_is_caught(tmp_path) -> None:
     item = ScoredItem(
         uid=1, hotkey="hk1", challenge_id="c1", item_id="iT",
         bundle_digest=b.bundle_digest(), packet_digest=b.score_packet.digest,
-        committed_track="upscaling", score=0.8, cycle_sequence=0,
+        committed_track="upscaling", score=0.8, cycle_sequence=1,
     )
     manifest = build_audit_manifest([item], store=store)
     fin = EpochFinalizer(CFG, scorer_version=SCORER)
@@ -718,7 +724,7 @@ def test_missing_earning_input_for_nonzero_uid_at_genesis_is_disputed(tmp_path) 
 # --- carry-in chaining across epochs (back to genesis) -------------------------------
 
 
-def _epoch(store, source, *, epoch_id, close_block, per_uid, priors, prior_log, seq=0):
+def _epoch(store, source, *, epoch_id, close_block, per_uid, priors, prior_log, seq=1):
     items, miners = [], []
     # The committed dispatch ordering_key is MONOTONIC per uid across epochs (the producer only
     # folds a packet whose key exceeds the highest already folded), so a LATER epoch chaining the
@@ -756,7 +762,7 @@ def test_carry_in_chains_against_the_prior_log(tmp_path) -> None:
     carry = _fold(0.0, [0.8])
     cur = _epoch(
         store, source, epoch_id=100, close_block=360_000,
-        per_uid={1: (0.5, _fold(carry, [0.5]))}, priors={1: carry}, prior_log=prior, seq=1,
+        per_uid={1: (0.5, _fold(carry, [0.5]))}, priors={1: carry}, prior_log=prior, seq=2,
     )
 
     report = _auditor(source).audit_epoch(cur, store, NO_SAMPLE, None, NOW, prior_log=prior)
@@ -776,14 +782,14 @@ def test_prior_epoch_packet_replay_is_disputed_even_when_fold_and_weights_match(
     source = InMemoryBundleSource()
     prior = _epoch(
         store, source, epoch_id=99, close_block=359_640,
-        per_uid={1: (0.8, _fold(0.0, [0.8]))}, priors={}, prior_log=None, seq=5,
+        per_uid={1: (0.8, _fold(0.0, [0.8]))}, priors={}, prior_log=None, seq=6,
     )
     carry = _fold(0.0, [0.8])  # uid 1 ended the prior epoch here (its cycle folded at key 5)
     # E+1 REPLAYS a cycle at key 3 (<= the prior max key 5) — a re-fold of already-counted work
     # that inflates the accumulator. The carry-in (== the prior accumulator) chains correctly and
     # the fold reproduces the stated accumulate_score, so ONLY the replay guard catches it.
-    b = _bundle(store, source, 1, "e100i1replay", 0.5, seq=3)
-    manifest = build_audit_manifest([_scored(b, 1, 0.5, seq=3)], store=store, prior_accumulate={1: carry})
+    b = _bundle(store, source, 1, "e100i1replay", 0.5, seq=4)
+    manifest = build_audit_manifest([_scored(b, 1, 0.5, seq=4)], store=store, prior_accumulate={1: carry})
     fin = EpochFinalizer(CFG, scorer_version=SCORER)
     cur = fin.build_log(
         epoch_id=100, close_block=360_000, snapshots=(make_miner(1, _fold(carry, [0.5])),),
@@ -804,10 +810,10 @@ def test_reactivation_after_carry_only_epoch_uses_cumulative_watermark(tmp_path)
     source = InMemoryBundleSource()
     # Prior epoch: uid 1 carried FORWARD (positive accumulator, NO earning input) alongside uid 2.
     prior_acc1 = _fold(0.0, [0.8])
-    b2 = _bundle(store, source, 2, "e99i2", 0.7, seq=1)
+    b2 = _bundle(store, source, 2, "e99i2", 0.7, seq=2)
     manifest99 = build_audit_manifest(
-        [_scored(b2, 2, 0.7, seq=1)], store=store, prior_accumulate={2: 0.0},
-        prior_fold_cursors={1: 0},
+        [_scored(b2, 2, 0.7, seq=2)], store=store, prior_accumulate={2: 0.0},
+        prior_fold_cursors={1: 1},
     )
     fin = EpochFinalizer(CFG, scorer_version=SCORER)
     prior = fin.build_log(
@@ -818,11 +824,11 @@ def test_reactivation_after_carry_only_epoch_uses_cumulative_watermark(tmp_path)
     )
     assert prior.audit_manifest.earning_for(1) is None  # uid 1 carried forward, no EI
 
-    assert prior.audit_manifest.fold_cursors[1] == 0
+    assert prior.audit_manifest.fold_cursors[1] == 1
     # E+1: uid 1 is ACTIVE again above its carried boundary.
-    b1 = _bundle(store, source, 1, "e100i1", 0.5, seq=2)
+    b1 = _bundle(store, source, 1, "e100i1", 0.5, seq=3)
     manifest100 = build_audit_manifest(
-        [_scored(b1, 1, 0.5, seq=2)], store=store,
+        [_scored(b1, 1, 0.5, seq=3)], store=store,
         prior_accumulate={1: prior_acc1},
         prior_fold_cursors=prior.audit_manifest.fold_cursors,
     )
@@ -857,9 +863,9 @@ def test_first_fold_after_explicit_null_cursor_is_clean(tmp_path) -> None:
     )
     assert prior.audit_manifest.fold_cursors == {1: None}
 
-    bundle = _bundle(store, source, 1, "e100-first", 0.8, seq=0)
+    bundle = _bundle(store, source, 1, "e100-first", 0.8, seq=1)
     manifest = build_audit_manifest(
-        [_scored(bundle, 1, 0.8, seq=0)],
+        [_scored(bundle, 1, 0.8, seq=1)],
         store=store,
         prior_accumulate={1: 0.0},
         prior_fold_cursors=prior.audit_manifest.fold_cursors,
@@ -902,10 +908,10 @@ def test_replay_after_excluded_carry_only_epoch_is_not_clean(tmp_path) -> None:
     # Prior epoch: uid 1 is EXCLUDED (accumulator latched to the -1 sentinel) and carried FORWARD
     # with NO earning input; uid 2 keeps the epoch non-empty with fresh evidence.
     excluded_acc = _fold(_fold(0.0, [0.8]), [-1.0])  # earned, then excluded → -1
-    b2 = _bundle(store, source, 2, "e99i2", 0.7, seq=1)
+    b2 = _bundle(store, source, 2, "e99i2", 0.7, seq=2)
     manifest99 = build_audit_manifest(
-        [_scored(b2, 2, 0.7, seq=1)], store=store, prior_accumulate={2: 0.0},
-        prior_fold_cursors={1: 0},
+        [_scored(b2, 2, 0.7, seq=2)], store=store, prior_accumulate={2: 0.0},
+        prior_fold_cursors={1: 1},
     )
     fin = EpochFinalizer(CFG, scorer_version=SCORER)
     prior = fin.build_log(
@@ -915,13 +921,13 @@ def test_replay_after_excluded_carry_only_epoch_is_not_clean(tmp_path) -> None:
         prior_log_digest="d" * 64, prior_earning={1: ("hk1", excluded_acc)},
     )
     assert prior.audit_manifest.earning_for(1) is None  # carried -1 forward, no EI
-    assert prior.audit_manifest.fold_cursors[1] == 0
+    assert prior.audit_manifest.fold_cursors[1] == 1
 
     # E+1: uid 1 RE-FOLDS an old packet (key 0) over the -1 restart — a replay of already-awarded
     # work. The fold reproduces the stated accumulator and the carry-in chains, so ONLY the
     # non-replay guard can catch it; the carried watermark makes the replay conclusive.
-    b1 = _bundle(store, source, 1, "e100i1", 0.5, seq=0)
-    manifest100 = build_audit_manifest([_scored(b1, 1, 0.5, seq=0)], store=store, prior_accumulate={1: 0.0})
+    b1 = _bundle(store, source, 1, "e100i1", 0.5, seq=1)
+    manifest100 = build_audit_manifest([_scored(b1, 1, 0.5, seq=1)], store=store, prior_accumulate={1: 0.0})
     cur = fin.build_log(
         epoch_id=100, close_block=360_000, snapshots=(make_miner(1, _fold(0.0, [0.5])),),
         burn_uid=BURN_UID, audit_manifest=manifest100, now=NOW, prior_log_digest=prior.log_digest(),
@@ -950,14 +956,14 @@ def test_replay_after_excluded_identity_omitted_for_one_epoch_is_not_clean(
     source = InMemoryBundleSource()
     fin = EpochFinalizer(CFG, scorer_version=SCORER)
 
-    earned = _bundle(store, source, 1, "e98-earned", 0.8, seq=0)
-    excluded = _bundle(store, source, 1, "e98-excluded", 0.0, seq=1, excluded=True)
-    keeper = _bundle(store, source, 2, "e98-keeper", 0.7, seq=0)
+    earned = _bundle(store, source, 1, "e98-earned", 0.8, seq=1)
+    excluded = _bundle(store, source, 1, "e98-excluded", 0.0, seq=2, excluded=True)
+    keeper = _bundle(store, source, 2, "e98-keeper", 0.7, seq=1)
     history_manifest = build_audit_manifest(
         [
-            _scored(earned, 1, 0.8, seq=0),
-            _scored(excluded, 1, 0.0, seq=1, excluded=True),
-            _scored(keeper, 2, 0.7, seq=0),
+            _scored(earned, 1, 0.8, seq=1),
+            _scored(excluded, 1, 0.0, seq=2, excluded=True),
+            _scored(keeper, 2, 0.7, seq=1),
         ],
         store=store,
         prior_fold_cursors={},
@@ -973,7 +979,7 @@ def test_replay_after_excluded_identity_omitted_for_one_epoch_is_not_clean(
         now=NOW,
         prior_fold_cursors={},
     )
-    assert prior.audit_manifest.fold_cursors[1] == 1
+    assert prior.audit_manifest.fold_cursors[1] == 2
 
     for offset in range(omission_epochs):
         carried = build_audit_manifest(
@@ -990,12 +996,12 @@ def test_replay_after_excluded_identity_omitted_for_one_epoch_is_not_clean(
             prior_earning={2: ("hk2", keeper_acc)},
             prior_fold_cursors=prior.audit_manifest.fold_cursors,
         )
-        assert prior.audit_manifest.fold_cursors[1] == 1
+        assert prior.audit_manifest.fold_cursors[1] == 2
 
     # Re-use the exact previously-folded packet at key 0.  A dishonest producer can bypass
     # its own refusal, but cannot make the auditor forget the anchored predecessor tombstone.
     replay_manifest = build_audit_manifest(
-        [_scored(earned, 1, 0.8, seq=0)],
+        [_scored(earned, 1, 0.8, seq=1)],
         store=store,
         prior_accumulate={1: 0.0},
     ).model_copy(update={"fold_cursors": prior.audit_manifest.fold_cursors})
@@ -1027,10 +1033,10 @@ def test_hotkey_ping_pong_cannot_reset_uid_fold_cursor(tmp_path) -> None:
     source = InMemoryBundleSource()
     fin = EpochFinalizer(CFG, scorer_version=SCORER)
 
-    old = _bundle(store, source, 1, "e98-a", 0.8, seq=5)
-    keeper0 = _bundle(store, source, 2, "e98-keeper", 0.7, seq=0)
+    old = _bundle(store, source, 1, "e98-a", 0.8, seq=6)
+    keeper0 = _bundle(store, source, 2, "e98-keeper", 0.7, seq=1)
     first_manifest = build_audit_manifest(
-        [_scored(old, 1, 0.8, seq=5), _scored(keeper0, 2, 0.7, seq=0)],
+        [_scored(old, 1, 0.8, seq=6), _scored(keeper0, 2, 0.7, seq=1)],
         store=store,
         prior_fold_cursors={},
     )
@@ -1047,9 +1053,9 @@ def test_hotkey_ping_pong_cannot_reset_uid_fold_cursor(tmp_path) -> None:
 
     # The uid is genuinely re-registered to B; its numeric accumulator resets, but the uid-slot
     # replay boundary remains 5 while another miner supplies this epoch's new evidence.
-    keeper1 = _bundle(store, source, 2, "e99-keeper", 0.7, seq=1)
+    keeper1 = _bundle(store, source, 2, "e99-keeper", 0.7, seq=2)
     b_manifest = build_audit_manifest(
-        [_scored(keeper1, 2, 0.7, seq=1)],
+        [_scored(keeper1, 2, 0.7, seq=2)],
         store=store,
         prior_accumulate={2: keeper_acc},
         prior_fold_cursors=first_a.audit_manifest.fold_cursors,
@@ -1068,12 +1074,12 @@ def test_hotkey_ping_pong_cannot_reset_uid_fold_cursor(tmp_path) -> None:
         prior_log_digest=first_a.log_digest(),
         prior_fold_cursors=first_a.audit_manifest.fold_cursors,
     )
-    assert middle_b.audit_manifest.fold_cursors[1] == 5
+    assert middle_b.audit_manifest.fold_cursors[1] == 6
 
     # A registers again and reuses its original key-5 packet.  Numeric carry-in 0 is correct for
     # B -> A, so only the uid-slot replay watermark exposes the double award.
     replay_manifest = build_audit_manifest(
-        [_scored(old, 1, 0.8, seq=5)],
+        [_scored(old, 1, 0.8, seq=6)],
         store=store,
         prior_accumulate={1: 0.0},
     ).model_copy(update={"fold_cursors": middle_b.audit_manifest.fold_cursors})
@@ -1109,13 +1115,13 @@ def test_deregistered_uid_fold_cursor_tombstone_cannot_be_deleted(tmp_path) -> N
         per_uid={1: (0.8, _fold(0.0, [0.8]))},
         priors={},
         prior_log=None,
-        seq=4,
+        seq=5,
     )
     # uid 1 is genuinely absent from the current metagraph/census; uid 2 is new.  Dropping
     # uid 1 from the watermark map is still tampering because it would let the slot replay key 4
     # if uid 1 later returned.
-    b2 = _bundle(store, source, 2, "e100i2", 0.7, seq=0)
-    dropped = build_audit_manifest([_scored(b2, 2, 0.7, seq=0)], store=store)
+    b2 = _bundle(store, source, 2, "e100i2", 0.7, seq=1)
+    dropped = build_audit_manifest([_scored(b2, 2, 0.7, seq=1)], store=store)
     fin = EpochFinalizer(CFG, scorer_version=SCORER)
     cur = fin.build_log(
         epoch_id=100,
@@ -1151,7 +1157,7 @@ def test_substituted_carry_in_is_caught_when_chained(tmp_path) -> None:
     lie = 0.9
     cur = _epoch(
         store, source, epoch_id=100, close_block=360_000,
-        per_uid={1: (0.5, _fold(lie, [0.5]))}, priors={1: lie}, prior_log=prior, seq=1,
+        per_uid={1: (0.5, _fold(lie, [0.5]))}, priors={1: lie}, prior_log=prior, seq=2,
     )
 
     report = _auditor(source).audit_epoch(cur, store, NO_SAMPLE, None, NOW, prior_log=prior)
@@ -1174,7 +1180,7 @@ def test_referenced_but_unavailable_prior_zero_carry_in_is_inconclusive(tmp_path
     # `cur` references `prior` (prior_log_digest set) but declares a ZERO carry-in.
     cur = _epoch(
         store, source, epoch_id=100, close_block=360_000,
-        per_uid={1: (0.8, _fold(0.0, [0.8]))}, priors={1: 0.0}, prior_log=prior, seq=1,
+        per_uid={1: (0.8, _fold(0.0, [0.8]))}, priors={1: 0.0}, prior_log=prior, seq=2,
     )
     # Audit WITHOUT supplying prior_log -> the referenced prior is unavailable.
     report = _auditor(source).audit_epoch(cur, store, NO_SAMPLE, None, NOW, prior_log=None)
@@ -1390,8 +1396,8 @@ def test_honest_zero_weight_carry_forward_stays_clean(tmp_path) -> None:
     items, miners = [], []
     top_prior = {uid: _fold(0.0, [0.9]) for uid in range(1, 6)}
     for uid in range(1, 6):
-        b = _bundle(store, source, uid, f"e100i{uid}", 0.9, seq=1)
-        items.append(_scored(b, uid, 0.9, seq=1))
+        b = _bundle(store, source, uid, f"e100i{uid}", 0.9, seq=2)
+        items.append(_scored(b, uid, 0.9, seq=2))
         miners.append(make_miner(uid, _fold(top_prior[uid], [0.9])))
     carried = _fold(0.0, [0.1])
     miners.append(make_miner(6, carried))  # uid 6 present, positive accumulator, NO new item
@@ -1432,8 +1438,8 @@ def test_honest_nonzero_weight_carry_forward_stays_clean(tmp_path) -> None:
     items, miners = [], []
     top_prior = {uid: _fold(0.0, [0.9]) for uid in range(1, 6)}
     for uid in range(1, 5):
-        b = _bundle(store, source, uid, f"e100i{uid}", 0.9, seq=1)
-        items.append(_scored(b, uid, 0.9, seq=1))
+        b = _bundle(store, source, uid, f"e100i{uid}", 0.9, seq=2)
+        items.append(_scored(b, uid, 0.9, seq=2))
         miners.append(make_miner(uid, _fold(top_prior[uid], [0.9])))
     miners.append(make_miner(5, top_prior[5]))  # nonzero-weight idle earner, NO new item
     manifest = build_audit_manifest(
@@ -1471,8 +1477,8 @@ def test_injected_nonzero_weight_carry_forward_disputes(tmp_path) -> None:
     items, miners = [], []
     top_prior = {uid: _fold(0.0, [0.9]) for uid in range(1, 6)}
     for uid in range(1, 5):
-        b = _bundle(store, source, uid, f"e100i{uid}", 0.9, seq=1)
-        items.append(_scored(b, uid, 0.9, seq=1))
+        b = _bundle(store, source, uid, f"e100i{uid}", 0.9, seq=2)
+        items.append(_scored(b, uid, 0.9, seq=2))
         miners.append(make_miner(uid, _fold(top_prior[uid], [0.9])))
     # uid 5 stays nonzero-weight but its accumulator JUMPS with no new evidence and != prior.
     miners.append(make_miner(5, _fold(top_prior[5], [0.9])))
@@ -1514,8 +1520,8 @@ def test_injected_zero_weight_carry_forward_disputes(tmp_path) -> None:
     items, miners = [], []
     top_prior = {uid: _fold(0.0, [0.9]) for uid in range(1, 6)}
     for uid in range(1, 6):
-        b = _bundle(store, source, uid, f"e100i{uid}", 0.9, seq=1)
-        items.append(_scored(b, uid, 0.9, seq=1))
+        b = _bundle(store, source, uid, f"e100i{uid}", 0.9, seq=2)
+        items.append(_scored(b, uid, 0.9, seq=2))
         miners.append(make_miner(uid, _fold(top_prior[uid], [0.9])))
     # uid 6's accumulator JUMPS to fold([0.5]) with no new evidence and != the prior fold([0.1]).
     miners.append(make_miner(6, _fold(0.0, [0.5])))
@@ -1555,19 +1561,19 @@ def test_reregistered_hotkey_inheriting_carry_in_disputes(tmp_path) -> None:
     # E+1: uid 1 is RE-REGISTERED as hkNEW; its committed evidence is under hkNEW, but the log
     # claims the previous owner's carry-in.
     packet = make_packet(
-        challenge_id="c1", item_id="e100i1", miner_hotkey="hkNEW", score=0.5, cycle_sequence=1,
+        challenge_id="c2", item_id="e100i1", miner_hotkey="hkNEW", score=0.5, cycle_sequence=2,
         metrics={"compression_rate": 0.1, "vmaf": 93.0, "final_score": 0.5},
     )
     b = make_fake_bundle(
-        store, challenge_id="c1", item_id="e100i1", miner_hotkey="hkNEW", packet=packet,
-        dispatch_ordering_key=1,
+        store, challenge_id="c2", item_id="e100i1", miner_hotkey="hkNEW", packet=packet,
+        dispatch_ordering_key=2,
     )
     persist_bundle(store, b)
     source.add(b)
     item = ScoredItem(
-        uid=1, hotkey="hkNEW", challenge_id="c1", item_id="e100i1",
+        uid=1, hotkey="hkNEW", challenge_id="c2", item_id="e100i1",
         bundle_digest=b.bundle_digest(), packet_digest=b.score_packet.digest,
-        committed_track="compression", score=0.5, cycle_sequence=1,
+        committed_track="compression", score=0.5, cycle_sequence=2,
     )
     reregistered = replace(
         make_miner(1, _fold(carry, [0.5])), hotkey="hkNEW", coldkey="ckNEW", ip="10.0.1.1"
@@ -1602,19 +1608,19 @@ def test_reregistered_hotkey_with_zero_carry_in_passes(tmp_path) -> None:
         per_uid={1: (0.8, _fold(0.0, [0.8]))}, priors={}, prior_log=None,
     )
     packet = make_packet(
-        challenge_id="c1", item_id="e100i1", miner_hotkey="hkNEW", score=0.5, cycle_sequence=1,
+        challenge_id="c2", item_id="e100i1", miner_hotkey="hkNEW", score=0.5, cycle_sequence=2,
         metrics={"compression_rate": 0.1, "vmaf": 93.0, "final_score": 0.5},
     )
     b = make_fake_bundle(
-        store, challenge_id="c1", item_id="e100i1", miner_hotkey="hkNEW", packet=packet,
-        dispatch_ordering_key=1,
+        store, challenge_id="c2", item_id="e100i1", miner_hotkey="hkNEW", packet=packet,
+        dispatch_ordering_key=2,
     )
     persist_bundle(store, b)
     source.add(b)
     item = ScoredItem(
-        uid=1, hotkey="hkNEW", challenge_id="c1", item_id="e100i1",
+        uid=1, hotkey="hkNEW", challenge_id="c2", item_id="e100i1",
         bundle_digest=b.bundle_digest(), packet_digest=b.score_packet.digest,
-        committed_track="compression", score=0.5, cycle_sequence=1,
+        committed_track="compression", score=0.5, cycle_sequence=2,
     )
     fresh = replace(
         make_miner(1, _fold(0.0, [0.5])), hotkey="hkNEW", coldkey="ckNEW", ip="10.0.1.1"
@@ -1663,9 +1669,9 @@ def test_active_epoch_cannot_reset_prior_miner_to_zero_without_evidence(tmp_path
     )
     prior2 = _fold(0.0, [0.6])
     # Current: only uid2 carries committed evidence; uid1 is present (same hk1) but reset to 0.0.
-    b2 = _bundle(store, source, 2, "e100i2", 0.6, seq=1)
+    b2 = _bundle(store, source, 2, "e100i2", 0.6, seq=2)
     manifest = build_audit_manifest(
-        [_scored(b2, 2, 0.6, seq=1)], store=store, prior_accumulate={2: prior2},
+        [_scored(b2, 2, 0.6, seq=2)], store=store, prior_accumulate={2: prior2},
         prior_fold_cursors=prior.audit_manifest.fold_cursors,
     )
     miners = (make_miner(1, 0.0), make_miner(2, _fold(prior2, [0.6])))
@@ -1700,9 +1706,9 @@ def test_genuine_deregistration_of_prior_positive_miner_is_not_falsely_disputed(
         priors={}, prior_log=None,
     )
     prior2 = _fold(0.0, [0.6])
-    b2 = _bundle(store, source, 2, "e100i2", 0.6, seq=1)  # monotonic: > the prior epoch's key 0
+    b2 = _bundle(store, source, 2, "e100i2", 0.6, seq=2)  # monotonic: > the prior epoch's key 0
     manifest = build_audit_manifest(
-        [_scored(b2, 2, 0.6, seq=1)], store=store, prior_accumulate={2: prior2},
+        [_scored(b2, 2, 0.6, seq=2)], store=store, prior_accumulate={2: prior2},
         prior_fold_cursors=prior.audit_manifest.fold_cursors,
     )
     fin = EpochFinalizer(CFG, scorer_version=SCORER)
@@ -1730,10 +1736,10 @@ def test_evidenced_exclusion_of_prior_positive_miner_is_not_falsely_disputed(tmp
         priors={}, prior_log=None,
     )
     prior1, prior2 = _fold(0.0, [0.6]), _fold(0.0, [0.6])
-    # monotonic keys: this epoch's cycles (seq=1) exceed the prior epoch's key 0 for each uid
-    bx = _bundle(store, source, 1, "e100ix", 0.0, seq=1, excluded=True)  # committed exclusion
-    b2 = _bundle(store, source, 2, "e100i2", 0.6, seq=1)
-    items = [_scored(bx, 1, 0.0, seq=1, excluded=True), _scored(b2, 2, 0.6, seq=1)]
+    # monotonic keys: this epoch's cycles (seq=2) exceed the prior epoch's key 0 for each uid
+    bx = _bundle(store, source, 1, "e100ix", 0.0, seq=2, excluded=True)  # committed exclusion
+    b2 = _bundle(store, source, 2, "e100i2", 0.6, seq=2)
+    items = [_scored(bx, 1, 0.0, seq=2, excluded=True), _scored(b2, 2, 0.6, seq=2)]
     manifest = build_audit_manifest(
         items, store=store, prior_accumulate={1: prior1, 2: prior2},
         prior_fold_cursors=prior.audit_manifest.fold_cursors,

@@ -15,7 +15,6 @@ from datetime import timedelta
 
 from vidaio.audit.store import LocalFsStore
 from vidaio.auditor import (
-    Auditor,
     AuditorConfig,
     AuditStatus,
     CREATED_AT_MISMATCH,
@@ -25,6 +24,7 @@ from vidaio.auditor import (
     SamplePolicy,
 )
 from vidaio.tokenomics import TokenomicsConfig
+from tests.auditor.fakes import FakeChronologyAuditor as Auditor
 
 from tests.auditor.fakes import (
     BURN_UID,

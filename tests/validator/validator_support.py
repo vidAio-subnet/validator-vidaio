@@ -114,6 +114,8 @@ class FakeChallengeClient:
         #: keeps the row; `dispatched` is only the not-yet-terminal view)
         self.recorded_owners: dict[str, str] = {}
         self._items: dict[str, ChallengeItem] = {}
+        self._dispatch_counter = 0
+        self._track_fetch_counts: dict[str, int] = {}
         #: SERVICE-SIDE state for GET /challenges: challenge_id -> (track, age, owner).
         #: A challenge lands here when the service produces it, which is BEFORE
         #: the response reaches the validator — that gap is the lost-response
@@ -227,6 +229,19 @@ class FakeChallengeClient:
         if track in self.fail_tracks:
             raise RuntimeError(f"challenge service down for {track}")
         item = self.item_for(track)
+        self._dispatch_counter += 1
+        occurrence = self._track_fetch_counts.get(track, 0) + 1
+        self._track_fetch_counts[track] = occurrence
+        challenge_id = f"ch-{track}" + (f"-{occurrence}" if occurrence > 1 else "")
+        item = item.model_copy(update={
+            "challenge_id": challenge_id,
+            "dispatch": item.dispatch.model_copy(update={"challenge_id": challenge_id}),
+            "commitment_anchor": item.commitment_anchor.model_copy(update={
+                "dispatch_ordering_key": self._dispatch_counter,
+                "commitment_hash": sha256_bytes(f"commitment:{track}:{occurrence}".encode()),
+            }),
+        })
+        self._items[track] = item
         # Service-side effect of a successful production: the challenge is
         # dispatched (age 0 — a live round's challenge is never old enough for
         # the sweep, which is exactly why the sweep is age-gated) and ATTRIBUTED

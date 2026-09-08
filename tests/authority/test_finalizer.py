@@ -519,3 +519,29 @@ def test_finalize_determinism_two_finalizers(store: LocalFsStore, tmp_path: Path
     b = EpochFinalizer(TokenomicsConfig(), scorer_version=SCORER).finalize(store=store_b, **kw)
     assert a.log_digest == b.log_digest
     assert a.weight_vector_digest == b.weight_vector_digest
+
+
+def test_finalizer_archives_the_applied_payout_floor(store: LocalFsStore) -> None:
+    """D-025: the log records the exact `payout_min_alpha_stake` its vector was built with."""
+    from dataclasses import replace
+
+    fin = EpochFinalizer(TokenomicsConfig(payout_min_alpha_stake=50.0), scorer_version=SCORER)
+    items = [_item(1, store), _item(2, store, score=0.9)]
+    manifest = build_audit_manifest(items, store=store)
+    rich = replace(_miner(1, _acc(0.8)), alpha_stake=100.0)
+    poor = replace(_miner(2, _acc(0.9)), alpha_stake=10.0)  # best score, below the floor
+    log = fin.build_log(
+        epoch_id=1, close_block=100, snapshots=(rich, poor), burn_uid=0,
+        audit_manifest=manifest, now=NOW,
+    )
+    assert log.payout_min_alpha_stake == 50.0
+    assert log.weight_shares[1] > 0.0
+    assert log.weight_shares.get(2, 0.0) == 0.0
+    assert EpochLog.from_json(log.to_json()).payout_min_alpha_stake == 50.0
+
+    default = EpochFinalizer(TokenomicsConfig(), scorer_version=SCORER).build_log(
+        epoch_id=1, close_block=100, snapshots=(rich, poor), burn_uid=0,
+        audit_manifest=manifest, now=NOW,
+    )
+    assert default.payout_min_alpha_stake == 0.0
+    assert default.weight_shares[2] > 0.0

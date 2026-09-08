@@ -159,6 +159,10 @@ def test_upscaling_factor_is_reconstructed_from_the_committed_seed_dag(
             backend_versions={},
             score=0.0,
             gate_passed=False,
+            canonical_content_digest=None,
+            content_fingerprint=None,
+            encoded_size=None,
+            canonicalization_plan_digest=None,
         )
 
     monkeypatch.setattr("vidaio.auditor.recomputer._score_sync", score)

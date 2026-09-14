@@ -292,7 +292,10 @@ async def test_concurrency_never_exceeds_max_concurrent_under_a_timeout_burst(
         )
     assert [r.status_code for r in responses] == [504, 504, 504, 504]
     # Releasing the slot on the AWAIT (the bug) would have run all four at once.
-    assert vmaf.calls == 4
+    # Two primary runs per compression request now (pristine basis + the scored
+    # served-input basis; no secondary model here); how many of the eight start
+    # before the app's shutdown drain gives up is timing, the invariant is the peak.
+    assert vmaf.calls >= 4
     assert vmaf.peak == 1
 
 

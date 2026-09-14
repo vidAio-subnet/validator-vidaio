@@ -48,6 +48,25 @@ def get_logger(name: str) -> logging.Logger:
     return logging.getLogger(name)
 
 
+def restore_levels(*, keep_prefixes: tuple[str, ...] = ("bittensor",)) -> int:
+    """Undo third-party level clamps so :func:`setup_logging`'s root level applies again.
+
+    Importing the bittensor SDK "enables default logging" by raising every logger that
+    already exists to CRITICAL (level 50), keeping only its own. Any service logger
+    created before that import — the scoring worker's, for one — then emits nothing at
+    all. Reset every non-SDK logger with an explicit level back to NOTSET and return
+    how many were reset.
+    """
+    reset = 0
+    for name, obj in list(logging.root.manager.loggerDict.items()):
+        if not isinstance(obj, logging.Logger) or name.startswith(keep_prefixes):
+            continue
+        if obj.level != logging.NOTSET:
+            obj.setLevel(logging.NOTSET)
+            reset += 1
+    return reset
+
+
 @contextlib.contextmanager
 def bound(**fields: Any) -> Iterator[None]:
     """Bind structured fields to every log line emitted inside the block."""

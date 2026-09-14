@@ -26,6 +26,21 @@ informational `GateSkip` (`require_secondary_vmaf=False` on the model-delta gate
 skips are persisted on the `ItemScore` packet, so a reader can always tell a packet
 that passed a check from one that never ran it.
 
+**Source-proximity residuals** (`plane_psnr.py`, `source_proximity_evidence.py`) —
+every measured compression packet also publishes `vmaf_residual`
+(VMAF vs pristine − VMAF vs the served input, both runs the scorer already makes) and
+`chroma_residual` (mean per-frame U/V-plane PSNR vs pristine − vs input, an exact
+integer-sum pass over the canonical y4m streams). They decide nothing per item. At
+round composition the authority builds a uid-sorted roster of every eligible
+measured packet, takes the round medians, and zeroes an output with
+`SOURCE_PROXIMITY` only when BOTH residuals exceed the medians by fixed margins
+(`+0.25` VMAF, `+0.10 dB` chroma) AND its absolute luma residual is positive — the
+signature of an encode of the sealed pristine reference rather than of the input.
+The verdict is minted like a content decision: the flagged item's packet carries the
+canonical roster witness, auditors re-derive medians/flags from the archived
+originals, recompute the flagged member's residuals from released media, and check
+the roster against the epoch's eligible fold set.
+
 **Fail-closed non-finite handling** (`finite.py` + everywhere) — NaN compares False
 against every threshold, so a non-finite metric would silently pass a gate or
 compose into a score. Formulas and aggregation raise `ValueError` at the boundary

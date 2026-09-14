@@ -34,13 +34,18 @@ from __future__ import annotations
 import json
 import math
 import numbers
+import time
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from dataclasses import replace
 from datetime import datetime
+from threading import Lock, get_ident, local
 from typing import Callable, Mapping, Protocol
 
 from pydantic import ValidationError
 
 from vidaio.audit.bundle import AuditBundle
+from vidaio.core.logging import get_logger, log_fields
 from vidaio.audit.canonical import canonical_json_bytes, sha256_hex
 from vidaio.audit.commitments import (
     load_competition_commitment,
@@ -169,6 +174,7 @@ _MAX_AUDIT_METADATA_BYTES = 16 * 1024 * 1024
 #: check is PROVABLE from the log's own bytes (no metagraph), so it fires even for a burn/empty log.
 _CENSUS_SOURCE = "census"
 _COMPETITION_SOURCE = "competition-economics"
+_LOG = get_logger(__name__)
 
 
 class MetagraphReader(Protocol):
@@ -419,6 +425,31 @@ class _Recomputer(Protocol):
     def recompute(self, bundle: object, artifacts: Mapping[ArtifactKind, bytes]): ...
 
 
+class _WorkerRecomputer:
+    """One backend composition per pool thread, shared behind the epoch memo."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self._caller = get_ident()
+        self._workers = local()
+        self._construction = Lock()
+        self._first_worker = True
+
+    def __getattr__(self, name):
+        if get_ident() == self._caller:
+            # Caller-thread economic verification follows pool shutdown and can
+            # reuse the original model, keeping at most N model instances alive.
+            return getattr(self._inner, name)
+        if not hasattr(self._workers, "recomputer"):
+            with self._construction:
+                if self._first_worker:
+                    self._workers.recomputer = self._inner
+                    self._first_worker = False
+                else:
+                    self._workers.recomputer = self._inner.for_worker()
+        return getattr(self._workers.recomputer, name)
+
+
 class Auditor:
     """Audits one epoch and produces (optionally submits) a signed AuditReport."""
 
@@ -516,6 +547,8 @@ class Auditor:
         historical_view = getattr(recomputer, "for_epoch_log", None)
         if callable(historical_view):
             recomputer = historical_view(epoch_log)
+        if self._config.recompute_concurrency > 1 and callable(getattr(recomputer, "for_worker", None)):
+            recomputer = _WorkerRecomputer(recomputer)
         from vidaio.auditor.content_cache import EpochRecomputer
         recomputer = EpochRecomputer(recomputer)
         try:
@@ -557,8 +590,11 @@ class Auditor:
         # identity the manifest attributes the item to — even when the bundle pins no miner
         #. None for an archived-baseline row (item.uid is None).
         hotkey_by_uid = {m.uid: m.hotkey for m in epoch_log.miners}
-        item_verdicts = tuple(
-            self._audit_item(
+        audit_context = copy_context()
+
+        def audit_sampled_item(item: AuditItem) -> ItemVerdict:
+            return audit_context.copy().run(
+                self._audit_item,
                 item,
                 store,
                 recomputer,
@@ -608,7 +644,19 @@ class Auditor:
                     else None
                 ),
             )
-            for item in sampled
+        audit_started = time.monotonic()
+        # map retains sampled order; the context manager waits for every running
+        # item before an unexpected exception can leave this audit invocation.
+        with ThreadPoolExecutor(max_workers=self._config.recompute_concurrency) as executor:
+            item_verdicts = tuple(executor.map(audit_sampled_item, sampled))
+        _LOG.info(
+            "epoch items audited",
+            extra=log_fields(
+                epoch_id=epoch_log.epoch_id,
+                n_items=len(sampled),
+                concurrency=self._config.recompute_concurrency,
+                seconds=time.monotonic() - audit_started,
+            ),
         )
         # an internal review: read the close-block METAGRAPH ourselves and bind the
         # SNAPSHOT-derivable weight inputs (uid->hotkey/coldkey/ip identity, the IP/coldkey
@@ -700,6 +748,8 @@ class Auditor:
         # coverage floor (their sources are not media strata).
         from vidaio.auditor.content_evidence import audit_manifest_rounds
         content_verdicts = audit_manifest_rounds(self, epoch_log, store, recomputer, prior_log=prior_log)
+        from vidaio.auditor.source_evidence import audit_source_rounds
+        content_verdicts = content_verdicts + audit_source_rounds(epoch_log, store)
         from vidaio.auditor.round_membership import audit_round_membership
         round_verdicts = audit_round_membership(self, epoch_log, store, prior_log, is_genesis)
         earning_verdicts = (

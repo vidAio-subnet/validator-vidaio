@@ -101,6 +101,49 @@ def test_compose_without_breakdown_scores_zero() -> None:
     assert item.skips == []
 
 
+@pytest.mark.parametrize("gate_passed", [False, True])
+@pytest.mark.parametrize("with_breakdown", [False, True])
+@pytest.mark.parametrize("shared_score", [0.1 / 3, 0.5, 1.0])
+def test_equal_share_replaces_computed_score_for_either_gate_outcome(
+    gate_passed: bool, with_breakdown: bool, shared_score: float,
+) -> None:
+    breakdown = score_compression(
+        candidate_bytes=500, reference_bytes=1000, vmaf=92.0, config=CFG,
+    ) if with_breakdown else None
+    metrics = {"content_duplicate_witness": "fixture witness", "vmaf_primary": 92.0}
+    item = compose_item_score(
+        item_id="shared-item", challenge_id="shared-challenge", track="compression",
+        gate_passed=gate_passed, violations=[], breakdown=breakdown, config=CFG,
+        shared_score=shared_score, metrics=metrics,
+    )
+    assert item.score == shared_score
+    assert item.gate_passed is gate_passed
+    assert item.breakdown == breakdown and item.metrics == metrics
+    assert ItemScore.from_json(item.to_json()) == item
+
+
+@pytest.mark.parametrize("shared_score", [
+    0.0, -0.1, 1.0000001, float("nan"), float("inf"), float("-inf"),
+])
+def test_equal_share_requires_a_positive_finite_bounded_score(shared_score: float) -> None:
+    with pytest.raises(ValueError):
+        compose_item_score(
+            item_id="shared-item", challenge_id="shared-challenge", track="compression",
+            gate_passed=False, violations=[], breakdown=None, config=CFG,
+            shared_score=shared_score, metrics={"content_duplicate_witness": "fixture witness"},
+        )
+
+
+@pytest.mark.parametrize("metrics", [None, {}, {"vmaf_primary": 92.0}])
+def test_equal_share_requires_content_duplicate_witness_metric(metrics) -> None:
+    with pytest.raises(ValueError, match="content_duplicate_witness"):
+        compose_item_score(
+            item_id="shared-item", challenge_id="shared-challenge", track="compression",
+            gate_passed=False, violations=[], breakdown=None, config=CFG,
+            shared_score=0.25, metrics=metrics,
+        )
+
+
 def test_gate_skips_round_trip_through_item_json() -> None:
     # A consciously-disabled check is part of the persisted audit packet, not
     # transient GateContext state (compose_item_score threads GateContext.skips).

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class AuthorityConfig(BaseModel):
@@ -71,3 +71,18 @@ class AuthorityConfig(BaseModel):
     #: the operator confirms may be declared as a gap. Set via
     #: `VIDAIO__AUTHORITY__GAP_ACK_THROUGH_EPOCH`, remove after recovery.
     gap_ack_through_epoch: int | None = Field(default=None, ge=1)
+
+    #: Acknowledge one unresolved authority submission without authorizing a new
+    #: anchor or extending its deadline. Remove after recovery; preflight rejects
+    #: hashes which no longer identify a pending submission.
+    #: Env: VIDAIO__AUTHORITY__ANCHOR_SUBMISSION_ACK.
+    anchor_submission_ack: str | None = Field(default=None, pattern=r"^0x[0-9a-f]{64}$")
+
+    @field_validator("anchor_submission_ack", mode="before")
+    @classmethod
+    def _ack_hash_from_environment(cls, value: object) -> object:
+        # The shared environment loader parses YAML scalars; an unquoted 0x
+        # hash becomes an integer. Restore its canonical 32-byte representation.
+        if isinstance(value, int) and not isinstance(value, bool) and 0 <= value < 2**256:
+            return f"0x{value:064x}"
+        return value

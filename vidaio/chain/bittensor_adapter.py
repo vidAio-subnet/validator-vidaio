@@ -30,12 +30,15 @@ from __future__ import annotations
 import asyncio
 import inspect
 import math
+import re
 import threading
 import time
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from functools import wraps
+from hashlib import blake2b
 from pathlib import Path
 from typing import Any, Callable, Protocol, runtime_checkable
 
@@ -53,6 +56,7 @@ from vidaio.chain.adapter import (
 )
 from vidaio.chain.anchor_writer import anchor_writer_lock
 from vidaio.core import get_logger
+from vidaio.core.logging import restore_levels
 
 #: The canonical deterministic quantizer now lives in the dependency-free shared
 #: home vidaio/tokenomics/quantize.py (the project design record wave 1 —
@@ -68,6 +72,7 @@ __all__ = [
     "BittensorChainAdapter",
     "BittensorHotkeySigner",
     "BittensorReadOnlyChainAdapter",
+    "ChainReadTimeout",
     "CommitmentCapacity",
     "EpochScheduleView",
     "MetagraphView",
@@ -90,6 +95,84 @@ _INSTALL_HINT = (
 
 class ReadOnlyChainError(PermissionError):
     """A signing or mutation was attempted through a wallet-free chain reader."""
+
+
+class ChainReadTimeout(ChainStateUnavailable, TimeoutError):
+    """A read exceeded its deadline; its transport must be replaced before retry."""
+
+
+_CHAIN_SHORT_READ_SECONDS = 30.0
+_CHAIN_ARCHIVE_READ_SECONDS = 120.0
+
+
+def _bounded_chain_read(*, archive: bool = False):
+    """Bound a side-effect-free read, including transport acquisition/reconnect."""
+    def decorate(method):
+        @wraps(method)
+        def bounded(self, *args, **kwargs):
+            seconds = (
+                _CHAIN_ARCHIVE_READ_SECONDS
+                if archive
+                else min(_CHAIN_SHORT_READ_SECONDS, self._config.rpc_timeout_seconds)
+            )
+            return self._run_chain_read(
+                lambda: method(self, *args, **kwargs), seconds, method.__name__
+            )
+        return bounded
+    return decorate
+
+
+class AuthorityAnchorConfirmationPending(TimeoutError):
+    """The durable submitted hash remains unresolved; only confirmation may retry."""
+
+
+class AuthorityAnchorExpiredAbsent(RuntimeError):
+    """The complete finalized era search proves this signed hash cannot land."""
+
+    def __init__(self, evidence: dict[str, Any]) -> None:
+        self.evidence = evidence
+        super().__init__(
+            f"authority anchor {evidence['extrinsic_hash']} expired without inclusion; "
+            f"finalized blocks {evidence['search_start']}..{evidence['search_end']} "
+            "were completely searched"
+        )
+
+
+def _validate_authority_submission(submission: Mapping[str, Any]) -> None:
+    """Reject malformed durable submission evidence before touching a transport."""
+    txid = submission.get("extrinsic_hash")
+    encoded = submission.get("extrinsic_hex")
+    if not isinstance(txid, str) or re.fullmatch(r"0x[0-9a-f]{64}", txid) is None:
+        raise ValueError("authority anchor extrinsic_hash must be lowercase 32-byte hex")
+    if (
+        not isinstance(encoded, str)
+        or re.fullmatch(r"0x(?:[0-9a-f]{2})+", encoded) is None
+    ):
+        raise ValueError("authority anchor extrinsic_hex must contain encoded bytes")
+    if "0x" + blake2b(bytes.fromhex(encoded[2:]), digest_size=32).hexdigest() != txid:
+        raise ValueError("authority anchor extrinsic_hash does not match the signed bytes")
+    block = submission.get("submit_block")
+    if isinstance(block, bool) or not isinstance(block, int) or block < 0:
+        raise ValueError("authority anchor submit_block must be a nonnegative integer")
+    submitted_at = submission.get("submit_time")
+    if (
+        isinstance(submitted_at, bool)
+        or not isinstance(submitted_at, (int, float))
+        or not math.isfinite(submitted_at)
+        or submitted_at < 0
+    ):
+        raise ValueError("authority anchor submit_time must be finite and nonnegative")
+    nonce = submission.get("nonce")
+    if nonce is not None and (
+        isinstance(nonce, bool) or not isinstance(nonce, int) or nonce < 0
+    ):
+        raise ValueError("authority anchor nonce must be a nonnegative integer or None")
+    era = submission.get("mortal_era")
+    if era is not None and (
+        isinstance(era, bool) or not isinstance(era, int)
+        or era < 4 or era > 65536 or era & (era - 1)
+    ):
+        raise ValueError("authority anchor mortal_era must be a decoded mortal period or None")
 
 
 # --------------------------------------------------------------------------------------
@@ -283,6 +366,31 @@ class _TransportGeneration:
     lock: Any = field(default_factory=threading.RLock, repr=False)
 
 
+@dataclass
+class _ChainReadScope:
+    name: str
+    deadline: float
+    generation: _TransportGeneration
+    parent: _ChainReadScope | None = None
+    cancelled: threading.Event = field(default_factory=threading.Event)
+
+    def check(self) -> None:
+        if self.parent is not None:
+            self.parent.check()
+        if self.cancelled.is_set() or time.monotonic() >= self.deadline:
+            raise ChainReadTimeout(f"subtensor read {self.name!r} exceeded its deadline")
+
+
+@dataclass(frozen=True)
+class _ChainSnapshot:
+    generation: _TransportGeneration
+    neurons: list[ChainNeuron]
+    block: int
+    own_uid: int | None
+    own_last_update: int | None
+    rate_limit: int
+
+
 # --------------------------------------------------------------------------------------
 # Adapter configuration.
 # --------------------------------------------------------------------------------------
@@ -419,6 +527,7 @@ class BittensorChainAdapter:
         self._unreaped_generations: dict[str, threading.Thread] = {}
         self._retired_generation_sequences: set[int] = set()
         self._next_transport_sequence = 0
+        self._chain_read_scope = threading.local()
 
         # How the socket is (re)built. Tests pass a fake factory; production
         # defaults to the real, lazily-imported one. When only a transport is
@@ -608,6 +717,67 @@ class BittensorChainAdapter:
             >= self._config.reconnect_after_consecutive_failures
         )
 
+    def _check_chain_read(self) -> None:
+        scope = getattr(self._chain_read_scope, "current", None)
+        if scope is not None:
+            scope.check()
+
+    def _run_chain_read(
+        self, fn: Callable[[], Any], seconds: float, name: str
+    ) -> Any:
+        parent = getattr(self._chain_read_scope, "current", None)
+        deadline = time.monotonic() + seconds
+        if parent is not None:
+            parent.check()
+            deadline = min(deadline, parent.deadline)
+        with self._transport_state_lock:
+            scope = _ChainReadScope(name, deadline, self._main_generation, parent)
+
+        def read() -> Any:
+            self._chain_read_scope.current = scope
+            try:
+                scope.check()
+                result = fn()
+                scope.check()
+                return result
+            finally:
+                del self._chain_read_scope.current
+
+        try:
+            result = _run_with_timeout(read, max(0.0, deadline - time.monotonic()), name)
+            scope.check()
+            with self._transport_state_lock:
+                if scope.generation is not self._main_generation or self._condemned:
+                    raise ChainStateUnavailable(
+                        f"subtensor read {name!r} completed on a retired transport"
+                    )
+            return result
+        except Exception as exc:
+            # Public reads add ChainStateUnavailable context. Preserve a timeout
+            # through that context so it cannot become "missing archive state".
+            cause: BaseException | None = exc
+            while cause is not None and not isinstance(cause, TimeoutError):
+                cause = cause.__cause__
+            if cause is None:
+                raise
+            scope.cancelled.set()
+            with self._transport_state_lock:
+                if scope.generation is self._main_generation:
+                    self._condemned = True
+            raise ChainReadTimeout(f"subtensor read {name!r} timed out: {cause}") from exc
+
+    @contextmanager
+    def _read_aware_reconnect_lock(self):
+        # Normal write callers retain their existing lock semantics. A read
+        # abandoned while waiting must not later build/install a new transport.
+        while not self._main_reconnect_lock.acquire(timeout=0.05):
+            self._check_chain_read()
+        try:
+            self._check_chain_read()
+            yield
+        finally:
+            self._main_reconnect_lock.release()
+
     def _reconnect(self, *, force: bool = True) -> None:
         """Atomically install a fresh socket; retire the old one asynchronously.
 
@@ -616,52 +786,67 @@ class BittensorChainAdapter:
         worker abandoned after timeout can therefore remain wedged without freezing
         all subsequent reads and submissions.
         """
-        with self._main_reconnect_lock:
-            with self._transport_state_lock:
-                if not force and not self._main_reconnect_due():
-                    return
-                failures = self._consecutive_failures
-                condemned = self._condemned
-            self._log.warning(
-                "reconnecting the subtensor socket",
-                extra={
-                    "consecutive_failures": failures,
-                    "condemned": condemned,
-                },
-            )
-            replacement = self._connect_transport()
-            self._validate_transport_identity(replacement)
-            replacement_generation = self._new_generation(replacement)
-            redundant = False
-            old_generation: _TransportGeneration | None = None
-            with self._transport_state_lock:
-                if not force and not self._main_reconnect_due():
-                    redundant = True
-                else:
-                    old_generation = self._main_generation
-                    self._main_generation = replacement_generation
-                    self._transport = replacement
-                    self._socket_lock = replacement_generation.lock
-                    if self._anchor_transport_is_shared:
-                        self._anchor_generation = replacement_generation
-                        self._anchor_transport = replacement
-                        self._anchor_socket_lock = replacement_generation.lock
-                    self._consecutive_failures = 0
-                    self._condemned = False
-
-            if redundant:
-                self._retire_generation("redundant-main", replacement_generation)
-                return
-            assert old_generation is not None
-            if old_generation.transport is not replacement:
-                self._retire_generation("main", old_generation)
-            else:
-                # Only an injected singleton factory can do this. It cannot provide
-                # timeout isolation, but must not be closed as its own replacement.
+        expired_replacement: _TransportGeneration | None = None
+        try:
+            with self._read_aware_reconnect_lock():
+                with self._transport_state_lock:
+                    if not force and not self._main_reconnect_due():
+                        return
+                    failures = self._consecutive_failures
+                    condemned = self._condemned
                 self._log.warning(
-                    "transport factory reused the condemned transport; reconnect "
-                    "cannot isolate an abandoned SDK generation"
+                    "reconnecting the subtensor socket",
+                    extra={
+                        "consecutive_failures": failures,
+                        "condemned": condemned,
+                    },
                 )
+                replacement = self._connect_transport()
+                replacement_generation = self._new_generation(replacement)
+                expired_replacement = replacement_generation
+                self._check_chain_read()
+                self._validate_transport_identity(replacement)
+                redundant = False
+                old_generation: _TransportGeneration | None = None
+                with self._transport_state_lock:
+                    self._check_chain_read()
+                    if not force and not self._main_reconnect_due():
+                        redundant = True
+                    else:
+                        old_generation = self._main_generation
+                        self._main_generation = replacement_generation
+                        self._transport = replacement
+                        self._socket_lock = replacement_generation.lock
+                        if self._anchor_transport_is_shared:
+                            self._anchor_generation = replacement_generation
+                            self._anchor_transport = replacement
+                            self._anchor_socket_lock = replacement_generation.lock
+                        self._consecutive_failures = 0
+                        self._condemned = False
+
+                expired_replacement = None
+                if redundant:
+                    self._retire_generation("redundant-main", replacement_generation)
+                    return
+                assert old_generation is not None
+                if old_generation.transport is not replacement:
+                    self._retire_generation("main", old_generation)
+                else:
+                    # Only an injected singleton factory can do this. It cannot provide
+                    # timeout isolation, but must not be closed as its own replacement.
+                    self._log.warning(
+                        "transport factory reused the condemned transport; reconnect "
+                        "cannot isolate an abandoned SDK generation"
+                    )
+        except ChainReadTimeout:
+            # Discard a replacement whose read deadline expired during connect or
+            # identity validation. Release the reconnect lock before cleanup.
+            if (
+                expired_replacement is not None
+                and expired_replacement.transport is not self._main_generation.transport
+            ):
+                self._retire_generation("expired-main", expired_replacement)
+            raise
 
     def _ensure_main_transport(self) -> None:
         with self._transport_state_lock:
@@ -673,14 +858,22 @@ class BittensorChainAdapter:
     def _transport_call(self):
         """Yield a serialized current transport, escaping a condemned busy lock."""
         while True:
+            self._check_chain_read()
             self._ensure_main_transport()
+            self._check_chain_read()
             with self._transport_state_lock:
                 generation = self._main_generation
+                scope = getattr(self._chain_read_scope, "current", None)
+                while scope is not None:
+                    scope.check()
+                    scope.generation = generation
+                    scope = scope.parent
 
             # Poll instead of waiting forever: cancellation may condemn the
             # generation after we selected it but while another worker owns it.
             acquired = False
             while not acquired:
+                self._check_chain_read()
                 acquired = generation.lock.acquire(timeout=0.05)
                 if acquired:
                     break
@@ -703,6 +896,7 @@ class BittensorChainAdapter:
                 generation.lock.release()
                 continue
             try:
+                self._check_chain_read()
                 yield generation.transport
             finally:
                 generation.lock.release()
@@ -837,6 +1031,7 @@ class BittensorChainAdapter:
         """Last observed head; 0 until the first successful refresh."""
         return self._block
 
+    @_bounded_chain_read()
     def best_head_block(self) -> int:
         """Fresh bounded read for the round-commit/epoch-selection SQL fence.
 
@@ -851,13 +1046,14 @@ class BittensorChainAdapter:
             return value
 
         try:
-            return _run_with_timeout(read, self._config.rpc_timeout_seconds, "best_head_block")
+            return read()
         except Exception as exc:
             self._note_raise()
             raise ChainStateUnavailable(
                 f"cannot read fresh best head: {type(exc).__name__}: {exc}"
             ) from exc
 
+    @_bounded_chain_read()
     def finalized_block(self) -> int:
         """Return the latest GRANDPA-finalized height from the live socket.
 
@@ -887,6 +1083,7 @@ class BittensorChainAdapter:
                 f"adapter is bound to subnet {self._config.netuid}, not {netuid}"
             )
 
+    @_bounded_chain_read()
     def _epoch_index_at(self, netuid: int, block_number: int) -> int:
         with self._transport_call() as transport:
             value = transport.epoch_index(netuid, block_number)
@@ -897,6 +1094,7 @@ class BittensorChainAdapter:
             raise ValueError(f"negative SubnetEpochIndex {index}")
         return index
 
+    @_bounded_chain_read()
     def _epoch_schedule_at(self, netuid: int, block_number: int) -> EpochScheduleView:
         with self._transport_call() as transport:
             state = transport.epoch_schedule(netuid, block_number)
@@ -944,6 +1142,23 @@ class BittensorChainAdapter:
                 )
             return cached.close_block
 
+        candidate = self._find_epoch_close_block_uncached(
+            netuid=netuid, epoch_id=epoch_id, finalized=finalized,
+            finalized_index=finalized_index,
+        )
+        # Only the caller that received a timely complete proof may publish it.
+        # An abandoned archive worker never writes shared cache state.
+        if candidate is not None:
+            self._epoch_boundaries[epoch_id] = EpochBoundary(
+                epoch_id=epoch_id, close_block=candidate
+            )
+        return candidate
+
+    @_bounded_chain_read(archive=True)
+    def _find_epoch_close_block_uncached(
+        self, *, netuid: int, epoch_id: int, finalized: int,
+        finalized_index: int | None = None,
+    ) -> int | None:
         if finalized < 2:
             return None
         high_index = (
@@ -978,6 +1193,8 @@ class BittensorChainAdapter:
                 )
             try:
                 probe_index = self._epoch_index_at(netuid, probe)
+            except TimeoutError:
+                raise
             except Exception as unavailable:  # noqa: BLE001 - migration prefix
                 # Storage availability is a prefix boundary for this runtime
                 # item.  Bisect that boundary without treating the unavailable
@@ -990,6 +1207,8 @@ class BittensorChainAdapter:
                     middle = (unreadable + readable) // 2
                     try:
                         middle_index = self._epoch_index_at(netuid, middle)
+                    except TimeoutError:
+                        raise
                     except Exception as exc:  # noqa: BLE001 - same prefix search
                         unreadable = middle
                         last_unavailable = exc
@@ -1055,8 +1274,6 @@ class BittensorChainAdapter:
                 "archive state; refusing to synthesize a boundary"
             )
 
-        boundary = EpochBoundary(epoch_id=epoch_id, close_block=candidate)
-        self._epoch_boundaries[epoch_id] = boundary
         return candidate
 
     def epoch_close_block(self, *, netuid: int, epoch_id: int) -> int | None:
@@ -1151,6 +1368,13 @@ class BittensorChainAdapter:
         refreshes the cached head and own-uid LastUpdate so set_weights can
         pre-gate.
         """
+        try:
+            self.refresh_for_authority_finalizer()
+        except Exception:  # noqa: BLE001 - legacy refresh contract never raises
+            pass
+
+    def refresh_for_authority_finalizer(self) -> None:
+        """Refresh with the same TTL, raising on failure so the finalizer HOLDs."""
         now = self._clock()
         if (
             self._last_successful_refresh is not None
@@ -1159,35 +1383,18 @@ class BittensorChainAdapter:
             return  # inside the TTL — cheap snapshot read, no RPC
 
         try:
-            # Reads share the exact socket used by the blocking write path.  Hold
-            # the mutex across the whole coherent snapshot so refresh cannot run on
-            # a socket whose caller-abandoned set_weights worker is still alive.
-            with self._transport_call() as transport:
-                view = transport.metagraph(self._config.netuid)
-                neurons = self._map_metagraph(view)
-                block = transport.current_block()
-                if self._config.read_only:
-                    # Registration-only consumers need the live metagraph, not a
-                    # fictitious "own" uid. Avoid identity-specific reads entirely.
-                    own_uid = None
-                    own_last_update = None
-                    rate_limit = 0
-                else:
-                    own_uid = transport.uid_for_hotkey(
-                        self._config.validator_hotkey, self._config.netuid
-                    )
-                    own_last_update = (
-                        transport.query_last_update(self._config.netuid, own_uid)
-                        if own_uid is not None
-                        else None
-                    )
-                    # weights_rate_limit is effectively static; read it best-effort here
-                    # so the pre-gate has it (0 = pre-gate disabled; the chain re-checks).
-                    try:
-                        rate_limit = transport.weights_rate_limit(self._config.netuid)
-                    except Exception:  # noqa: BLE001 - optional pre-gate input only
-                        rate_limit = self._weights_rate_limit
-        except Exception as exc:  # noqa: BLE001 - refresh() MUST NOT raise
+            snapshot = self._read_refresh_snapshot()
+            with self._transport_state_lock:
+                if snapshot.generation is not self._main_generation or self._condemned:
+                    raise ChainStateUnavailable("snapshot completed on a retired transport")
+                self._neurons = snapshot.neurons
+                self._block = snapshot.block
+                self._own_uid = snapshot.own_uid
+                self._own_last_update = snapshot.own_last_update
+                self._weights_rate_limit = snapshot.rate_limit
+                self._last_successful_refresh = self._clock()
+                self._last_refresh_error = None
+        except Exception as exc:
             self._note_raise()
             self._last_refresh_error = f"{type(exc).__name__}: {exc}"
             self._log.warning(
@@ -1198,15 +1405,46 @@ class BittensorChainAdapter:
                     "consecutive_failures": self._consecutive_failures,
                 },
             )
-            return
+            if isinstance(exc, ChainStateUnavailable):
+                raise
+            raise ChainStateUnavailable(
+                f"cannot refresh chain snapshot: {type(exc).__name__}: {exc}"
+            ) from exc
 
-        self._neurons = neurons
-        self._block = block
-        self._own_uid = own_uid
-        self._own_last_update = own_last_update
-        self._weights_rate_limit = rate_limit
-        self._last_successful_refresh = self._clock()
-        self._last_refresh_error = None
+    @_bounded_chain_read()
+    def _read_refresh_snapshot(self) -> _ChainSnapshot:
+        # Fetch a coherent detached snapshot; publication stays on the calling
+        # thread, so a late daemon result can never replace a newer good cache.
+        with self._transport_call() as transport:
+            view = transport.metagraph(self._config.netuid)
+            self._check_chain_read()
+            neurons = self._map_metagraph(view)
+            block = transport.current_block()
+            self._check_chain_read()
+            if self._config.read_only:
+                own_uid = None
+                own_last_update = None
+                rate_limit = 0
+            else:
+                own_uid = transport.uid_for_hotkey(
+                    self._config.validator_hotkey, self._config.netuid
+                )
+                self._check_chain_read()
+                own_last_update = (
+                    transport.query_last_update(self._config.netuid, own_uid)
+                    if own_uid is not None else None
+                )
+                self._check_chain_read()
+                try:
+                    rate_limit = transport.weights_rate_limit(self._config.netuid)
+                except TimeoutError:
+                    raise
+                except Exception:  # noqa: BLE001 - optional pre-gate input only
+                    rate_limit = self._weights_rate_limit
+            return _ChainSnapshot(
+                self._chain_read_scope.current.generation,
+                neurons, block, own_uid, own_last_update, rate_limit,
+            )
 
     def _map_metagraph(self, view: MetagraphView) -> list[ChainNeuron]:
         """metagraph arrays -> list[ChainNeuron].
@@ -1244,6 +1482,7 @@ class BittensorChainAdapter:
             )
         return neurons
 
+    @_bounded_chain_read(archive=True)
     def neurons_at(self, block_number: int) -> list[ChainNeuron]:
         """Read a metagraph pinned to ``block_number`` without mutating the cache.
 
@@ -1382,6 +1621,7 @@ class BittensorChainAdapter:
                 f"{type(exc).__name__}: {exc}"
             ) from exc
 
+    @_bounded_chain_read()
     def commitment_capacity(self, netuid: int, hotkey: str) -> CommitmentCapacity:
         """Read the exact per-epoch Commitments-pallet byte budget.
 
@@ -1402,6 +1642,7 @@ class BittensorChainAdapter:
             # two to the exact head returned by the first.
             with self._transport_call() as transport:
                 raw_block = transport.current_block()
+                self._check_chain_read()
                 if isinstance(raw_block, bool):
                     raise TypeError("boolean current block")
                 block = int(raw_block)
@@ -1409,6 +1650,7 @@ class BittensorChainAdapter:
                     raise ValueError(f"invalid current block {block}")
 
                 raw_epoch = transport.epoch_index(netuid, block)
+                self._check_chain_read()
                 if isinstance(raw_epoch, bool):
                     raise TypeError("boolean subnet epoch index")
                 current_epoch = int(raw_epoch)
@@ -1806,6 +2048,227 @@ class BittensorChainAdapter:
             pass
         return self._block
 
+    def _authority_anchor_rpc(
+        self, name: str, *args: Any, timeout_seconds: float | None = None, **kwargs: Any
+    ) -> Any:
+        """Bound a short authority RPC, including transport-generation contention.
+
+        A submission timeout only retires its transport. The caller already owns
+        durable signed evidence and must confirm that hash, never send it again.
+        Ordinary commitment and weight writers retain their existing SDK path.
+        """
+        def invoke() -> Any:
+            with self._anchor_transport_call() as transport:
+                return getattr(transport, name)(*args, **kwargs)
+
+        seconds = self._config.rpc_timeout_seconds
+        if timeout_seconds is not None:
+            seconds = min(seconds, timeout_seconds)
+        try:
+            return _run_with_timeout(invoke, seconds, name)
+        except (TimeoutError, asyncio.CancelledError):
+            if self._anchor_transport_is_shared:
+                self._condemned = True
+            else:
+                self._anchor_condemned = True
+            raise
+        except Exception as exc:
+            if "MaxRetriesExceeded" in {base.__name__ for base in type(exc).__mro__}:
+                if self._anchor_transport_is_shared:
+                    self._condemned = True
+                else:
+                    self._anchor_condemned = True
+                raise TimeoutError(f"authority anchor RPC {name} exhausted its transport deadline") from exc
+            self._note_anchor_raise()
+            raise
+
+    async def prepare_authority_anchor(self, payload: bytes) -> dict[str, Any]:
+        """Sign one authority commitment without sending it.
+
+        ``anchor_epoch`` holds the shared writer lane and durably records this
+        JSON-compatible evidence before invoking ``submit_authority_anchor``.
+        The hash is known before any network mutation, including an ambiguous
+        send whose acknowledgement is lost.
+        """
+        if self._config.read_only:
+            raise ReadOnlyChainError("wallet-free reader cannot prepare authority anchors")
+        if not payload or len(payload) > 128:
+            raise ValueError("authority anchor payload must contain 1 to 128 bytes")
+        prepared = await asyncio.to_thread(
+            self._authority_anchor_rpc,
+            "prepare_authority_anchor",
+            netuid=self._config.netuid,
+            payload=payload.decode("ascii"),
+        )
+        if not isinstance(prepared, dict):
+            raise TypeError("authority anchor preparation did not return submission evidence")
+        _validate_authority_submission(prepared)
+        return prepared
+
+    async def submit_authority_anchor(self, submission: Mapping[str, Any]) -> None:
+        """Send the durably recorded signed bytes exactly once, without a subscription.
+
+        This method never retries. A timeout or rejection leaves the persisted
+        evidence in charge: later ticks and restarts may only confirm its hash.
+        """
+        if self._config.read_only:
+            raise ReadOnlyChainError("wallet-free reader cannot submit authority anchors")
+        _validate_authority_submission(submission)
+        await asyncio.to_thread(
+            self._authority_anchor_rpc, "submit_authority_anchor", submission
+        )
+        self._note_anchor_clean_submit()
+
+    async def confirm_authority_anchor(
+        self,
+        submission: Mapping[str, Any],
+        *,
+        search_blocks: int = 60,
+        confirmation_depth: int = 20,
+        timeout_seconds: float = 90.0,
+        poll_seconds: float = 1.0,
+    ) -> int:
+        """Confirm the exact hash with bounded reads; never send it again.
+
+        Finalized absence is retained across ticks in this adapter; a restart
+        safely repeats the search. Exhausting one batch only leaves the hash
+        pending. Expiration requires the decoded mortal era, a finalized head
+        beyond era+K, and a complete contiguous finalized absence proof.
+        """
+        _validate_authority_submission(submission)
+        if isinstance(search_blocks, bool) or not isinstance(search_blocks, int) or search_blocks < 1:
+            raise ValueError("authority anchor search_blocks must be a positive integer")
+        if isinstance(confirmation_depth, bool) or not isinstance(confirmation_depth, int) or confirmation_depth < 0:
+            raise ValueError("authority anchor confirmation_depth must be a nonnegative integer")
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise ValueError("authority anchor confirmation timeout must be positive")
+        if not math.isfinite(poll_seconds) or poll_seconds <= 0:
+            raise ValueError("authority anchor confirmation poll interval must be positive")
+        txid = str(submission["extrinsic_hash"])
+        first = int(submission["submit_block"])
+        era = submission.get("mortal_era")
+        last = first + era + confirmation_depth if era is not None else None
+        deadline = time.monotonic() + timeout_seconds
+        # Only finalized absence is cached, so no best-chain fork observation can
+        # skip a block in an eventual expiration proof.
+        if not hasattr(self, "_authority_anchor_search"):
+            self._authority_anchor_search: dict[tuple[str, int, int | None, int], int] = {}
+        search_key = (txid, first, era, confirmation_depth)
+        cursor = self._authority_anchor_search.get(search_key, first)
+        inspected = 0
+        candidate: int | None = None
+
+        def pending(reason: str) -> AuthorityAnchorConfirmationPending:
+            return AuthorityAnchorConfirmationPending(
+                f"authority anchor {txid}: {reason}; durable submission remains pending; never resubmit"
+            )
+
+        def remaining() -> float:
+            budget = deadline - time.monotonic()
+            if budget <= 0:
+                raise pending(f"confirmation exceeded {timeout_seconds:g}s")
+            return budget
+
+        async def read(name: str, *args: Any) -> Any:
+            for attempt in range(2):
+                budget = remaining()
+                try:
+                    return await asyncio.to_thread(
+                        self._authority_anchor_rpc, name, *args, timeout_seconds=budget,
+                    )
+                except TimeoutError:
+                    if attempt:
+                        raise
+                    self._log.warning(
+                        "authority anchor confirmation RPC timed out; reconnecting for the same hash",
+                        extra={"fields": {"extrinsic_hash": txid, "operation": name}},
+                    )
+            raise AssertionError("unreachable")
+
+        async def included(block: int, *, finalized_only: bool = True) -> bool:
+            result = await read("authority_anchor_included", txid, block, finalized_only)
+            if result is not True and result is not False:
+                raise TypeError("authority anchor inclusion read must return a boolean")
+            return result
+
+        while True:
+            remaining()
+            finalized = await read("finalized_block")
+            if isinstance(finalized, bool) or not isinstance(finalized, int) or finalized < 0:
+                raise ValueError("authority anchor confirmation read an invalid finalized head")
+            through = min(finalized, last) if last is not None else finalized
+            while cursor <= through and inspected < search_blocks:
+                if await included(cursor):
+                    self._authority_anchor_search.pop(search_key, None)
+                    return cursor
+                cursor += 1
+                inspected += 1
+                self._authority_anchor_search[search_key] = cursor
+            if last is not None and finalized > last and cursor > last:
+                evidence = {
+                    "extrinsic_hash": txid,
+                    "finalized_block": finalized,
+                    "search_start": first,
+                    "search_end": last,
+                    "mortal_era": era,
+                    "confirmation_depth": confirmation_depth,
+                }
+                self._authority_anchor_search.pop(search_key, None)
+                self._log.error(
+                    "authority anchor expired and absent from its complete finalized era; HOLD",
+                    extra={"fields": evidence},
+                )
+                raise AuthorityAnchorExpiredAbsent(evidence)
+            if inspected >= search_blocks:
+                raise pending(f"searched {search_blocks} finalized blocks in this bounded batch")
+            # Observe inclusion on the best chain while finality catches up. The
+            # next loop always proves the hash anew in a finalized block.
+            if candidate is None:
+                best = await read("current_block")
+                if isinstance(best, bool) or not isinstance(best, int) or best < 0:
+                    raise ValueError("authority anchor confirmation read an invalid best head")
+                best_through = min(best, last) if last is not None else best
+                for block in range(max(cursor, finalized + 1), best_through + 1):
+                    if inspected >= search_blocks:
+                        raise pending(f"searched {search_blocks} blocks in this bounded batch")
+                    inspected += 1
+                    if await included(block, finalized_only=False):
+                        candidate = block
+                        break
+            elif finalized >= candidate:
+                # Finalized scanning above did not find the former candidate:
+                # its best-chain block was reorged. Resume ordinary observation.
+                candidate = None
+            await asyncio.sleep(min(poll_seconds, remaining()))
+
+    def read_authority_anchor_at(
+        self, *, netuid: int, epoch_id: int, domain: str, block_number: int
+    ) -> str | None:
+        """Authority receipt read at fresh canonical finalized archive state."""
+        self._require_bound_netuid(netuid)
+        if isinstance(block_number, bool) or not isinstance(block_number, int) or block_number < 0:
+            raise ValueError("authority anchor archive block must be a nonnegative integer")
+        account = self._config.anchor_hotkey or self._config.validator_hotkey
+        for attempt in range(2):
+            try:
+                record = self._authority_anchor_rpc(
+                    "get_authority_anchor_record", netuid=netuid, ss58=account,
+                    block_number=block_number,
+                )
+                break
+            except TimeoutError:
+                if attempt:
+                    raise
+        if record is None:
+            return None
+        if not isinstance(record, ChainCommitmentRecord):
+            raise ChainStateUnavailable("authority archive read did not return a commitment record")
+        if record.block != block_number:
+            return None
+        return parse_anchor_digest(
+            [record.payload], netuid=netuid, epoch_id=epoch_id, domain=domain,
+        )
+
     async def anchor_commitment(self, payload: bytes) -> str:
         """Anchor <=128 payload bytes on the Commitments pallet; returns a tx id.
 
@@ -1917,6 +2380,7 @@ class BittensorChainAdapter:
             )
         return digest
 
+    @_bounded_chain_read()
     def read_anchor_at(
         self,
         *,
@@ -1943,6 +2407,7 @@ class BittensorChainAdapter:
                 payload = transport.get_commitment(
                     netuid=netuid, ss58=account, block_number=block_number
                 )
+                self._check_chain_read()
                 if payload is None:
                     return None
                 digest = parse_anchor_digest(
@@ -1976,6 +2441,7 @@ class BittensorChainAdapter:
             return None
         return digest
 
+    @_bounded_chain_read()
     def _read_commitment(
         self, netuid: int, ss58: str, *, block_number: int | None = None
     ) -> bytes | None:
@@ -1984,6 +2450,7 @@ class BittensorChainAdapter:
                 netuid=netuid, ss58=ss58, block_number=block_number
             )
 
+    @_bounded_chain_read()
     def read_commitment_record(
         self, *, netuid: int, block_number: int | None = None
     ) -> ChainCommitmentRecord | None:
@@ -2007,6 +2474,7 @@ class BittensorChainAdapter:
                 payload = transport.get_commitment(
                     netuid=netuid, ss58=account, block_number=block_number
                 )
+                self._check_chain_read()
                 if payload is None:
                     return None
                 included_at = transport.get_commitment_block(
@@ -2035,6 +2503,7 @@ class BittensorChainAdapter:
 
     # -- anchor inclusion-block read (EpochAnchorBlockReadable) --------------------
 
+    @_bounded_chain_read()
     def read_anchor_block(
         self, *, netuid: int, epoch_id: int, domain: str
     ) -> int | None:
@@ -2063,6 +2532,7 @@ class BittensorChainAdapter:
                 payload = transport.get_commitment(
                     netuid=netuid, ss58=account, block_number=None
                 )
+                self._check_chain_read()
                 if payload is None:
                     return None
                 if (
@@ -2127,6 +2597,7 @@ class BittensorChainAdapter:
             normalized = normalized[2:]
         return normalized.lower()
 
+    @_bounded_chain_read()
     def _read_commitment_block(
         self, netuid: int, ss58: str, *, block_number: int | None = None
     ) -> int | None:
@@ -2135,10 +2606,12 @@ class BittensorChainAdapter:
                 netuid=netuid, ss58=ss58, block_number=block_number
             )
 
+    @_bounded_chain_read()
     def _read_block_hash(self, block_number: int) -> str | None:
         with self._transport_call() as transport:
             return transport.get_block_hash(block_number)
 
+    @_bounded_chain_read()
     def block_time(self, block_number: int) -> datetime | None:
         """UTC timestamp recorded by ``Timestamp.Now`` at ``block_number``.
 
@@ -2169,6 +2642,7 @@ class BittensorChainAdapter:
             )
         return value.astimezone(timezone.utc)
 
+    @_bounded_chain_read()
     def tempo(self, netuid: int | None = None) -> int:
         """The subnet's live epoch length in blocks, read from chain (#14).
 
@@ -2190,6 +2664,7 @@ class BittensorChainAdapter:
                 f"cannot read tempo for subnet {nid}: {type(exc).__name__}: {exc}"
             ) from exc
 
+    @_bounded_chain_read()
     def get_burn_uid(self) -> int:
         """Current uid of the subnet-owner hotkey, resolved entirely from chain.
 
@@ -2202,6 +2677,7 @@ class BittensorChainAdapter:
         try:
             with self._transport_call() as transport:
                 owner_hotkey = transport.subnet_owner_hotkey(netuid)
+                self._check_chain_read()
                 if not owner_hotkey:
                     raise ChainStateUnavailable(
                         f"subnet {netuid} has no readable subnet owner hotkey "
@@ -2428,6 +2904,7 @@ def _connect_real_transport(config: BittensorAdapterConfig) -> _SubtensorTranspo
         import bittensor as bt  # noqa: F401 - imported for its side of the seam
     except ImportError as exc:
         raise NotConfiguredError(_INSTALL_HINT) from exc
+    restore_levels()  # the SDK import clamps every pre-existing logger to CRITICAL
 
     return _RealSubtensorTransport(config)
 
@@ -2446,6 +2923,7 @@ class _RealSubtensorTransport:
     def __init__(self, config: BittensorAdapterConfig) -> None:
         import bittensor as bt
 
+        restore_levels()  # see make_transport: the import silences our own loggers
         self._bt = bt
         self._config = config
         self._log = get_logger("chain.bittensor.transport")
@@ -2681,7 +3159,9 @@ class _RealSubtensorTransport:
                 "chain contract: " + "; ".join(problems) + ". " + _INSTALL_HINT
             )
 
-    def _rpc(self, fn: Callable[[], Any], name: str) -> Any:
+    def _rpc(
+        self, fn: Callable[[], Any], name: str, *, timeout_seconds: float | None = None
+    ) -> Any:
         # Unit tests construct this private transport without __init__ to exercise
         # SDK-shape logic without importing bittensor. Production always sets it in
         # __init__; the fallback keeps that test seam honest.
@@ -2692,7 +3172,11 @@ class _RealSubtensorTransport:
             with self._sdk_lock:
                 return fn()
 
-        return _run_with_timeout(_serialized, self._config.rpc_timeout_seconds, name)
+        return _run_with_timeout(
+            _serialized,
+            self._config.rpc_timeout_seconds if timeout_seconds is None else timeout_seconds,
+            name,
+        )
 
     # -- transport surface ---------------------------------------------------------
 
@@ -2763,6 +3247,9 @@ class _RealSubtensorTransport:
         mg = self._rpc(
             lambda: self._subtensor.metagraph(netuid, lite=False, block=block_number),
             "metagraph" if block_number is None else f"metagraph_at_{block_number}",
+            timeout_seconds=(
+                None if block_number is None else _CHAIN_ARCHIVE_READ_SECONDS
+            ),
         )
 
         def _ip(uid: int) -> str:
@@ -3220,6 +3707,200 @@ class _RealSubtensorTransport:
 
     def tempo(self, netuid: int) -> int:
         return int(self._rpc(lambda: self._subtensor.tempo(netuid), "tempo"))
+
+    def prepare_authority_anchor(self, *, netuid: int, payload: str) -> dict[str, Any]:
+        """Compose/sign the existing commitment call without dispatching it."""
+        if self._config.read_only:
+            raise ReadOnlyChainError("wallet-free transport cannot prepare authority anchors")
+
+        def prepare() -> dict[str, Any]:
+            substrate = self._substrate
+            encoded = payload.encode("ascii")
+            call = substrate.compose_call(
+                call_module="Commitments",
+                call_function="set_commitment",
+                call_params={"netuid": netuid,
+                             "info": {"fields": [[{f"Raw{len(encoded)}": encoded}]]}},
+            )
+            # Keep the pinned SDK's current mortal period. The durable evidence
+            # below is decoded from the signed bytes, never copied from this
+            # request: only the actual encoded period can prove later expiry.
+            extrinsic = substrate.create_signed_extrinsic(
+                call=call, keypair=self._hotkey, era={"period": 128},
+            )
+            txid = "0x" + bytes(extrinsic.extrinsic_hash).hex()
+            nonce = None
+            mortal_era = None
+            try:
+                signed_data = type(extrinsic.data)(str(extrinsic.data))
+                decoded = substrate.create_scale_object("Extrinsic", data=signed_data)
+                value = decoded.decode()
+                if isinstance(value, Mapping):
+                    raw_nonce = value.get("nonce")
+                    if isinstance(raw_nonce, int) and not isinstance(raw_nonce, bool) and raw_nonce >= 0:
+                        nonce = raw_nonce
+                    raw_era = value.get("era")
+                    period = (
+                        raw_era[0] if isinstance(raw_era, (tuple, list)) and len(raw_era) == 2
+                        else raw_era.get("period") if isinstance(raw_era, Mapping)
+                        else None
+                    )
+                    if (
+                        isinstance(period, int) and not isinstance(period, bool)
+                        and 4 <= period <= 65536 and not period & (period - 1)
+                    ):
+                        mortal_era = period
+            except Exception:
+                # The signed hash is still confirmable. An unreadable era can
+                # never justify automatic absence/expiry; an operator must act.
+                pass
+            # Sample after signing: the expiry horizon must not start at a head
+            # observed before a slow preparation moved the signed era forward.
+            start = substrate.get_block_number(substrate.get_chain_head())
+            if isinstance(start, bool) or not isinstance(start, int) or start < 0:
+                raise ValueError("authority anchor preparation read an invalid best head")
+            result = {
+                "extrinsic_hash": txid,
+                "extrinsic_hex": str(extrinsic.data),
+                "submit_block": start,
+                "submit_time": time.time(),
+                "nonce": nonce,
+                "mortal_era": mortal_era,
+            }
+            _validate_authority_submission(result)
+            return result
+
+        return self._rpc(prepare, "prepare_authority_anchor")
+
+    def submit_authority_anchor(self, submission: Mapping[str, Any]) -> None:
+        """One bounded submit RPC; bypass SDK subscription and automatic replays."""
+        if self._config.read_only:
+            raise ReadOnlyChainError("wallet-free transport cannot submit authority anchors")
+        _validate_authority_submission(submission)
+
+        def submit() -> None:
+            substrate = self._substrate
+            old_retries = substrate.max_retries
+            old_timeout = substrate.retry_timeout
+            try:
+                substrate.max_retries = 1
+                substrate.retry_timeout = self._config.rpc_timeout_seconds
+                # RetrySyncSubstrate wraps submit_extrinsic AND rpc_request with
+                # endpoint failover/replay. Its private request primitive is not
+                # wrapped. Disabling its own recursive retry guarantees one send.
+                response = substrate._make_rpc_request([
+                    substrate.make_payload(
+                        "rpc_request", "author_submitExtrinsic", [submission["extrinsic_hex"]]
+                    )
+                ])
+                rows = response.get("rpc_request") if isinstance(response, Mapping) else None
+                if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], Mapping):
+                    raise OSError("authority anchor submit acknowledgement is malformed; hash remains pending")
+                if rows[0].get("result") != submission["extrinsic_hash"]:
+                    raise OSError("authority anchor submit did not acknowledge the signed hash; hash remains pending")
+            finally:
+                substrate.max_retries = old_retries
+                substrate.retry_timeout = old_timeout
+
+        self._rpc(submit, "submit_authority_anchor")
+
+    def _authority_connection_token(self) -> tuple[int, Any]:
+        return id(getattr(self._substrate, "ws", None)), getattr(self._substrate, "url", None)
+
+    def _require_authority_connection(self, token: tuple[int, Any]) -> None:
+        if self._authority_connection_token() != token:
+            raise ChainStateUnavailable(
+                "authority anchor endpoint changed during finalized proof; retry without advancing the search"
+            )
+
+    def _authority_canonical_block_hash(
+        self, block: int, *, finalized_only: bool
+    ) -> tuple[str, tuple[int, Any]]:
+        """Resolve one canonical block without borrowing another endpoint's finality."""
+        token = self._authority_connection_token()
+        if finalized_only:
+            head_hash = self._substrate.get_chain_finalised_head()
+            if not head_hash:
+                raise ChainStateUnavailable("authority anchor endpoint returned no finalized head")
+            finalized = self._substrate.get_block_number(block_hash=head_hash)
+            if isinstance(finalized, bool) or not isinstance(finalized, int) or finalized < block:
+                raise ChainStateUnavailable(
+                    f"authority anchor block {block} is not finalized on this endpoint (head={finalized!r})"
+                )
+        # get_block_hash caches best-chain hashes. An inclusion first seen
+        # before finality may be reorged, so resolve its canonical hash afresh.
+        response = self._substrate.rpc_request("chain_getBlockHash", [block])
+        block_hash = response.get("result") if isinstance(response, Mapping) else None
+        self._require_authority_connection(token)
+        if not isinstance(block_hash, str) or re.fullmatch(r"0x[0-9a-fA-F]{64}", block_hash) is None:
+            raise LookupError(f"authority anchor search block {block} is unavailable")
+        return block_hash, token
+
+    def authority_anchor_included(self, txid: str, block: int, finalized_only: bool = False) -> bool:
+        """Prove exact-hash successful inclusion without cached-fork or failover ambiguity."""
+        def read() -> bool:
+            # get_block_hash caches best-chain hashes. An inclusion first seen
+            # before finality may be reorged, so every verification resolves its
+            # canonical hash afresh instead of trusting that cache.
+            block_hash, token = self._authority_canonical_block_hash(block, finalized_only=finalized_only)
+            extrinsics = self._substrate.get_extrinsics(block_hash=block_hash)
+            if extrinsics is None:
+                raise LookupError(f"authority anchor search block {block} has no readable extrinsics")
+            for extrinsic in extrinsics:
+                found = "0x" + bytes(extrinsic.extrinsic_hash).hex()
+                if found != txid:
+                    continue
+                receipt = self._substrate.retrieve_extrinsic_by_hash(block_hash, txid)
+                success = receipt.is_success
+                self._require_authority_connection(token)
+                if success is not True:
+                    raise RuntimeError(
+                        f"authority anchor {txid} was included at {block} but execution failed; "
+                        "durable submission remains unresolved; HOLD for operator"
+                    )
+                return True
+            self._require_authority_connection(token)
+            return False
+
+        return bool(self._rpc(read, "authority_anchor_included"))
+
+    def get_authority_anchor_record(
+        self, *, netuid: int, ss58: str, block_number: int
+    ) -> ChainCommitmentRecord | None:
+        """Read the raw commitment and original inclusion block at one finalized hash."""
+        def read() -> ChainCommitmentRecord | None:
+            block_hash, token = self._authority_canonical_block_hash(block_number, finalized_only=True)
+            raw = self._substrate.query(
+                module="Commitments", storage_function="CommitmentOf",
+                params=[netuid, ss58], block_hash=block_hash,
+            )
+            self._require_authority_connection(token)
+            value = getattr(raw, "value", raw)
+            if value is None:
+                return None
+            if not isinstance(value, Mapping):
+                raise TypeError("authority archive CommitmentOf is not a mapping")
+            block = value.get("block")
+            if isinstance(block, bool) or not isinstance(block, int) or block < 0:
+                raise TypeError("authority archive CommitmentOf exposes no valid inclusion block")
+            info = value.get("info")
+            fields = info.get("fields") if isinstance(info, Mapping) else None
+            if not isinstance(fields, (tuple, list)) or len(fields) != 1:
+                raise TypeError("authority archive CommitmentOf has malformed fields")
+            entry = fields[0]
+            if not isinstance(entry, Mapping) or len(entry) != 1:
+                return None
+            kind, encoded = next(iter(entry.items()))
+            if not isinstance(kind, str) or re.fullmatch(r"Raw[0-9]+", kind) is None:
+                return None
+            if not isinstance(encoded, str):
+                raise TypeError("authority archive raw commitment is not hex")
+            payload = bytes.fromhex(encoded.removeprefix("0x"))
+            if len(payload) != int(kind[3:]):
+                raise ValueError("authority archive raw commitment length is inconsistent")
+            return ChainCommitmentRecord(payload=payload, block=block)
+
+        return self._rpc(read, "get_authority_anchor_record")
 
     def set_commitment(self, *, netuid: int, payload: str) -> str:
         if self._config.read_only:

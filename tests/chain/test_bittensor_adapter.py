@@ -34,6 +34,9 @@ from vidaio.chain import (
     quantize_u16,
 )
 from vidaio.chain.bittensor_adapter import (
+    AuthorityAnchorConfirmationPending,
+    AuthorityAnchorExpiredAbsent,
+    ChainReadTimeout,
     EpochScheduleView,
     MetagraphView,
     ReadOnlyChainError,
@@ -420,6 +423,330 @@ def test_best_head_read_deadline_includes_transport_lock_contention():
         assert time.monotonic() - started < .5
     finally:
         generation.lock.release()
+
+
+@pytest.mark.parametrize(
+    ("method", "call"),
+    [
+        ("current_block", lambda a: a.best_head_block()),
+        ("finalized_block", lambda a: a.finalized_block()),
+        ("epoch_index", lambda a: a._epoch_index_at(1, 350)),
+        ("epoch_schedule", lambda a: a._epoch_schedule_at(1, 350)),
+        ("block_time", lambda a: a.block_time(333)),
+        ("subnet_owner_hotkey", lambda a: a.get_burn_uid()),
+        ("metagraph", lambda a: a.neurons_at(333)),
+        ("metagraph", lambda a: a.refresh_for_authority_finalizer()),
+        ("current_block", lambda a: a.commitment_capacity(1, "hk-0")),
+    ],
+)
+def test_finalizer_chain_read_timeout_reconnects_next_read(monkeypatch, method, call):
+    import time
+    import vidaio.chain.bittensor_adapter as module
+
+    monkeypatch.setattr(module, "_CHAIN_ARCHIVE_READ_SECONDS", .05)
+    release = threading.Event()
+    exited = threading.Event()
+    old = FakeTransport(view=make_view(), block=350)
+    original = getattr(old, method)
+
+    def blocked(*args, **kwargs):
+        try:
+            assert release.wait(2)
+            return original(*args, **kwargs)
+        finally:
+            exited.set()
+
+    setattr(old, method, blocked)
+    fresh = FakeTransport(
+        view=make_view(), block=350, uid_map={"hk-0": 0},
+        subnet_owner_hotkey="hk-0", epoch_closes={41: 310, 42: 333},
+    )
+    adapter = BittensorChainAdapter(
+        BittensorAdapterConfig(validator_hotkey="hk-0", netuid=1, rpc_timeout_seconds=.05),
+        transport=old, connect_transport=lambda: fresh,
+    )
+    started = time.monotonic()
+    try:
+        with pytest.raises(ChainReadTimeout) as error:
+            call(adapter)
+        assert isinstance(error.value, (ChainStateUnavailable, TimeoutError))
+        assert time.monotonic() - started < .5
+        assert adapter._condemned
+        # A fresh generation serves retry while the old SDK call is still busy.
+        call(adapter)
+        assert adapter._main_generation.transport is fresh
+        assert not adapter._condemned
+    finally:
+        release.set()
+        assert exited.wait(1)
+
+
+def test_expired_lock_waiter_never_reads_the_replacement():
+    class CountingTransport(FakeTransport):
+        calls = 0
+
+        def current_block(self):
+            self.calls += 1
+            return super().current_block()
+
+    old = CountingTransport()
+    fresh = CountingTransport()
+    adapter = BittensorChainAdapter(
+        BittensorAdapterConfig(validator_hotkey="hk-0", rpc_timeout_seconds=.05),
+        transport=old, connect_transport=lambda: fresh,
+    )
+    generation = adapter._main_generation
+    generation.lock.acquire()
+    try:
+        with pytest.raises(ChainReadTimeout):
+            adapter.best_head_block()
+        assert adapter.best_head_block() == fresh._block
+    finally:
+        generation.lock.release()
+    # Joining read workers proves the timed-out waiter cannot wake later and
+    # consume the fresh socket after the caller already received its HOLD.
+    for thread in threading.enumerate():
+        if thread.name == "bt-rpc-best_head_block":
+            thread.join(1)
+            assert not thread.is_alive()
+    assert old.calls == 0
+    assert fresh.calls == 1
+
+
+def test_refresh_timeout_keeps_snapshot_and_cannot_publish_late_result():
+    clock = [1000.0]
+    old = FakeTransport(view=make_view(2), block=1000)
+    fresh = FakeTransport(view=make_view(3), block=2000)
+    adapter = BittensorChainAdapter(
+        BittensorAdapterConfig(validator_hotkey="hk-0", rpc_timeout_seconds=.05),
+        transport=old, connect_transport=lambda: fresh, clock=lambda: clock[0],
+    )
+    adapter.refresh()
+    clock[0] += 200
+    release = threading.Event()
+    original = old.metagraph
+
+    def blocked(*args, **kwargs):
+        assert release.wait(2)
+        return original(*args, **kwargs)
+
+    old.metagraph = blocked
+    try:
+        adapter.refresh()  # The ordinary refresh contract still never raises.
+        assert adapter.current_block() == 1000
+        assert len(adapter.neurons()) == 2
+        assert "ChainReadTimeout" in adapter.last_refresh_error
+        adapter.refresh_for_authority_finalizer()
+        assert adapter.current_block() == 2000
+    finally:
+        release.set()
+    for thread in threading.enumerate():
+        if thread.name == "bt-rpc-_read_refresh_snapshot":
+            thread.join(1)
+            assert not thread.is_alive()
+    assert adapter.current_block() == 2000
+    assert len(adapter.neurons()) == 3
+    assert adapter.last_refresh_error is None
+
+
+def test_optional_refresh_rate_limit_does_not_swallow_timeout():
+    transport = FakeTransport(view=make_view())
+    transport.raise_on = {"weights_rate_limit"}
+    transport.raise_exc = TimeoutError("slow optional storage")
+    adapter = make_adapter(transport)
+    with pytest.raises(ChainReadTimeout):
+        adapter.refresh_for_authority_finalizer()
+    assert adapter.last_successful_refresh is None
+    assert adapter._condemned
+
+
+def test_epoch_search_timeout_is_not_treated_as_migration_absence():
+    class Archive(FakeTransport):
+        calls = []
+
+        def epoch_index(self, netuid, block_number):
+            self.calls.append(block_number)
+            raise TimeoutError("archive endpoint stalled")
+
+    transport = Archive()
+    adapter = make_adapter(transport)
+    with pytest.raises(ChainReadTimeout):
+        adapter._find_epoch_close_block(
+            netuid=1, epoch_id=42, finalized=350, finalized_index=42,
+        )
+    assert transport.calls == [349]
+    assert not adapter._epoch_boundaries
+
+
+def test_epoch_migration_prefix_probe_timeout_propagates_immediately():
+    class Archive(FakeTransport):
+        calls = []
+
+        def epoch_index(self, netuid, block_number):
+            self.calls.append(block_number)
+            if block_number >= 348:
+                return 42
+            if block_number == 346:
+                raise LookupError("pre-migration block")
+            raise TimeoutError("slow prefix probe")
+
+    transport = Archive()
+    adapter = make_adapter(transport)
+    with pytest.raises(ChainReadTimeout):
+        adapter._find_epoch_close_block(
+            netuid=1, epoch_id=42, finalized=350, finalized_index=42,
+        )
+    assert transport.calls == [349, 348, 346, 347]
+    assert not adapter._epoch_boundaries
+
+
+def test_epoch_search_has_one_aggregate_deadline_and_no_late_cache(monkeypatch):
+    import time
+    import vidaio.chain.bittensor_adapter as module
+
+    monkeypatch.setattr(module, "_CHAIN_ARCHIVE_READ_SECONDS", .06)
+    release = threading.Event()
+
+    class SlowArchive(FakeTransport):
+        calls = []
+
+        def epoch_index(self, netuid, block_number):
+            self.calls.append(block_number)
+            if len(self.calls) <= 2:
+                time.sleep(.02)  # Individually below the short-read deadline.
+                return 42
+            assert release.wait(2)
+            return super().epoch_index(netuid, block_number)
+
+    old = SlowArchive(epoch_closes={41: 310, 42: 333})
+    fresh = FakeTransport(epoch_closes={41: 310, 42: 333})
+    adapter = BittensorChainAdapter(
+        BittensorAdapterConfig(validator_hotkey="hk-0", netuid=1, rpc_timeout_seconds=.2),
+        transport=old, connect_transport=lambda: fresh,
+    )
+    started = time.monotonic()
+    try:
+        with pytest.raises(ChainReadTimeout):
+            adapter._find_epoch_close_block(
+                netuid=1, epoch_id=42, finalized=350, finalized_index=42,
+            )
+        assert time.monotonic() - started < .3
+        assert adapter._condemned
+        assert not adapter._epoch_boundaries
+    finally:
+        release.set()
+    for thread in threading.enumerate():
+        if thread.name in {"bt-rpc-_find_epoch_close_block_uncached", "bt-rpc-_epoch_index_at"}:
+            thread.join(1)
+            assert not thread.is_alive()
+    assert old.calls == [349, 348, 346]
+    assert not adapter._epoch_boundaries
+    assert adapter._find_epoch_close_block(
+        netuid=1, epoch_id=42, finalized=350, finalized_index=42,
+    ) == 333
+
+
+def test_reconnect_replacement_returned_after_deadline_is_not_installed():
+    release = threading.Event()
+    old = FakeTransport()
+    late = FakeTransport(block=2000)
+    fresh = FakeTransport(block=3000)
+    connects = []
+
+    def connect():
+        connects.append(None)
+        if len(connects) == 1:
+            assert release.wait(2)
+            return late
+        return fresh
+
+    adapter = BittensorChainAdapter(
+        BittensorAdapterConfig(validator_hotkey="hk-0", rpc_timeout_seconds=.05),
+        transport=old, connect_transport=connect,
+    )
+    adapter._condemned = True
+    try:
+        with pytest.raises(ChainReadTimeout):
+            adapter.best_head_block()
+        assert adapter._main_generation.transport is old
+    finally:
+        release.set()
+    for thread in threading.enumerate():
+        if thread.name == "bt-rpc-best_head_block":
+            thread.join(1)
+            assert not thread.is_alive()
+    assert late.closed == 1
+    assert adapter._main_generation.transport is old
+    assert adapter.best_head_block() == 3000
+
+
+def test_reconnect_identity_finishing_after_deadline_discards_replacement():
+    release = threading.Event()
+
+    class LateIdentity(FakeTransport):
+        def signer_hotkey(self):
+            assert release.wait(2)
+            return "hk-0"
+
+    old = FakeTransport()
+    late = LateIdentity()
+    fresh = FakeTransport(block=3000)
+    replacements = iter([late, fresh])
+    adapter = BittensorChainAdapter(
+        BittensorAdapterConfig(validator_hotkey="hk-0", rpc_timeout_seconds=.05),
+        transport=old, connect_transport=lambda: next(replacements),
+    )
+    adapter._condemned = True
+    try:
+        with pytest.raises(ChainReadTimeout):
+            adapter.best_head_block()
+    finally:
+        release.set()
+    for thread in threading.enumerate():
+        if thread.name == "bt-rpc-best_head_block":
+            thread.join(1)
+            assert not thread.is_alive()
+    assert late.closed == 1
+    assert adapter._main_generation.transport is old
+    assert adapter.best_head_block() == 3000
+
+
+def test_finalizer_chain_read_budgets_are_30_and_120_seconds(monkeypatch):
+    import vidaio.chain.bittensor_adapter as module
+
+    calls = []
+    run = module._run_with_timeout
+
+    def recording_run(fn, seconds, name):
+        calls.append((name, seconds))
+        return run(fn, seconds, name)
+
+    monkeypatch.setattr(module, "_run_with_timeout", recording_run)
+    transport = FakeTransport(
+        view=make_view(), block=350, uid_map={"hk-0": 0},
+        subnet_owner_hotkey="hk-0", epoch_closes={41: 310, 42: 333},
+    )
+    adapter = make_adapter(transport)
+    adapter.refresh_for_authority_finalizer()
+    adapter.best_head_block()
+    adapter.get_burn_uid()
+    adapter.latest_closed_epoch(netuid=1)
+    adapter.block_time(333)
+    adapter.neurons_at(333)
+    expected = {
+        "_read_refresh_snapshot": 30,
+        "best_head_block": 30,
+        "get_burn_uid": 30,
+        "finalized_block": 30,
+        "_epoch_index_at": 30,
+        "_epoch_schedule_at": 30,
+        "block_time": 30,
+        "neurons_at": 120,
+        "_find_epoch_close_block_uncached": 120,
+    }
+    assert {name for name, _ in calls} == expected.keys()
+    for name, seconds in calls:
+        assert expected[name] - .5 < seconds <= expected[name]
 
 
 def test_report_best_head_is_live_bounded_and_failure_never_uses_cache():
@@ -2970,7 +3297,17 @@ def test_real_transport_epoch_reads_refuse_pruned_head_fallback() -> None:
         transport.epoch_index(85, 333)
 
 
-def test_real_transport_metagraph_pins_block_and_maps_registration_height():
+def test_real_transport_metagraph_pins_block_and_maps_registration_height(monkeypatch):
+    import vidaio.chain.bittensor_adapter as module
+
+    timeouts = []
+    original_run = module._run_with_timeout
+
+    def record_timeout(fn, seconds, name):
+        timeouts.append((seconds, name))
+        return original_run(fn, seconds, name)
+
+    monkeypatch.setattr(module, "_run_with_timeout", record_timeout)
     class Axon:
         def __init__(self, ip, port):
             self.ip = ip
@@ -3003,6 +3340,9 @@ def test_real_transport_metagraph_pins_block_and_maps_registration_height():
     assert view.registration_block == [600, 601]
     assert view.axon_ips == ["10.0.0.1", "10.0.0.2"]
     assert view.axon_ports == [9101, 9102]
+    assert timeouts == [(120.0, "metagraph_at_777")]
+    _real_transport_with(sdk).metagraph(85)
+    assert timeouts[-1] == (30.0, "metagraph")
 
 
 class CompatibleV105Sdk:
@@ -3205,3 +3545,447 @@ def test_factory_bittensor_mode_fails_fast_when_deps_absent(monkeypatch):
     with pytest.raises(NotConfiguredError) as exc:
         make_chain_adapter({"chain": {"mode": "bittensor"}})
     assert ".[chain]" in str(exc.value)
+
+
+_AUTHORITY_TXID = "0x65da3986eaecf046cb2c41673aed9d4e1e661730dc31c62f327df5d15933595d"
+
+def _authority_submission(**changes):
+    return {
+        "extrinsic_hash": _AUTHORITY_TXID,
+        "extrinsic_hex": "0x0102",
+        "submit_block": 100,
+        "submit_time": 1.0,
+        "nonce": 17,
+        "mortal_era": 128,
+        **changes,
+    }
+
+
+def test_authority_prepare_signs_without_sending_and_decodes_actual_signed_era():
+    class PreparingSubstrate(FakeSubstrate):
+        def __init__(self):
+            super().__init__()
+            self.calls = []
+
+        def get_block_number(self, block_hash=None):
+            assert block_hash == "0xhead"
+            return 100
+
+        def compose_call(self, **kwargs):
+            self.calls.append(("compose", kwargs))
+            return "commitment-call"
+
+        def create_signed_extrinsic(self, **kwargs):
+            self.calls.append(("sign", kwargs))
+            return types.SimpleNamespace(extrinsic_hash=bytes.fromhex(_AUTHORITY_TXID[2:]), data="0x0102")
+
+        def create_scale_object(self, name, *, data):
+            assert name == "Extrinsic" and data == "0x0102"
+            # Deliberately differs from the requested period: expiry must use
+            # the signed bytes, never a hard-coded or caller-supplied value.
+            return types.SimpleNamespace(decode=lambda: {"era": (256, 40), "nonce": 17})
+
+    substrate = PreparingSubstrate()
+    transport = _real_transport_with(FakeSubtensor(commits=[]), substrate=substrate)
+    transport._hotkey = object()
+    prepared = transport.prepare_authority_anchor(netuid=1, payload="anchor")
+    assert prepared["mortal_era"] == 256
+    assert prepared["nonce"] == 17
+    assert prepared["extrinsic_hash"] == _AUTHORITY_TXID
+    assert prepared["submit_block"] == 100
+    assert substrate.calls[0] == ("compose", {
+        "call_module": "Commitments", "call_function": "set_commitment",
+        "call_params": {"netuid": 1, "info": {"fields": [[{"Raw6": b"anchor"}]]}},
+    })
+    assert substrate.calls[1] == ("sign", {
+        "call": "commitment-call", "keypair": transport._hotkey, "era": {"period": 128},
+    })
+
+
+@pytest.mark.parametrize("lost_ack", [False, True])
+def test_authority_submit_bypasses_sdk_replay_and_never_waits_for_inclusion(lost_ack):
+    class OneShotSubstrate(FakeSubstrate):
+        max_retries = 5
+        retry_timeout = 60.0
+
+        def __init__(self):
+            super().__init__()
+            self.requests = []
+
+        def make_payload(self, name, method, params):
+            return (name, method, params)
+
+        def _make_rpc_request(self, payloads):
+            self.requests.append(payloads)
+            assert self.max_retries == 1
+            assert self.retry_timeout == 30.0
+            if lost_ack:
+                raise TimeoutError("acknowledgement was lost after dispatch")
+            return {"rpc_request": [{"result": _AUTHORITY_TXID}]}
+
+        def submit_extrinsic(self, *_args, **_kwargs):
+            raise AssertionError("SDK subscription/replay entry point must not run")
+
+        def rpc_request(self, *_args, **_kwargs):
+            raise AssertionError("SDK failover/replay entry point must not run")
+
+    substrate = OneShotSubstrate()
+    transport = _real_transport_with(FakeSubtensor(commits=[]), substrate=substrate)
+    if lost_ack:
+        with pytest.raises(TimeoutError, match="acknowledgement was lost"):
+            transport.submit_authority_anchor(_authority_submission())
+    else:
+        transport.submit_authority_anchor(_authority_submission())
+    assert substrate.requests == [[("rpc_request", "author_submitExtrinsic", ["0x0102"])]]
+    assert substrate.max_retries == 5 and substrate.retry_timeout == 60.0
+
+
+class AuthorityAnchorTransport(FakeTransport):
+    def __init__(self, *, inclusion=101, finalized=101):
+        super().__init__(block=max(finalized, inclusion or 0), finalized_block=finalized)
+        self.inclusion = inclusion
+        self.prepares = 0
+        self.submissions = []
+        self.searched = []
+
+    def prepare_authority_anchor(self, *, netuid, payload):
+        assert netuid == 1 and payload == "anchor"
+        self.prepares += 1
+        return _authority_submission()
+
+    def submit_authority_anchor(self, submission):
+        self.submissions.append(dict(submission))
+
+    def authority_anchor_included(self, txid, block, finalized_only=False):
+        self.searched.append((txid, block))
+        assert txid == _AUTHORITY_TXID
+        return block == self.inclusion
+
+
+async def test_authority_confirmation_timeout_reconnects_same_hash_without_resubmitting():
+    entered = threading.Event()
+    release = threading.Event()
+
+    class WedgedFinality(AuthorityAnchorTransport):
+        def finalized_block(self):
+            entered.set()
+            release.wait(5)
+            return 101
+
+    main = FakeTransport()
+    initial = WedgedFinality()
+    replacement = AuthorityAnchorTransport()
+    replacements = iter((initial, replacement))
+    adapter = BittensorChainAdapter(
+        BittensorAdapterConfig(validator_hotkey="hk-0", netuid=1, rpc_timeout_seconds=0.025),
+        transport=main, connect_transport=lambda: next(replacements),
+    )
+    try:
+        prepared = await adapter.prepare_authority_anchor(b"anchor")
+        await adapter.submit_authority_anchor(prepared)
+        block = await adapter.confirm_authority_anchor(prepared, timeout_seconds=1)
+        assert block == 101
+        assert entered.is_set()
+        assert initial.prepares == 1 and initial.submissions == [prepared]
+        assert replacement.prepares == 0 and replacement.submissions == []
+        assert {txid for txid, _ in replacement.searched} == {prepared["extrinsic_hash"]}
+        assert initial.commit_calls == replacement.commit_calls == []
+        assert main.closed == 0
+    finally:
+        release.set()
+
+
+async def test_authority_existing_submission_confirms_on_fresh_adapter_without_any_submit():
+    transport = AuthorityAnchorTransport()
+    adapter = make_adapter(transport)
+    assert await adapter.confirm_authority_anchor(_authority_submission()) == 101
+    assert transport.prepares == 0 and transport.submissions == transport.commit_calls == []
+
+
+async def test_authority_era_absence_requires_complete_finalized_scan_across_bounded_ticks():
+    transport = AuthorityAnchorTransport(inclusion=None, finalized=107)
+    adapter = make_adapter(transport)
+    prepared = _authority_submission(mortal_era=4)
+    for _ in range(2):
+        with pytest.raises(AuthorityAnchorConfirmationPending, match="bounded batch"):
+            await adapter.confirm_authority_anchor(prepared, search_blocks=3, confirmation_depth=2)
+    with pytest.raises(AuthorityAnchorExpiredAbsent) as caught:
+        await adapter.confirm_authority_anchor(prepared, search_blocks=3, confirmation_depth=2)
+    assert caught.value.evidence == {
+        "extrinsic_hash": prepared["extrinsic_hash"], "finalized_block": 107,
+        "search_start": 100, "search_end": 106, "mortal_era": 4, "confirmation_depth": 2,
+    }
+    assert [block for _, block in transport.searched] == list(range(100, 107))
+    assert transport.submissions == []
+
+
+async def test_authority_search_batch_exhaustion_keeps_searching_for_later_inclusion():
+    transport = AuthorityAnchorTransport(inclusion=105, finalized=105)
+    adapter = make_adapter(transport)
+    with pytest.raises(AuthorityAnchorConfirmationPending):
+        await adapter.confirm_authority_anchor(_authority_submission(), search_blocks=3)
+    assert await adapter.confirm_authority_anchor(_authority_submission(), search_blocks=3) == 105
+    assert [block for _, block in transport.searched] == list(range(100, 106))
+    assert transport.submissions == []
+
+
+@pytest.mark.parametrize("era,finalized", [(None, 1000), (4, 106)])
+async def test_authority_never_proves_expiry_without_decoded_era_and_head_past_horizon(era, finalized):
+    transport = AuthorityAnchorTransport(inclusion=None, finalized=finalized)
+    adapter = make_adapter(transport)
+    with pytest.raises(AuthorityAnchorConfirmationPending):
+        await adapter.confirm_authority_anchor(
+            _authority_submission(mortal_era=era), search_blocks=10,
+            confirmation_depth=2, timeout_seconds=0.03, poll_seconds=0.001,
+        )
+    assert transport.submissions == []
+
+
+@pytest.mark.parametrize("changes", [
+    {"extrinsic_hash": "committed"}, {"extrinsic_hex": "0x1"}, {"submit_block": True},
+    {"submit_time": float("nan")}, {"nonce": -1}, {"mortal_era": 127},
+])
+async def test_authority_malformed_submission_never_reaches_transport(changes):
+    transport = AuthorityAnchorTransport()
+    adapter = make_adapter(transport)
+    with pytest.raises(ValueError):
+        await adapter.submit_authority_anchor(_authority_submission(**changes))
+    assert transport.submissions == []
+
+
+async def test_authority_signed_bytes_must_match_the_durable_hash():
+    transport = AuthorityAnchorTransport()
+    adapter = make_adapter(transport)
+    with pytest.raises(ValueError, match="does not match the signed bytes"):
+        await adapter.submit_authority_anchor(_authority_submission(extrinsic_hex="0x0103"))
+    assert transport.submissions == []
+
+
+def test_authority_submit_pinned_rpc_primitive_sends_once_even_when_receive_times_out():
+    substrate_module = pytest.importorskip("async_substrate_interface.sync_substrate")
+    errors = pytest.importorskip("async_substrate_interface.errors")
+
+    class TimedOutSocket:
+        def __init__(self):
+            self.sent = []
+
+        def send(self, data):
+            self.sent.append(data)
+
+        def recv(self, *, timeout, decode):
+            assert timeout == 30.0 and decode is False
+            raise TimeoutError("no acknowledgement")
+
+    socket = TimedOutSocket()
+    substrate = object.__new__(substrate_module.SubstrateInterface)
+    substrate.max_retries = 5
+    substrate.retry_timeout = 60.0
+    substrate.log_raw_websockets = False
+    substrate.connect = lambda **_kwargs: socket
+    transport = _real_transport_with(FakeSubtensor(commits=[]), substrate=substrate)
+    with pytest.raises(errors.MaxRetriesExceeded):
+        transport.submit_authority_anchor(_authority_submission())
+    assert len(socket.sent) == 1
+    assert 'author_submitExtrinsic' in socket.sent[0]
+    assert 'author_submitAndWatchExtrinsic' not in socket.sent[0]
+    assert substrate.max_retries == 5 and substrate.retry_timeout == 60.0
+
+
+@pytest.mark.parametrize("included,successful", [(False, True), (True, True), (True, False)])
+def test_authority_transport_requires_exact_hash_and_successful_execution(included, successful):
+    class InclusionSubstrate(FakeSubstrate):
+        def rpc_request(self, method, params):
+            assert method == "chain_getBlockHash" and params == [101]
+            return {"result": "0x" + f"{101:064x}"}
+
+        def get_block_hash(self, block_id):
+            raise AssertionError("best-chain hash cache cannot prove finality after a reorg")
+
+        def get_extrinsics(self, *, block_hash):
+            assert block_hash == "0x" + f"{101:064x}"
+            hashes = [b"\xff" * 32]
+            if included:
+                hashes.append(bytes.fromhex(_AUTHORITY_TXID[2:]))
+            return [types.SimpleNamespace(extrinsic_hash=value) for value in hashes]
+
+        def retrieve_extrinsic_by_hash(self, block_hash, txid):
+            assert included and txid == _AUTHORITY_TXID
+            assert block_hash == "0x" + f"{101:064x}"
+            return types.SimpleNamespace(is_success=successful)
+
+    transport = _real_transport_with(FakeSubtensor(commits=[]), substrate=InclusionSubstrate())
+    if included and not successful:
+        with pytest.raises(RuntimeError, match="execution failed"):
+            transport.authority_anchor_included(_AUTHORITY_TXID, 101)
+    else:
+        assert transport.authority_anchor_included(_AUTHORITY_TXID, 101) is included
+
+
+async def test_authority_inclusion_waits_for_finality_without_any_submission():
+    class LaggingFinality(AuthorityAnchorTransport):
+        reads = 0
+
+        def finalized_block(self):
+            self.reads += 1
+            return 100 if self.reads == 1 else 101
+
+    transport = LaggingFinality()
+    adapter = make_adapter(transport)
+    assert await adapter.confirm_authority_anchor(_authority_submission(), poll_seconds=0.001) == 101
+    assert transport.reads == 2
+    assert transport.searched.count((_AUTHORITY_TXID, 101)) == 2
+    assert transport.submissions == []
+
+
+async def test_authority_missing_archive_block_cannot_be_skipped_in_expiry_proof():
+    class UnreadableBlock(AuthorityAnchorTransport):
+        failed = False
+
+        def authority_anchor_included(self, txid, block, finalized_only=False):
+            if block == 102 and not self.failed:
+                self.failed = True
+                raise LookupError("archive block unavailable")
+            return super().authority_anchor_included(txid, block, finalized_only)
+
+    transport = UnreadableBlock(inclusion=None, finalized=107)
+    adapter = make_adapter(transport)
+    prepared = _authority_submission(mortal_era=4)
+    with pytest.raises(LookupError, match="archive block unavailable"):
+        await adapter.confirm_authority_anchor(prepared, confirmation_depth=2)
+    with pytest.raises(AuthorityAnchorExpiredAbsent):
+        await adapter.confirm_authority_anchor(prepared, confirmation_depth=2)
+    assert [block for _, block in transport.searched] == list(range(100, 107))
+    assert transport.submissions == []
+
+
+async def test_authority_sdk_retry_exhaustion_reconnects_before_read_only_confirmation_retry():
+    class MaxRetriesExceeded(Exception):
+        pass
+
+    class BrokenFinality(AuthorityAnchorTransport):
+        def finalized_block(self):
+            raise MaxRetriesExceeded("pinned SDK converts socket timeout to retry exhaustion")
+
+    broken = BrokenFinality()
+    recovered = AuthorityAnchorTransport()
+    replacements = iter((broken, recovered))
+    adapter = BittensorChainAdapter(
+        BittensorAdapterConfig(validator_hotkey="hk-0", netuid=1),
+        transport=FakeTransport(), connect_transport=lambda: next(replacements),
+    )
+    assert await adapter.confirm_authority_anchor(_authority_submission()) == 101
+    assert broken.closed == 1
+    assert broken.submissions == recovered.submissions == []
+
+
+def test_authority_finalized_proof_ignores_a_cached_orphan_hash():
+    class ReorgSubstrate(FakeSubstrate):
+        canonical = "0x" + "a" * 64
+
+        def get_block_hash(self, block_id):
+            return "0x" + "a" * 64  # SDK cache retains the orphan
+
+        def rpc_request(self, method, params):
+            assert method == "chain_getBlockHash" and params == [101]
+            return {"result": self.canonical}
+
+        def get_extrinsics(self, *, block_hash):
+            if block_hash == "0x" + "a" * 64:
+                return [types.SimpleNamespace(extrinsic_hash=bytes.fromhex(_AUTHORITY_TXID[2:]))]
+            return []
+
+        def retrieve_extrinsic_by_hash(self, block_hash, txid):
+            return types.SimpleNamespace(is_success=True)
+
+    substrate = ReorgSubstrate()
+    transport = _real_transport_with(FakeSubtensor(commits=[]), substrate=substrate)
+    assert transport.authority_anchor_included(_AUTHORITY_TXID, 101, False) is True
+    substrate.canonical = "0x" + "b" * 64
+    assert transport.authority_anchor_included(_AUTHORITY_TXID, 101, True) is False
+
+
+@pytest.mark.parametrize("change_during", ["head", "hash", "extrinsics", "receipt"])
+def test_authority_endpoint_switch_cannot_supply_finalized_inclusion_or_absence(change_during):
+    class SwitchingSubstrate(FakeSubstrate):
+        ws = object()
+        url = "wss://original"
+
+        def switch(self, phase):
+            if phase == change_during:
+                self.ws = object()
+                self.url = "wss://replacement"
+
+        def get_chain_finalised_head(self):
+            self.switch("head")
+            return super().get_chain_finalised_head()
+
+        def rpc_request(self, method, params):
+            self.switch("hash")
+            return {"result": "0x" + "b" * 64}
+
+        def get_extrinsics(self, *, block_hash):
+            self.switch("extrinsics")
+            return [types.SimpleNamespace(extrinsic_hash=bytes.fromhex(_AUTHORITY_TXID[2:]))]
+
+        def retrieve_extrinsic_by_hash(self, block_hash, txid):
+            self.switch("receipt")
+            return types.SimpleNamespace(is_success=True)
+
+    transport = _real_transport_with(FakeSubtensor(commits=[]), substrate=SwitchingSubstrate())
+    with pytest.raises(ChainStateUnavailable, match="endpoint changed"):
+        transport.authority_anchor_included(_AUTHORITY_TXID, 101, True)
+
+
+def test_authority_finalized_search_does_not_borrow_height_from_previous_endpoint():
+    class LaggingSubstrate(FakeSubstrate):
+        def get_block_number(self, block_hash=None):
+            return 100
+
+        def rpc_request(self, *_args, **_kwargs):
+            raise AssertionError("lagging endpoint cannot contribute block 101 absence")
+
+    transport = _real_transport_with(FakeSubtensor(commits=[]), substrate=LaggingSubstrate())
+    with pytest.raises(ChainStateUnavailable, match="not finalized on this endpoint"):
+        transport.authority_anchor_included(_AUTHORITY_TXID, 101, True)
+
+
+def test_authority_archive_receipt_pins_payload_and_inclusion_to_fresh_finalized_hash():
+    payload = b"vidaio.epoch.anchor.v1:1:3:" + b"d" * 64
+
+    class ArchiveSubstrate(FakeSubstrate):
+        def get_block_hash(self, block_id):
+            raise AssertionError("mutable SDK hash cache must not be consulted")
+
+        def rpc_request(self, method, params):
+            assert method == "chain_getBlockHash" and params == [101]
+            return {"result": "0x" + "b" * 64}
+
+        def query(self, **kwargs):
+            assert kwargs == {
+                "module": "Commitments", "storage_function": "CommitmentOf",
+                "params": [1, "hk-0"], "block_hash": "0x" + "b" * 64,
+            }
+            return types.SimpleNamespace(value={
+                "block": 101, "info": {"fields": [{f"Raw{len(payload)}": "0x" + payload.hex()}]},
+            })
+
+    transport = _real_transport_with(FakeSubtensor(commits=[]), substrate=ArchiveSubstrate())
+    record = transport.get_authority_anchor_record(netuid=1, ss58="hk-0", block_number=101)
+    assert record.payload == payload and record.block == 101
+
+
+@pytest.mark.parametrize("recorded_block,expected", [(101, "d" * 64), (100, None)])
+def test_authority_archive_reader_requires_exact_record_inclusion_block(recorded_block, expected):
+    from vidaio.chain.adapter import ChainCommitmentRecord
+
+    class ArchiveTransport(AuthorityAnchorTransport):
+        def get_authority_anchor_record(self, **kwargs):
+            assert kwargs == {"netuid": 1, "ss58": "hk-0", "block_number": 101}
+            return ChainCommitmentRecord(
+                payload=b"vidaio.epoch.anchor.v1:1:3:" + b"d" * 64, block=recorded_block,
+            )
+
+    adapter = make_adapter(ArchiveTransport())
+    assert adapter.read_authority_anchor_at(
+        netuid=1, epoch_id=3, domain="vidaio.epoch.anchor.v1", block_number=101,
+    ) == expected

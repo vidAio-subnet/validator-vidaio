@@ -61,8 +61,11 @@ def test_empty_open_round_does_not_block_close_and_head_equal_close_seals(conn):
 
 @pytest.mark.parametrize("head,limit", [(19, None), (25, 25), (26, 25)])
 def test_stale_head_or_closed_anchor_window_never_seals(conn, head, limit):
+    elapsed_heads = []
     with pytest.raises(EpochCaptureUnavailable):
-        capture(conn, head=head, max_head=limit)
+        capture(conn, head=head, max_head=limit,
+                on_anchor_window_elapsed=elapsed_heads.append)
+    assert elapsed_heads == ([] if limit is None else [head])
     assert conn.execute("SELECT sealed_close FROM round_seal").fetchone()[0] == -1
     assert not conn.in_transaction
 
@@ -244,13 +247,13 @@ async def test_real_round_samples_completion_after_work_inside_sql(validator, ch
     reads = []
     def fresh():
         reads.append(conn.in_transaction)
-        return 2
+        return 1 + len(reads)
     monkeypatch.setattr(chain, "best_head_block", fresh)
     report = await validator.run_round()
     row = conn.execute("SELECT block,commit_block FROM rounds WHERE round_id=?", (report.round_id,)).fetchone()
-    assert tuple(row) == (1, 2) and reads == [True]
-    assert ScorePacketEvidence(conn).packets(through_block=1) == []
-    assert len(ScorePacketEvidence(conn).packets(after_block=1, through_block=2)) == 1
+    assert tuple(row) == (2, 3) and reads == [False, True]
+    assert ScorePacketEvidence(conn).packets(through_block=2) == []
+    assert len(ScorePacketEvidence(conn).packets(after_block=2, through_block=3)) == 1
 
 
 async def test_real_round_defers_outside_sql_without_redispatch(validator, chain, miner_client, challenge_client,

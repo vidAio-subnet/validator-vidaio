@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,16 +12,23 @@ from tests.auditor.test_duplicate_evidence import _case, _signed_receipt, _recei
 from vidaio.audit import ArtifactKind, canonical_json_bytes, verify_bundle
 from vidaio.audit.recompute import RecomputedScore
 from vidaio.auditor.chronology import verify_challenge_chronology, ChronologyKind
-from vidaio.auditor.content_evidence import verify_round, audit_manifest_rounds
+from vidaio.auditor.content_evidence import (
+    verify_round, audit_manifest_rounds, validate_zero_packet, validate_share_packet,
+)
 from vidaio.auditor.report import ItemVerdictKind
 from vidaio.challenge import deep_reveal_verifier
 from vidaio.epoch import ContentRoundInput, AuditManifest, AuditFileRef, AuditFileKind
 from vidaio.scoring.content_duplicate_evidence import (
-    ContentMember, ContentRoundEvidence, ContentDuplicateWitness, derive_edges,
-    derive_components, mint_content_duplicate_packet,
+    CONTENT_EVIDENCE_RULE, CONTENT_EVIDENCE_RULE_V1, CONTENT_EVIDENCE_RULE_V2,
+    ContentMember, ContentRoundEvidence, ContentRoundEvidenceV1, ContentRoundEvidenceV2,
+    ContentDuplicateWitness, derive_edges,
+    ContentShareWitness, InvalidContentEvidence, derive_components,
+    content_identity_version, content_witness_from_packet, mint_content_duplicate_packet,
+    mint_content_share_packet,
 )
+from vidaio.scoring.compression import score_compression
 from vidaio.scoring.content_fingerprint import compute_canonical_content
-from vidaio.scoring.result import config_digest
+from vidaio.scoring.result import ItemScore, config_digest
 
 
 class ByteRecomputer:
@@ -65,7 +73,7 @@ def content_case(tmp_path):
         roster.append(ContentMember(uid=uid,hotkey=hotkey,score_packet=ref,output=output,receipt=receipt,
             canonical_content_digest=evidence.canonical_content_digest,content_fingerprint=evidence.content_fingerprint,
             encoded_size=output.byte_size,canonicalization_plan_digest='c'*64))
-    context=ContentRoundEvidence(challenge_id=template.challenge_id,item_id=template.challenge_id,track='compression',
+    context=ContentRoundEvidenceV1(challenge_id=template.challenge_id,item_id=template.challenge_id,track='compression',
         challenge_input=template.challenge_input,reference_original=template.reference_original,
         commitment_anchor=template.challenge_anchor,committed_scorer_version=real.scorer_version,
         scoring_config_digest=config_digest(scoring),roster=tuple(roster),
@@ -205,7 +213,7 @@ def test_unavailable_component_skips_only_itself_other_component_proceeds(tmp_pa
         canonical_content_digest=evidence.canonical_content_digest,content_fingerprint=evidence.content_fingerprint,
         encoded_size=output.byte_size,canonicalization_plan_digest='c'*64)
     roster=context.roster+(member,)
-    context=ContentRoundEvidence.model_validate(context.model_dump()|dict(roster=roster,
+    context=type(context).model_validate(context.model_dump()|dict(roster=roster,
         edges=derive_edges(roster),components=derive_components(roster),skipped_components=((4,9),)))
     assert context.components==((4,9),(20,))
     originals[20]=packet;case[4]=context
@@ -269,7 +277,7 @@ def test_epoch_memo_scores_five_originals_once_across_four_zeros_and_winner(tmp_
         originals[uid]=packet
         roster.append(roster[0].model_copy(update=dict(uid=uid,hotkey=receipt.miner_hotkey,
             score_packet=ref,output=output,receipt=receipt,encoded_size=output.byte_size)))
-    context=ContentRoundEvidence.model_validate(context.model_dump()|dict(roster=tuple(roster),
+    context=type(context).model_validate(context.model_dump()|dict(roster=tuple(roster),
         edges=derive_edges(roster),components=derive_components(roster)))
     component=context.components[0];winner=context.winner(component)
     calls=[]
@@ -432,3 +440,433 @@ def test_index_owes_positive_packets_only_not_gate_passed_zeros(tmp_path,score,e
     verdicts=audit_manifest_rounds(service,log,store,byte)
     omitted=[v for v in verdicts if v.verdict is ItemVerdictKind.FAIL and 'omitted' in v.detail]
     assert bool(omitted)==expect_fail,verdicts
+
+
+def shared_case(
+    tmp_path, n=2, *, split=False, evidence_rule=CONTENT_EVIDENCE_RULE_V1,
+    encoded_sizes=None, uids=None, challenge_id=None,
+):
+    """Archive real content descriptors and a typed synthetic 0.5 measurement."""
+    store, scoring, real, template, context, byte, originals, *_ = content_case(tmp_path)
+    if challenge_id is not None:
+        context = context.model_copy(update={'challenge_id': challenge_id, 'item_id': challenge_id})
+        template = template.model_copy(update={'challenge_id': challenge_id})
+    base_member = context.roster[0]
+    media = store.get(base_member.output).split(b'\n', 1)[1]
+    frame = media.split(b'FRAME\n', 1)[1]
+    breakdown = score_compression(
+        candidate_bytes=60, reference_bytes=100,
+        vmaf=(0.5 * scoring.compression_norm - scoring.compression_weights.comp * 0.4)
+             / scoring.compression_weights.vmaf * 100,
+        config=scoring,
+    )
+    assert breakdown.final == 0.5
+    roster, measured = [], {}
+    for position, uid in enumerate(uids or (4, 9, 20, 21, 22)[:n]):
+        canonical = media + (b'FRAME\n' + frame) * 4 if split and uid >= 20 else media
+        if encoded_sizes is not None and position:
+            # A uniform one-level luma shift changes decoded SHA-256 while
+            # preserving the perceptual fingerprint for this fixture.
+            canonical = canonical[:-24] + bytes(value + 1 for value in canonical[-24:])
+        path = tmp_path / f'share-canonical-{uid}.y4m'
+        path.write_bytes(canonical)
+        evidence = compute_canonical_content(path)
+        prefix = f'metadata-{uid}'.encode()
+        if encoded_sizes is not None:
+            prefix += b'x' * (encoded_sizes[position] - len(prefix) - 1 - len(canonical))
+        output = store.put(prefix + b'\n' + canonical, ArtifactKind.MINER_OUTPUT)
+        receipt = _signed_receipt(
+            validator='validator-hotkey', miner=f'miner-{uid}', uid=uid,
+            challenge_id=context.challenge_id, track=context.track,
+            anchor=context.commitment_anchor, input_digest=context.challenge_input.digest,
+            input_size=context.challenge_input.byte_size, output_digest=output.digest,
+            output_size=output.byte_size,
+        )
+        packet = ItemScore.model_validate(dict(
+            originals[4], item_id=receipt.metadata.task_id, challenge_id=context.challenge_id,
+            miner_hotkey=receipt.miner_hotkey,
+            content_digest=output.digest, breakdown=breakdown.model_dump(mode='json'),
+            metrics={'final_score': 0.5, 'measured_label': f'original-{uid}'},
+            canonical_content_digest=evidence.canonical_content_digest,
+            content_fingerprint=evidence.content_fingerprint, encoded_size=output.byte_size,
+        ))
+        measured[uid] = packet
+        ref = store.put(canonical_json_bytes(packet.model_dump(mode='json')), ArtifactKind.SCORE_PACKET)
+        roster.append(ContentMember(
+            uid=uid, hotkey=receipt.miner_hotkey, score_packet=ref, output=output, receipt=receipt,
+            canonical_content_digest=evidence.canonical_content_digest,
+            content_fingerprint=evidence.content_fingerprint, encoded_size=output.byte_size,
+            canonicalization_plan_digest=packet.canonicalization_plan_digest,
+        ))
+    round_model = {CONTENT_EVIDENCE_RULE_V1: ContentRoundEvidenceV1,
+                   CONTENT_EVIDENCE_RULE_V2: ContentRoundEvidenceV2}.get(evidence_rule, ContentRoundEvidence)
+    context = round_model.model_validate(context.model_dump(exclude={'size_delta_percent', 'size_delta_permille', 'match_rule'}) | dict(
+        evidence_rule=evidence_rule, roster=tuple(roster),
+        edges=derive_edges(roster, evidence_rule=evidence_rule),
+        components=derive_components(roster, evidence_rule=evidence_rule),
+    ))
+    packets, witnesses, bundles = {}, {}, {}
+    for component in context.components:
+        winner = context.winner(component)
+        for uid in component:
+            member = next(member for member in roster if member.uid == uid)
+            if len(component) == 1:
+                packet = measured[uid]
+            else:
+                witness = ContentShareWitness(
+                    round_evidence=context, component_uids=component,
+                    winner_uid=winner, member_uid=uid, winner_score=measured[winner].score,
+                    share=measured[winner].score / len(component),
+                )
+                witnesses[uid] = witness
+                packet = mint_content_share_packet(
+                    witness=witness, config=scoring,
+                    measured_packet=measured[uid] if uid == winner else None,
+                )
+            packets[uid] = packet
+            ref = store.put(canonical_json_bytes(packet.model_dump(mode='json')), ArtifactKind.SCORE_PACKET)
+            bundles[uid] = template.model_copy(update=dict(
+                item_id=member.receipt.metadata.task_id, miner_hotkey=member.hotkey,
+                miner_output=member.output, miner_receipt=member.receipt, score_packet=ref,
+                scorer_version=packet.scorer_version, backend_versions=packet.backend_versions,
+            ))
+    return SimpleNamespace(store=store, scoring=scoring, real=real, template=template,
+                           context=context, byte=byte, originals=measured, packets=packets,
+                           witnesses=witnesses, bundles=bundles)
+
+
+def shared_manifest(case):
+    context = case.context
+    template_ref = case.store.put(canonical_json_bytes(case.template.model_dump(mode='json')),
+                                  ArtifactKind.AUDIT_BUNDLE)
+    entry = ContentRoundInput(
+        challenge_id=context.challenge_id, item_id=context.item_id, track=context.track,
+        round_json=context.to_json(), round_digest=context.digest(), template_bundle=template_ref,
+    )
+    log = SimpleNamespace(
+        schema_version=17, prior_log_digest=None,
+        miner_census=tuple(SimpleNamespace(uid=m.uid, hotkey=m.hotkey) for m in context.roster),
+        audit_manifest=AuditManifest(content_rounds=(entry,)),
+    )
+    for uid, packet in case.packets.items():
+        replace_final_share(case, log, uid, packet.model_dump(mode='json'))
+    service = SimpleNamespace(
+        _reveal_verifier=deep_reveal_verifier,
+        _challenge_chronology=lambda b, s: verify_challenge_chronology(
+            b, s, _ChronologyChain(b.challenge_anchor), require_anchor=True,
+            expected_netuid=85, scoring=case.scoring, receipt_verifier=_receipt_ok,
+        ),
+    )
+    return service, log
+
+
+def replace_final_share(case, log, uid, packet):
+    member = next(member for member in case.context.roster if member.uid == uid)
+    ordering = case.context.commitment_anchor.dispatch_ordering_key
+    packet = dict(packet, item_id=f'{member.receipt.metadata.task_id}-c{ordering}',
+                  cycle_sequence=ordering, excluded=False)
+    ref = case.store.put(canonical_json_bytes(packet), ArtifactKind.SCORE_PACKET)
+    rows = dict(log.audit_manifest.per_uid)
+    rows[uid] = (AuditFileRef(kind=AuditFileKind.SCORE_PACKET, digest=ref.digest,
+                            challenge_id=case.context.challenge_id, item_id=packet['item_id'],
+                            committed_track=case.context.track),)
+    log.audit_manifest = log.audit_manifest.model_copy(update={'per_uid': rows})
+
+
+def share_chronology(case, bundle, *, receipt_verifier=_receipt_ok):
+    return verify_challenge_chronology(
+        bundle, case.store, _ChronologyChain(bundle.challenge_anchor), require_anchor=True,
+        expected_netuid=85, scoring=case.scoring, receipt_verifier=receipt_verifier,
+    )
+
+
+def test_legacy_v1_packet_still_passes_exact_zero_validation(tmp_path):
+    store, _, _, _, _, _, _, witness, bundle = content_case(tmp_path)
+    packet = json.loads(store.get(bundle.score_packet))
+    assert content_identity_version(packet['scorer_version']) == 1
+    assert isinstance(content_witness_from_packet(packet), ContentDuplicateWitness)
+    validate_zero_packet(packet, bundle, witness)
+
+
+@pytest.mark.parametrize('n', [2, 3, 5])
+@pytest.mark.parametrize('evidence_rule,identity_version', [
+    (CONTENT_EVIDENCE_RULE_V1, 2), (CONTENT_EVIDENCE_RULE_V2, 3), (CONTENT_EVIDENCE_RULE, 4)])
+def test_shared_round_reproduces_every_member_and_complete_economics(tmp_path, monkeypatch, n, evidence_rule, identity_version):
+    case = shared_case(tmp_path, n, evidence_rule=evidence_rule)
+    monkeypatch.setattr(case.real, 'recompute', case.byte.recompute)
+    reproduced = []
+    content_recompute = case.real.recompute_content_duplicate
+    def record_content_recompute(*args, **kwargs):
+        fresh = content_recompute(*args, **kwargs)
+        reproduced.append(fresh)
+        return fresh
+    monkeypatch.setattr(case.real, 'recompute_content_duplicate', record_content_recompute)
+    for uid, packet in case.packets.items():
+        witness, bundle = case.witnesses[uid], case.bundles[uid]
+        assert packet.score == witness.winner_score / n
+        assert packet.score == witness.share
+        assert content_identity_version(packet.scorer_version) == identity_version
+        validate_share_packet(packet, bundle, witness, case.store)
+        assert share_chronology(case, bundle).kind is ChronologyKind.PASS
+        report = verify_bundle(bundle, case.store, case.real,
+                               expected_bundle_digest=bundle.bundle_digest(),
+                               reveal_verifier=deep_reveal_verifier, strict=False)
+        assert report.passed, report.failures()
+        checks = {check.name: check for check in report.checks}
+        for name in ('packet_consistency', 'score_recompute:score', 'scorer_version_recompute'):
+            assert checks[name].passed and not checks[name].skipped
+        fresh = reproduced[-1]
+        assert fresh.score == witness.share
+        assert fresh.gate_passed is (witness.role == 'winner')
+        assert fresh.scorer_version == packet.scorer_version
+        if witness.role == 'winner':
+            assert packet.metrics['measured_label'] == f'original-{uid}'
+            assert packet.breakdown == case.originals[uid].breakdown
+        else:
+            assert set(packet.metrics) == {'content_duplicate_witness'}
+    service, log = shared_manifest(case)
+    verdicts = audit_manifest_rounds(service, log, case.store, case.byte)
+    assert verdicts and all(v.verdict is ItemVerdictKind.PASS for v in verdicts), verdicts
+
+
+@pytest.mark.parametrize('role', ['winner', 'loser'])
+def test_share_chronology_verifies_all_component_signatures(tmp_path, role):
+    case = shared_case(tmp_path)
+    uid = next(uid for uid, witness in case.witnesses.items() if witness.role == role)
+    bundle = case.bundles[uid]
+    result = share_chronology(case, bundle, receipt_verifier=lambda receipt: receipt == bundle.miner_receipt)
+    assert result.kind is ChronologyKind.FAIL
+    assert 'signature' in result.detail
+
+
+@pytest.mark.parametrize('role', ['winner', 'loser'])
+def test_share_score_tamper_is_exact_even_below_metric_tolerance(tmp_path, role):
+    case = shared_case(tmp_path, 3)
+    uid = next(uid for uid, witness in case.witnesses.items() if witness.role == role)
+    packet = case.packets[uid].model_dump(mode='json')
+    packet['score'] = math.nextafter(packet['score'], math.inf)
+    with pytest.raises(InvalidContentEvidence):
+        validate_share_packet(packet, case.bundles[uid], case.witnesses[uid], case.store)
+    service, log = shared_manifest(case)
+    replace_final_share(case, log, uid, packet)
+    verdicts = audit_manifest_rounds(service, log, case.store, case.byte)
+    assert any(v.verdict is ItemVerdictKind.FAIL and v.code == 'CONTENT_EVIDENCE_MISMATCH'
+               for v in verdicts), verdicts
+
+
+@pytest.mark.parametrize('role', ['winner', 'loser'])
+@pytest.mark.parametrize('field,value', [
+    ('metrics', {'final_score': 0.5}),
+    ('breakdown', {'final': 0.99}),
+    ('backend_versions', {'tampered': '1'}),
+    ('canonical_content_digest', 'e' * 64),
+])
+def test_share_packet_cannot_change_measurements_or_mint_loser_measurements(tmp_path, role, field, value):
+    case = shared_case(tmp_path)
+    uid = next(uid for uid, witness in case.witnesses.items() if witness.role == role)
+    packet = case.packets[uid].model_dump(mode='json')
+    packet[field] = value
+    with pytest.raises(InvalidContentEvidence):
+        validate_share_packet(packet, case.bundles[uid], case.witnesses[uid], case.store)
+
+
+@pytest.mark.parametrize('role', ['winner', 'loser'])
+def test_share_missing_reference_original_is_unavailable_everywhere(tmp_path, monkeypatch, role):
+    case = shared_case(tmp_path)
+    uid = next(uid for uid, witness in case.witnesses.items() if witness.role == role)
+    witness, bundle = case.witnesses[uid], case.bundles[uid]
+    winner = next(member for member in case.context.roster if member.uid == witness.winner_uid)
+    get = case.store.get_limited
+    def missing(ref, limit):
+        if ref == winner.score_packet:
+            raise FileNotFoundError('reference winner original temporarily missing')
+        return get(ref, limit)
+    monkeypatch.setattr(case.store, 'get_limited', missing)
+    monkeypatch.setattr(case.real, 'recompute', case.byte.recompute)
+    with pytest.raises(FileNotFoundError):
+        validate_share_packet(case.packets[uid], bundle, witness, case.store)
+    chronology = share_chronology(case, bundle)
+    assert chronology.kind is ChronologyKind.SKIP
+    assert 'original packet unavailable' in chronology.detail
+    report = verify_bundle(bundle, case.store, case.real,
+                           expected_bundle_digest=bundle.bundle_digest(),
+                           reveal_verifier=deep_reveal_verifier, strict=False)
+    assert any(c.name == 'score_recompute' and c.skipped for c in report.checks)
+    assert not report.failures(), report.failures()
+    service, log = shared_manifest(case)
+    verdicts = audit_manifest_rounds(service, log, case.store, case.byte)
+    assert verdicts and all(v.verdict is ItemVerdictKind.SKIP for v in verdicts), verdicts
+
+
+@pytest.mark.parametrize('inflated', [False, True])
+def test_loser_economics_bind_original_when_reference_winner_was_already_folded(tmp_path, inflated):
+    case = shared_case(tmp_path, 3)
+    service, log = shared_manifest(case)
+    winner = case.context.winner(case.context.components[0])
+    rows = dict(log.audit_manifest.per_uid)
+    rows.pop(winner)
+    log.audit_manifest = log.audit_manifest.model_copy(update={'per_uid': rows})
+    log.prior_log_digest = 'a' * 64
+    prior = SimpleNamespace(log_digest=lambda: 'a' * 64,
+                            audit_manifest=AuditManifest(fold_cursors={winner: 7}))
+    if inflated:
+        for uid, witness in case.witnesses.items():
+            if uid == winner:
+                continue
+            forged = ContentShareWitness.model_validate(witness.model_dump() | {
+                'winner_score': 1.0, 'share': 1.0 / len(witness.component_uids),
+            })
+            packet = mint_content_share_packet(witness=forged, config=case.scoring, measured_packet=None)
+            replace_final_share(case, log, uid, packet.model_dump(mode='json'))
+    verdicts = audit_manifest_rounds(service, log, case.store, case.byte, prior_log=prior)
+    if inflated:
+        assert any(v.verdict is ItemVerdictKind.FAIL and v.code == 'CONTENT_EVIDENCE_MISMATCH'
+                   and 'winner_score' in v.detail for v in verdicts), verdicts
+    else:
+        assert verdicts and all(v.verdict is ItemVerdictKind.PASS for v in verdicts), verdicts
+
+
+def test_sampled_loser_cannot_inflate_reference_winner_score(tmp_path, monkeypatch):
+    case = shared_case(tmp_path, 3)
+    uid = next(uid for uid, witness in case.witnesses.items() if witness.role == 'loser')
+    witness = case.witnesses[uid]
+    forged = ContentShareWitness.model_validate(witness.model_dump() | {'winner_score': 1.0, 'share': 1.0 / 3})
+    packet = mint_content_share_packet(witness=forged, config=case.scoring, measured_packet=None)
+    ref = case.store.put(canonical_json_bytes(packet.model_dump(mode='json')), ArtifactKind.SCORE_PACKET)
+    bundle = case.bundles[uid].model_copy(update={'score_packet': ref})
+    assert share_chronology(case, bundle).kind is ChronologyKind.FAIL
+    monkeypatch.setattr(case.real, 'recompute', case.byte.recompute)
+    report = verify_bundle(bundle, case.store, case.real,
+                           expected_bundle_digest=bundle.bundle_digest(),
+                           reveal_verifier=deep_reveal_verifier, strict=False)
+    assert not report.passed
+    assert any(c.code == 'CONTENT_EVIDENCE_MISMATCH' and 'winner_score' in c.reason
+               for c in report.failures())
+
+
+def test_shared_round_requires_a_reminted_reference_winner(tmp_path):
+    case = shared_case(tmp_path)
+    service, log = shared_manifest(case)
+    winner = case.context.winner(case.context.components[0])
+    replace_final_share(case, log, winner, case.originals[winner].model_dump(mode='json'))
+    verdicts = audit_manifest_rounds(service, log, case.store, case.byte)
+    assert any(v.verdict is ItemVerdictKind.FAIL and 'mixed v1/v2' in v.detail for v in verdicts)
+
+
+def test_round_version_is_uniform_across_distinct_duplicate_components(tmp_path):
+    case = shared_case(tmp_path, 5, split=True)
+    assert case.context.components == ((4, 9), (20, 21, 22))
+    service, log = shared_manifest(case)
+    component = case.context.components[0]
+    winner = case.context.winner(component)
+    for uid in component:
+        if uid == winner:
+            packet = case.originals[uid]
+        else:
+            witness = ContentDuplicateWitness(round_evidence=case.context, component_uids=component,
+                                              winner_uid=winner, loser_uid=uid)
+            packet = mint_content_duplicate_packet(witness=witness, config=case.scoring)
+        replace_final_share(case, log, uid, packet.model_dump(mode='json'))
+    verdicts = audit_manifest_rounds(service, log, case.store, case.byte)
+    assert any(v.verdict is ItemVerdictKind.FAIL and 'mixed v1/v2' in v.detail for v in verdicts)
+
+
+def test_shared_round_keeps_singleton_original_economics(tmp_path):
+    case = shared_case(tmp_path, 3, split=True)
+    assert case.context.components == ((4, 9), (20,))
+    assert case.packets[20] == case.originals[20]
+    service, log = shared_manifest(case)
+    verdicts = audit_manifest_rounds(service, log, case.store, case.byte)
+    assert verdicts and all(v.verdict is ItemVerdictKind.PASS for v in verdicts), verdicts
+
+
+@pytest.mark.parametrize('identity_version, expected_error', [(1, InvalidContentEvidence), (2, RuntimeError)])
+def test_content_recomputer_rejects_identity_witness_schema_mismatch(tmp_path, identity_version, expected_error):
+    case = shared_case(tmp_path)
+    uid = next(uid for uid, witness in case.witnesses.items() if witness.role == 'loser')
+    witness = case.witnesses[uid]
+    legacy = mint_content_duplicate_packet(
+        witness=ContentDuplicateWitness(round_evidence=case.context,
+                                        component_uids=witness.component_uids,
+                                        winner_uid=witness.winner_uid, loser_uid=uid),
+        config=case.scoring,
+    )
+    packet = (case.packets[uid] if identity_version == 1 else legacy).model_dump(mode='json')
+    packet['scorer_version'] = (legacy if identity_version == 1 else case.packets[uid]).scorer_version
+    raw = canonical_json_bytes(packet)
+    ref = case.store.put(raw, ArtifactKind.SCORE_PACKET)
+    bundle = case.bundles[uid].model_copy(update={'score_packet': ref, 'scorer_version': packet['scorer_version']})
+    with pytest.raises(expected_error, match=f'schema-v{identity_version}'):
+        case.real.recompute_content_duplicate(bundle, {ArtifactKind.SCORE_PACKET: raw}, case.store)
+    assert share_chronology(case, bundle).kind is ChronologyKind.FAIL
+
+
+def test_auditor_mixed_v2_v3_history_preserves_old_size_band_and_new_singletons(tmp_path, monkeypatch):
+    sizes = (8_662_928, 8_703_841)
+    old = shared_case(
+        tmp_path, evidence_rule=CONTENT_EVIDENCE_RULE_V1, encoded_sizes=sizes,
+        uids=(93, 194), challenge_id='historical-size-band-round',
+    )
+    current = shared_case(
+        tmp_path, evidence_rule=CONTENT_EVIDENCE_RULE, encoded_sizes=sizes,
+        uids=(93, 194), challenge_id='current-size-band-round',
+    )
+    assert old.context.roster[0].canonical_content_digest != old.context.roster[1].canonical_content_digest
+    assert old.context.roster[0].content_fingerprint == old.context.roster[1].content_fingerprint
+    assert tuple(member.encoded_size for member in old.context.roster) == sizes
+    assert old.context.edges == ((93, 194),)
+    assert old.context.components == ((93, 194),)
+    assert current.context.edges == ()
+    assert current.context.components == ((93,), (194,))
+    assert {packet.score for packet in old.packets.values()} == {0.25}
+    assert {packet.score for packet in current.packets.values()} == {0.5}
+    assert {content_identity_version(packet.scorer_version) for packet in old.packets.values()} == {2}
+
+    old_bytes = old.context.to_json()
+    old_packets = {uid: packet.model_dump(mode='json') for uid, packet in old.packets.items()}
+    monkeypatch.setattr(old.real, 'recompute', old.byte.recompute)
+    for bundle in old.bundles.values():
+        report = verify_bundle(
+            bundle, old.store, old.real, expected_bundle_digest=bundle.bundle_digest(),
+            reveal_verifier=deep_reveal_verifier, strict=False,
+        )
+        assert report.passed, report.failures()
+    service, old_log = shared_manifest(old)
+    _, current_log = shared_manifest(current)
+    combined = SimpleNamespace(**vars(old_log))
+    combined.audit_manifest = AuditManifest(
+        per_uid={uid: old_log.audit_manifest.per_uid[uid] + current_log.audit_manifest.per_uid[uid]
+                 for uid in (93, 194)},
+        content_rounds=old_log.audit_manifest.content_rounds + current_log.audit_manifest.content_rounds,
+    )
+    verdicts = audit_manifest_rounds(service, combined, old.store, old.byte)
+    assert [(v.challenge_id, v.verdict) for v in verdicts] == [
+        ('historical-size-band-round', ItemVerdictKind.PASS),
+        ('current-size-band-round', ItemVerdictKind.PASS),
+        ('current-size-band-round', ItemVerdictKind.PASS),
+    ], verdicts
+    assert old.context.to_json() == old_bytes
+    assert {uid: packet.model_dump(mode='json') for uid, packet in old.packets.items()} == old_packets
+
+
+@pytest.mark.parametrize('evidence_rule,other_rule', [
+    (CONTENT_EVIDENCE_RULE_V1, CONTENT_EVIDENCE_RULE),
+    (CONTENT_EVIDENCE_RULE, CONTENT_EVIDENCE_RULE_V1),
+])
+def test_content_share_identity_cannot_select_a_different_evidence_rule(tmp_path, evidence_rule, other_rule):
+    from vidaio.scoring.content_duplicate_evidence import content_duplicate_identity
+
+    case = shared_case(tmp_path, evidence_rule=evidence_rule)
+    uid = next(iter(case.packets))
+    packet = case.packets[uid].model_dump(mode='json')
+    packet['scorer_version'] = content_duplicate_identity(
+        committed_scorer_version=case.context.committed_scorer_version,
+        track=case.context.track, scoring_config_digest=case.context.scoring_config_digest,
+        evidence_rule=other_rule,
+    )
+    with pytest.raises(InvalidContentEvidence):
+        validate_share_packet(packet, case.bundles[uid], case.witnesses[uid], case.store)
+    service, log = shared_manifest(case)
+    replace_final_share(case, log, uid, packet)
+    assert any(v.verdict is ItemVerdictKind.FAIL
+               for v in audit_manifest_rounds(service, log, case.store, case.byte))

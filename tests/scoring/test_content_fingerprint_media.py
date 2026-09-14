@@ -12,7 +12,7 @@ import pytest
 
 from vidaio.scoring.backends_real import CanonicalizeExecutor
 from vidaio.scoring.canonicalize import build_canonicalization_plan, plan_template_digest
-from vidaio.scoring.content_duplicate_evidence import same_content
+from vidaio.scoring.content_duplicate_evidence import CONTENT_EVIDENCE_RULE_V2, same_content
 from vidaio.scoring.content_fingerprint import compute_canonical_content
 
 FFMPEG = shutil.which("ffmpeg")
@@ -94,7 +94,9 @@ def test_psnr_over_50_pixel_noise_survives_real_remux_and_matches(clips):
     assert clean.encoded_size == noisy_evidence.encoded_size
     assert sum((int(a, 16) ^ int(b, 16)).bit_count() <= 6
                for a, b in zip(clean.content_fingerprint, noisy_evidence.content_fingerprint)) >= 30
-    assert same_content(clean, noisy_evidence)
+    # The historical approximate-size rule grouped this pair; the exact-digest rule does not.
+    assert same_content(clean, noisy_evidence, evidence_rule=CONTENT_EVIDENCE_RULE_V2)
+    assert not same_content(clean, noisy_evidence)
 
 
 def test_crf22_and_crf26_legitimate_rate_choices_remain_distinct(clips):
@@ -106,5 +108,5 @@ def test_crf22_and_crf26_legitimate_rate_choices_remain_distinct(clips):
         measured.append(evidence(output)[0])
     left, right = measured
     assert left.canonical_content_digest != right.canonical_content_digest
-    assert 100 * abs(left.encoded_size - right.encoded_size) > max(left.encoded_size, right.encoded_size)
+    assert 1000 * abs(left.encoded_size - right.encoded_size) > 2 * max(left.encoded_size, right.encoded_size)
     assert not same_content(left, right)

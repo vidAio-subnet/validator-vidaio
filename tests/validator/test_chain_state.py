@@ -19,8 +19,11 @@ DB unhealthy even when it was fine.
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import urllib.request
+
+import pytest
 
 from vidaio.validator import miner_manager
 
@@ -188,6 +191,105 @@ async def test_gate_can_be_disabled_with_zero(make_validator, chain, miner_clien
     miner_client.tracks = {1: "compression"}
 
     assert (await validator.run_round()).skipped_reason is None
+
+
+async def test_round_assignment_reads_fresh_head_with_throttled_snapshot(
+    make_validator, chain, miner_client, conn, monkeypatch, caplog
+):
+    chain.set_neurons([mk_neuron(1)])
+    miner_client.tracks = {1: "compression"}
+    fresh = FreshnessChain(chain)
+    validator = make_validator(
+        chain=fresh,
+        clock=lambda: 1.0,
+        config={"metagraph_refresh_seconds": 1800.0},
+    )
+    validator._last_refresh_at = 0.0
+    reads = []
+
+    def read_head():
+        reads.append(conn.in_transaction)
+        return 1 + len(reads)
+
+    def unexpected_cached_read():
+        raise AssertionError("successful fresh read must not read the cached block")
+
+    monkeypatch.setattr(fresh, "best_head_block", read_head)
+    monkeypatch.setattr(fresh, "current_block", unexpected_cached_read)
+
+    with caplog.at_level(logging.WARNING):
+        report = await validator.run_round()
+
+    assert fresh.refresh_calls == 0
+    assert reads == [False, True]
+    assert report.scored == {1: 0.8}
+    row = conn.execute(
+        "SELECT block, commit_block FROM rounds WHERE round_id=?", (report.round_id,)
+    ).fetchone()
+    assert tuple(row) == (2, 3)
+    assert miner_manager.get_miner(conn, 1)["first_seen_block"] == 2
+    assert conn.execute(
+        "SELECT block FROM miner_state_history WHERE round_id=?", (report.round_id,)
+    ).fetchone()[0] == 2
+    assert not any("using cached block" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("error_type", [OSError, TimeoutError])
+async def test_round_assignment_falls_back_only_when_fresh_head_raises(
+    validator, chain, miner_client, conn, monkeypatch, caplog, error_type
+):
+    chain.set_neurons([mk_neuron(1)])
+    miner_client.tracks = {1: "compression"}
+    fresh_reads = []
+    cached_reads = []
+
+    def read_head():
+        fresh_reads.append(conn.in_transaction)
+        if len(fresh_reads) == 1:
+            raise error_type("head unavailable")
+        return 2
+
+    def read_cached():
+        cached_reads.append(conn.in_transaction)
+        return 1
+
+    monkeypatch.setattr(chain, "best_head_block", read_head)
+    monkeypatch.setattr(chain, "current_block", read_cached)
+
+    with caplog.at_level(logging.WARNING):
+        report = await validator.run_round()
+
+    assert fresh_reads == [False, True]
+    assert cached_reads == [False]
+    assert report.scored == {1: 0.8}
+    row = conn.execute(
+        "SELECT block, commit_block FROM rounds WHERE round_id=?", (report.round_id,)
+    ).fetchone()
+    assert tuple(row) == (1, 2)
+    assert miner_manager.get_miner(conn, 1)["first_seen_block"] == 1
+    (warning,) = [r for r in caplog.records if "using cached block" in r.getMessage()]
+    assert warning.levelno == logging.WARNING
+    assert warning.fields == {
+        "cached_block": 1, "error": f"{error_type.__name__}: head unavailable"
+    }
+
+
+async def test_failed_fresh_and_cached_heads_skip_round(
+    validator, chain, conn, miner_client, monkeypatch
+):
+    def unavailable():
+        raise OSError("chain unreachable")
+
+    monkeypatch.setattr(chain, "best_head_block", unavailable)
+    monkeypatch.setattr(chain, "current_block", unavailable)
+
+    report = await validator.run_round()
+
+    assert report.skipped_reason == "chain_state_unavailable"
+    assert report.round_id is None
+    assert report.scored == {}
+    assert miner_client.task_calls == []
+    assert conn.execute("SELECT COUNT(*) FROM rounds").fetchone()[0] == 0
 
 
 # --- #22 health ----------------------------------------------------------------

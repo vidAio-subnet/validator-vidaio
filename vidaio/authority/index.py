@@ -12,12 +12,18 @@ same row; a re-finalize with a DIFFERENT digest is a conflict and raises). `set_
 fills the anchor columns once, after the digest is anchored on chain (idempotent for
 the same txid). The in-database triggers (migration 0001) enforce this even against
 direct SQL.
+
+The separate submission journal retains signed authority extrinsics before
+dispatch. Its evidence is immutable; one terminal outcome may be added later.
 """
 
 from __future__ import annotations
 
+import json
+import re
 import sqlite3
 from pathlib import Path
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -57,6 +63,35 @@ class EpochRecord(BaseModel):
         return self.anchor_txid is not None
 
 
+class AnchorSubmissionRecord(BaseModel):
+    """Immutable signed dispatch evidence and its optional terminal disposition."""
+
+    model_config = ConfigDict(frozen=True)
+
+    extrinsic_hash: str
+    epoch_id: int
+    netuid: int
+    log_digest: str
+    submission: dict[str, Any]
+    outcome: Literal["confirmed", "expired_absent", "operator_acknowledged"] | None = None
+    outcome_at: str | None = None
+    outcome_evidence: dict[str, Any] | None = None
+
+
+def _row_to_submission(row: sqlite3.Row) -> AnchorSubmissionRecord:
+    return AnchorSubmissionRecord(
+        extrinsic_hash=row["extrinsic_hash"],
+        epoch_id=row["epoch_id"],
+        netuid=row["netuid"],
+        log_digest=row["log_digest"],
+        submission=json.loads(row["submission_json"]),
+        outcome=row["outcome"],
+        outcome_at=row["outcome_at"],
+        outcome_evidence=(json.loads(row["outcome_evidence"])
+                          if row["outcome_evidence"] is not None else None),
+    )
+
+
 def _row_to_record(row: sqlite3.Row) -> EpochRecord:
     return EpochRecord(
         epoch_id=row["epoch_id"],
@@ -88,6 +123,108 @@ class EpochIndex:
 
     def close(self) -> None:
         self._conn.close()
+
+    def _durable_execute(self, sql: str, parameters: tuple[Any, ...]) -> None:
+        """Fsync the WAL before dispatch or releasing a durable writer fence."""
+        if self._conn.in_transaction:
+            raise EpochIndexConflict("anchor evidence requires its own durable commit")
+        synchronous = int(self._conn.execute("PRAGMA synchronous").fetchone()[0])
+        self._conn.execute("PRAGMA synchronous=FULL")
+        try:
+            self._conn.execute(sql, parameters)
+        finally:
+            self._conn.execute(f"PRAGMA synchronous={synchronous}")
+
+    def record_anchor_submission(
+        self, epoch_id: int, *, netuid: int, log_digest: str,
+        submission: dict[str, Any],
+    ) -> AnchorSubmissionRecord:
+        """Durably reserve one signed hash before it may be sent, never replace it."""
+        txid = submission.get("extrinsic_hash")
+        if not isinstance(txid, str) or re.fullmatch(r"0x[0-9a-f]{64}", txid) is None:
+            raise ValueError("anchor submission hash must be canonical 32-byte hex")
+        encoded = json.dumps(submission, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        existing = self.anchor_submission_by_hash(txid)
+        if existing is not None:
+            if (existing.epoch_id != epoch_id or existing.netuid != netuid
+                    or existing.log_digest != log_digest or existing.submission != submission):
+                raise EpochIndexConflict("anchor hash already binds different durable evidence")
+            return existing
+        previous = self.get_anchor_submission(epoch_id)
+        if previous is not None and previous.outcome != "expired_absent":
+            raise EpochIndexConflict("refusing a second authority submission without proven expiry")
+        self._durable_execute(
+            "INSERT INTO authority_anchor_submissions"
+            " (extrinsic_hash,epoch_id,netuid,log_digest,submission_json) VALUES (?,?,?,?,?)",
+            (txid, epoch_id, netuid, log_digest, encoded),
+        )
+        recorded = self.anchor_submission_by_hash(txid)
+        assert recorded is not None
+        return recorded
+
+    def finish_anchor_submission(
+        self, extrinsic_hash: str, *,
+        outcome: Literal["confirmed", "expired_absent", "operator_acknowledged"],
+        outcome_at: str, evidence: dict[str, Any],
+    ) -> AnchorSubmissionRecord:
+        """Append a terminal disposition once, retaining the original signed bytes."""
+        record = self.anchor_submission_by_hash(extrinsic_hash)
+        if record is None:
+            raise EpochIndexConflict("cannot finish an unknown anchor submission")
+        if record.outcome is not None:
+            if record.outcome != outcome or record.outcome_evidence != evidence:
+                raise EpochIndexConflict("anchor submission already has a different terminal outcome")
+            return record
+        if outcome == "confirmed":
+            epoch = self.get(record.epoch_id)
+            if (epoch is None or epoch.anchor_txid != extrinsic_hash
+                    or epoch.anchor_block != evidence.get("block") or epoch.anchor_block is None):
+                raise EpochIndexConflict("confirmed outcome requires the exact durably indexed anchor")
+        elif outcome == "expired_absent":
+            era = record.submission.get("mortal_era")
+            depth = evidence.get("confirmation_depth")
+            start = record.submission.get("submit_block")
+            finalized_head = evidence.get("finalized_block")
+            if (isinstance(era, bool) or not isinstance(era, int) or era <= 0
+                    or isinstance(depth, bool) or not isinstance(depth, int) or depth < 0
+                    or not isinstance(start, int) or isinstance(start, bool)
+                    or not isinstance(finalized_head, int) or isinstance(finalized_head, bool)
+                    or evidence.get("extrinsic_hash") != extrinsic_hash
+                    or evidence.get("mortal_era") != era
+                    or evidence.get("search_start") != start
+                    or evidence.get("search_end") != start + era + depth
+                    or finalized_head <= start + era + depth):
+                raise EpochIndexConflict("expired-absent outcome requires full finalized mortal-era evidence")
+        elif outcome == "operator_acknowledged" and evidence.get("operator_ack") != extrinsic_hash:
+            raise EpochIndexConflict("operator acknowledgement must bind the pending hash")
+        self._durable_execute(
+            "UPDATE authority_anchor_submissions SET outcome=?,outcome_at=?,outcome_evidence=?"
+            " WHERE extrinsic_hash=? AND outcome IS NULL",
+            (outcome, outcome_at, json.dumps(evidence, sort_keys=True, separators=(",", ":"),
+                                          allow_nan=False), extrinsic_hash),
+        )
+        updated = self.anchor_submission_by_hash(extrinsic_hash)
+        assert updated is not None
+        return updated
+
+    def anchor_submission_by_hash(self, extrinsic_hash: str) -> AnchorSubmissionRecord | None:
+        row = self._conn.execute(
+            "SELECT * FROM authority_anchor_submissions WHERE extrinsic_hash=?",
+            (extrinsic_hash,),
+        ).fetchone()
+        return _row_to_submission(row) if row is not None else None
+
+    def get_anchor_submission(self, epoch_id: int) -> AnchorSubmissionRecord | None:
+        row = self._conn.execute(
+            "SELECT * FROM authority_anchor_submissions WHERE epoch_id=? ORDER BY rowid DESC LIMIT 1",
+            (epoch_id,),
+        ).fetchone()
+        return _row_to_submission(row) if row is not None else None
+
+    def pending_anchor_submissions(self) -> list[AnchorSubmissionRecord]:
+        return [_row_to_submission(row) for row in self._conn.execute(
+            "SELECT * FROM authority_anchor_submissions WHERE outcome IS NULL ORDER BY rowid"
+        )]
 
     # -- writes ----------------------------------------------------------------
 

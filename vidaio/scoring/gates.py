@@ -54,6 +54,11 @@ class ReasonCode(StrEnum):
     STREAM_PTS_INCONSISTENT = "STREAM_PTS_INCONSISTENT"
     REPLAY_DUPLICATE = "REPLAY_DUPLICATE"
     DUPLICATE_CONTENT = "DUPLICATE_CONTENT"
+    #: Round-composition verdict (never a per-item gate): the output is closer to
+    #: the sealed pristine reference than to the served input on BOTH the luma
+    #: (VMAF) and chroma (plane PSNR) residuals, relative to the round's
+    #: population — see ``vidaio.scoring.source_proximity_evidence``.
+    SOURCE_PROXIMITY = "SOURCE_PROXIMITY"
     MINER_TIMEOUT = "MINER_TIMEOUT"
     MINER_TRANSPORT_ERROR = "MINER_TRANSPORT_ERROR"
     MINER_TASK_ID_MISMATCH = "MINER_TASK_ID_MISMATCH"
@@ -103,7 +108,9 @@ class GateContext:
     ``reference_info`` is the pristine held-out original; ``input_info`` and
     ``input_path`` are the payload the miner actually received. Size caps,
     compression rate, anti-gaming VMAF, and perceptual-manipulation gates all use
-    that canonical miner-input basis. Scored quality remains pristine based.
+    that canonical miner-input basis. Scored quality (``vmaf_primary`` here) is
+    pristine based for upscaling and, since scoring config
+    ``compression_vmaf_basis="miner_input"``, miner-input based for compression.
     """
 
     track: str

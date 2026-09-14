@@ -501,6 +501,90 @@ def test_real_s3_does_not_hide_non_precondition_failures() -> None:
         _real_s3_transport(ConcurrentWriteClient()).put_bytes("key", b"payload")
 
 
+@pytest.mark.parametrize("read_to_file", [False, True])
+def test_real_s3_stream_timeout_closes_body_and_discards_partial_download(
+    tmp_path: Path, *, read_to_file: bool
+) -> None:
+    timeout = TimeoutError("object body socket timed out")
+
+    class TimedOutBody:
+        closed = False
+
+        def read(self) -> bytes:
+            raise timeout
+
+        def iter_chunks(self, *, chunk_size: int):
+            assert chunk_size > 0
+            yield b"partial epoch log"
+            raise timeout
+
+        def close(self) -> None:
+            self.closed = True
+
+    body = TimedOutBody()
+
+    class ReadClient:
+        calls = 0
+
+        def get_object(self, **kwargs: object) -> dict[str, object]:
+            assert kwargs == {
+                "Bucket": "audit-bucket",
+                "Key": "launch/finalized/epoch=7/log.json",
+            }
+            self.calls += 1
+            return {"Body": body}
+
+    client = ReadClient()
+    transport = _real_s3_transport(client)
+    destination = tmp_path / "epoch-log.json"
+    with pytest.raises(TimeoutError) as raised:
+        if read_to_file:
+            transport.get_file(
+                "finalized/epoch=7/log.json", destination, max_bytes=1024
+            )
+        else:
+            _RealS3Transport.get_bytes(transport, "finalized/epoch=7/log.json")
+
+    assert raised.value is timeout
+    assert body.closed
+    assert not destination.exists()
+    assert client.calls == 1  # The tick receives the failure; no hidden body retry.
+
+
+def test_s3_finalized_member_lost_write_ack_is_retried_without_overwrite() -> None:
+    timeout = TimeoutError("conditional create response timed out")
+
+    class LostWriteAckClient(ConditionalS3Client):
+        def put_object(self, **kwargs: object) -> None:
+            super().put_object(**kwargs)
+            if len(self.calls) == 1:
+                raise timeout
+
+    client = LostWriteAckClient()
+    store = S3Store(
+        AuditConfig(backend="s3", allow_plaintext_holdout=True),
+        transport=_real_s3_transport(client),
+    )
+    prefix = "finalized/epoch=19"
+    payload = b"durable epoch log, acknowledgement lost"
+
+    with pytest.raises(TimeoutError) as raised:
+        store.put_set_member(prefix, "log.json", payload)
+    assert raised.value is timeout
+    assert len(client.calls) == 1
+    assert not store.is_finalized(prefix)
+    with pytest.raises(SetNotFinalizedError):
+        store.get_set_member(prefix, "log.json")
+
+    ref = store.put_set_member(prefix, "log.json", payload)
+    store.finalize_set(prefix)
+    assert store.get_set_member(
+        prefix, "log.json", expected_digest=ref.digest, byte_size=ref.byte_size
+    ) == payload
+    assert client.objects["launch/finalized/epoch=19/log.json"] == payload
+    assert all(call["IfNoneMatch"] == "*" for call in client.calls)
+
+
 def test_s3_set_member_repeat_is_idempotent_but_different_bytes_conflict() -> None:
     client = ConditionalS3Client()
     store = S3Store(

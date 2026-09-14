@@ -41,6 +41,7 @@ def capture_epoch_inputs(
     chain_neurons: Sequence[ChainNeuron],
     read_best_head: Callable[[], int],
     max_head: int | None = None,
+    on_anchor_window_elapsed: Callable[[int], None] | None = None,
 ) -> CapturedEpochInputs:
     """Detach all epoch inputs under the same exclusion used by round writers.
 
@@ -83,6 +84,8 @@ def capture_epoch_inputs(
         if observed < close_block:
             raise EpochCaptureUnavailable("fresh best head is below the selected close")
         if max_head is not None and observed >= max_head:
+            if on_anchor_window_elapsed is not None:
+                on_anchor_window_elapsed(observed)
             raise EpochCaptureUnavailable("fresh best head is outside the open anchor window")
         changed = conn.execute("UPDATE round_seal SET sealed_close = MAX(sealed_close, ?) WHERE singleton = 1", (close_block,))
         if changed.rowcount != 1:

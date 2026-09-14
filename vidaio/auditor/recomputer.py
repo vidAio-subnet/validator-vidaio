@@ -29,6 +29,8 @@ from __future__ import annotations
 import hashlib
 import json
 import numbers
+import time
+from copy import copy
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Mapping
@@ -42,7 +44,11 @@ from vidaio.audit.recompute import (
     _orchestrator_zero_identity,
 )
 from vidaio.audit.store import ArtifactKind
-from vidaio.challenge.commitment import RevealedCommitment, verify_reveal_deep
+from vidaio.challenge.commitment import (
+    RevealedCommitment,
+    rebuild_dag_from_reveal,
+    verify_reveal_deep,
+)
 from vidaio.challenge.dag import UPSCALE_FACTORS, build_dag, dag_rng_from_seed
 from vidaio.competition.item_commitment import evaluation_item_commitment
 from vidaio.scoring import (
@@ -63,14 +69,14 @@ from vidaio.scoring_worker import (
     effective_scorer_version,
     real_backends,
 )
-from vidaio.scoring_worker.inputs import ScoreRejected
+from vidaio.scoring_worker.inputs import ScoreRejected, ScratchBudget
 from vidaio.scoring_worker.runtime_identity import (
     payout_runtime_attestation,
     require_attested_backend_versions,
     require_canonical_release_runtime,
     runtime_commitment_digest,
 )
-from vidaio.scoring_worker.service import _score_sync
+from vidaio.scoring_worker.service import _byte_limits, _score_sync
 from vidaio.services.protocol import ScoreRequest
 
 #: The version string unconfigured backend stubs stamp (see backends_real).
@@ -130,6 +136,8 @@ class RealScoreRecomputer:
         """
         self._config = config
         self._backends = backends
+        self._owns_real_backends = False
+        self._scratch_budget = ScratchBudget(_byte_limits(config))
         self._scoring_config = scoring_config or ScoringConfig()
         backend_attestation = getattr(backends, "runtime_attestation", None)
         if allow_noncanonical_pre_marker_build_or_test_runtime:
@@ -187,7 +195,7 @@ class RealScoreRecomputer:
         scoring_cfg = scoring_config or ScoringConfig()
         # Hard invariant: an auditor never selects CUDA, even on a CUDA host.
         # Validators can therefore accept the audit workload on ordinary CPUs.
-        return cls(
+        recomputer = cls(
             config,
             real_backends(config, scoring_config=scoring_cfg, pieapp_device="cpu"),
             scoring_config=scoring_cfg,
@@ -195,6 +203,27 @@ class RealScoreRecomputer:
                 allow_noncanonical_pre_marker_build_or_test_runtime
             ),
         )
+        recomputer._owns_real_backends = True
+        return recomputer
+
+    def for_worker(self) -> "RealScoreRecomputer":
+        """Clone real media tools while retaining identity and shared scratch accounting."""
+        worker = copy(self)
+        if self._owns_real_backends:
+            backends = real_backends(
+                self._config, scoring_config=self._scoring_config, pieapp_device="cpu",
+            )
+            if (
+                dict(backends.versions) != dict(self._backends.versions)
+                or backends.runtime_attestation is None
+                or runtime_commitment_digest(backends.runtime_attestation)
+                != runtime_commitment_digest(self._runtime_attestation)
+            ):
+                raise RuntimeError("worker audit backends differ from the original runtime commitment")
+            worker._backends = backends
+        # Injected test compositions retain their explicitly supplied backends.
+        # The shallow copy also retains the historical identity and common budget.
+        return worker
 
     @property
     def scorer_version(self) -> str:
@@ -206,7 +235,6 @@ class RealScoreRecomputer:
         This returns a separate observer instance; the live recomputer and worker
         identity remain unchanged. No packet-selected arbitrary scorer is accepted.
         """
-        from copy import copy
         from vidaio.epoch.log import _HistoryEpochLogV16
         from vidaio.scoring_worker.service import historical_v16_scorer_version
 
@@ -350,13 +378,7 @@ class RealScoreRecomputer:
                 scorer_version=None,  # accept the recomputer's own identity
             )
             try:
-                item = _score_sync(
-                    request,
-                    self._config,
-                    self._scoring_config,
-                    self._backends,
-                    self._scorer_version,
-                )
+                item = self._score_with_scratch_wait(request)
             except NotConfiguredError as exc:
                 # An unconfigured backend surfaced only once the pipeline ran (e.g.
                 # a deliberately injected refusal backend) — the SAME honest
@@ -397,6 +419,27 @@ class RealScoreRecomputer:
             ),
         )
 
+    def _score_with_scratch_wait(self, request: ScoreRequest):
+        """Share the existing work-dir budget; downloaded audit media remains outside it."""
+        deadline = time.monotonic() + self._config.request_timeout
+        while True:
+            try:
+                return _score_sync(
+                    request, self._config, self._scoring_config, self._backends,
+                    self._scorer_version, None, self._scratch_budget,
+                )
+            except ScoreRejected as exc:
+                if exc.status_code != 503 or exc.payload.get("error") != "scratch_budget_unavailable":
+                    raise
+                # _score_sync has removed this attempt's directory and released
+                # its lease before admission is retried; no partial lease waits.
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                time.sleep(min(5.0, remaining))
+                if time.monotonic() >= deadline:
+                    raise
+
     # -- helpers ----------------------------------------------------------------------
 
     @staticmethod
@@ -420,13 +463,33 @@ class RealScoreRecomputer:
         return is_duplicate_identity(packet.get("scorer_version"))
 
     def recompute_content_duplicate(self, bundle, artifacts, store, *, member_recomputer=None) -> RecomputedScore:
-        """Rerun every original signed member before reproducing a content zero."""
-        from vidaio.auditor.content_evidence import verify_round, validate_zero_packet
-        from vidaio.scoring.content_duplicate_evidence import content_witness_from_packet
+        """Rerun every original signed member before reproducing content economics."""
+        from vidaio.audit.recompute import ScorePacketShape
+        from vidaio.auditor.content_evidence import (
+            MAX_CONTENT_METADATA, ContentEvidenceUnavailable, verify_round,
+            validate_zero_packet, validate_share_packet,
+        )
+        from vidaio.scoring.content_duplicate_evidence import (
+            ContentDuplicateWitnessV1, ContentShareWitness, InvalidContentEvidence,
+            content_identity_version, content_witness_from_packet,
+        )
 
         packet = self._packet(artifacts)
         witness = content_witness_from_packet(packet)
-        validate_zero_packet(packet, bundle, witness)
+        version = content_identity_version(packet.get("scorer_version"))
+        if version in (2, 3, 4):
+            try:
+                if not isinstance(witness, ContentShareWitness):
+                    raise ValueError("content share identity requires a schema-v2 witness")
+                validate_share_packet(packet, bundle, witness, store)
+            except (OSError, FileNotFoundError, ContentEvidenceUnavailable) as exc:
+                raise ContentRecomputeUnavailable(str(exc)) from exc
+            except Exception as exc:
+                raise RuntimeError(f"content share packet is invalid: {exc}") from exc
+        else:
+            if not isinstance(witness, ContentDuplicateWitnessV1):
+                raise InvalidContentEvidence("content v1 identity requires a schema-v1 witness")
+            validate_zero_packet(packet, bundle, witness)
         context = witness.round_evidence
         revealed = self._committed_reveal(bundle, artifacts)
         if (revealed.scorer_version != context.committed_scorer_version
@@ -439,6 +502,84 @@ class RealScoreRecomputer:
             raise ContentRecomputeUnavailable(selected.detail)
         if selected.status != "verified":
             raise RuntimeError("content component evidence cannot be independently verified: " + selected.detail)
+        if version in (2, 3, 4):
+            if witness.role == "winner":
+                winner = next(member for member in context.roster if member.uid == witness.winner_uid)
+                try:
+                    original = ScorePacketShape.model_validate_json(
+                        store.get_limited(winner.score_packet, MAX_CONTENT_METADATA))
+                except (OSError, FileNotFoundError) as exc:
+                    raise ContentRecomputeUnavailable(str(exc)) from exc
+                return RecomputedScore(
+                    metrics=original.numeric_metrics(), scorer_version=packet["scorer_version"],
+                    backend_versions=original.backend_versions, score=witness.share, gate_passed=True,
+                    violations=packet["violations"], breakdown=original.breakdown,
+                    canonical_content_digest=original.canonical_content_digest,
+                    content_fingerprint=original.content_fingerprint, encoded_size=original.encoded_size,
+                    canonicalization_plan_digest=original.canonicalization_plan_digest,
+                )
+            return RecomputedScore(metrics={}, scorer_version=packet["scorer_version"],
+                                   backend_versions={}, score=witness.share, gate_passed=False,
+                                   violations=packet["violations"], breakdown=None)
+        return RecomputedScore(metrics={}, scorer_version=packet["scorer_version"],
+                               backend_versions={}, score=0.0, gate_passed=False,
+                               violations=packet["violations"], breakdown=None)
+
+    def recompute_source_proximity(self, bundle, artifacts, store) -> RecomputedScore:
+        """Reproduce a round-composition source-proximity zero from archived evidence.
+
+        Order of proof: the packet is the canonical decision for its witness; the
+        witness names the committed scorer/track/config; the flagged member's own
+        residuals are recomputed from the released media (a full honest rerun of the
+        pipeline over its ORIGINAL measured packet); every roster value equals its
+        archived original packet; and the medians/flags re-derive from the roster.
+        """
+        from vidaio.audit.recompute import ScorePacketShape
+        from vidaio.auditor.content_evidence import MAX_CONTENT_METADATA, ContentEvidenceUnavailable, measured_bundle
+        from vidaio.auditor.source_evidence import validate_source_packet, verify_roster
+        from vidaio.scoring.source_proximity_evidence import (
+            InvalidSourceEvidence, packet_residuals, source_witness_from_packet, validate_member_packet,
+        )
+
+        packet = self._packet(artifacts)
+        witness = source_witness_from_packet(packet)
+        context = witness.round_evidence
+        try:
+            validate_source_packet(packet, bundle, witness)
+        except Exception as exc:
+            raise RuntimeError(f"source-proximity packet is invalid: {exc}") from exc
+        revealed = self._committed_reveal(bundle, artifacts)
+        if (revealed.scorer_version != context.committed_scorer_version
+                or revealed.track != context.track
+                or config_digest(self._scoring_config) != context.scoring_config_digest):
+            raise RuntimeError("source witness differs from committed scorer/track/config")
+        member = context.member(witness.member_uid)
+        try:
+            original_raw = store.get_limited(member.score_packet, MAX_CONTENT_METADATA)
+        except (OSError, FileNotFoundError) as exc:
+            raise ContentRecomputeUnavailable(str(exc)) from exc
+        original = ScorePacketShape.model_validate_json(original_raw)
+        validate_member_packet(member, original, context)
+        # Rerun the flagged member's ORIGINAL measurement from the released media; the
+        # residuals it publishes are what the roster copied. The bundle and packet
+        # slots are rebound to that original so the honest pipeline reconstructs the
+        # same request the worker scored.
+        original_bundle = measured_bundle(bundle, member, original)
+        original_artifacts = {**artifacts, ArtifactKind.SCORE_PACKET: original_raw}
+        fresh = self.recompute(original_bundle, original_artifacts)
+        fresh_pair = (fresh.metrics.get("vmaf_residual"), fresh.metrics.get("chroma_residual"))
+        recorded = packet_residuals(original)
+        if recorded is None or None in fresh_pair:
+            raise RuntimeError("flagged member's original packet or its recompute lacks residual metrics")
+        if (abs(fresh_pair[0] - recorded[0]) > 0.10 or abs(fresh_pair[1] - recorded[1]) > 1e-6
+                or not fresh.gate_passed or fresh.score <= 0):
+            raise RuntimeError("flagged member's residuals do not reproduce from the released media")
+        try:
+            verify_roster(context, store)
+        except ContentEvidenceUnavailable as exc:
+            raise ContentRecomputeUnavailable(str(exc)) from exc
+        except InvalidSourceEvidence as exc:
+            raise RuntimeError(f"source roster cannot be independently verified: {exc}") from exc
         return RecomputedScore(metrics={}, scorer_version=packet["scorer_version"],
                                backend_versions={}, score=0.0, gate_passed=False,
                                violations=packet["violations"], breakdown=None)
@@ -820,7 +961,11 @@ class RealScoreRecomputer:
                 f"score packet track {packet_track!r} does not match the committed "
                 f"DAG_REVEAL track {revealed.track!r}"
             )
-        dag = build_dag(revealed.track, dag_rng_from_seed(revealed.seed))
+        dag = rebuild_dag_from_reveal(revealed)
+        if dag is None:
+            raise RuntimeError(
+                "committed DAG_REVEAL does not regenerate under any supported dag_version"
+            )
         downscales = [op for op in dag.ops if getattr(op, "op", "") == "downscale"]
         if len(downscales) != 1:
             raise RuntimeError(

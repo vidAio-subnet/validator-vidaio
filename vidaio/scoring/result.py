@@ -30,8 +30,9 @@ def config_digest(config: ScoringConfig) -> str:
 
 
 class ItemScore(BaseModel):
-    """One scored item. ``score`` is 0.0 whenever ``gate_passed`` is False —
-    gates-first is a structural invariant, not a convention (see :func:`compose_item_score`).
+    """One scored item, with gates-first zeroing except for witnessed content shares.
+
+    See :func:`compose_item_score` for the content equal-share exception.
     """
 
     model_config = {"frozen": True}
@@ -130,6 +131,7 @@ def compose_item_score(
     canonicalization_plan_digest: str | None = None,
     pieapp_start_frame: int | None = None,
     scorer_version: str | None = None,
+    shared_score: float | None = None,
 ) -> ItemScore:
     """Assemble the final ItemScore, enforcing gates-first zeroing.
 
@@ -139,11 +141,21 @@ def compose_item_score(
 
     ``skips`` is threaded from ``GateContext.skips`` so consciously-disabled checks
     become part of the persisted audit packet, not transient pipeline state.
+
+    ``shared_score`` replaces the computed score regardless of ``gate_passed``.
+    The only legitimate producer is the content equal-share rule; the packet must
+    then carry the ``content_duplicate_witness`` metric.
     """
     if gate_passed and breakdown is not None:
         score = breakdown.final
     else:
         score = 0.0
+    if shared_score is not None:
+        if not 0.0 < shared_score <= 1.0:
+            raise ValueError("shared_score must be in (0, 1]")
+        if metrics is None or "content_duplicate_witness" not in metrics:
+            raise ValueError("shared_score requires the content_duplicate_witness metric")
+        score = shared_score
     return ItemScore(
         item_id=item_id,
         challenge_id=challenge_id,

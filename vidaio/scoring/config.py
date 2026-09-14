@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import math
 
+from typing import Literal
+
 from pydantic import BaseModel, Field, model_validator
 
 TRACK_COMPRESSION = "compression"
@@ -102,6 +104,13 @@ class ScoringConfig(BaseModel):
     vmaf_thresholds: dict[str, float] = Field(
         default_factory=lambda: {TRACK_COMPRESSION: 90.0}
     )
+    #: Which reference the compression QUALITY term and the VMAF floor are measured
+    #: against. "miner_input": the served input (what the miner received and can
+    #: measure itself; equals the anti-gaming primary run, so miner-side and
+    #: validator-side VMAF agree exactly). "pristine": the sealed holdout (the launch
+    #: behaviour; the miner cannot measure it and must keep a blind margin above the
+    #: floor). The pristine-basis number is always published as metrics.vmaf_pristine.
+    compression_vmaf_basis: Literal["pristine", "miner_input"] = "miner_input"
     #: Width (in VMAF points) of the sub-threshold band the compression spec calls out
     #: (``vmaf < threshold - 5 -> 0``). See vidaio/scoring/compression.py for the
     #: documented reading of scores inside the band.

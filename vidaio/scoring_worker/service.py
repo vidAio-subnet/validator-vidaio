@@ -82,9 +82,11 @@ import asyncio
 import contextlib
 import hashlib
 import logging
+import threading
 import time
 import uuid
-from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field, replace
 from functools import partial
 from pathlib import Path
 from shutil import which
@@ -146,6 +148,7 @@ from vidaio.scoring.content_fingerprint import (
     ContentFingerprintUnavailable,
     compute_canonical_content,
 )
+from vidaio.scoring.plane_psnr import ChromaResidual, PlanePsnrError, chroma_residual
 from vidaio.scoring.result import ItemScore, config_digest
 from vidaio.scoring_worker.config import ScoringWorkerConfig
 from vidaio.scoring_worker.inputs import (
@@ -707,14 +710,23 @@ def _score_in_dir(
         try:
             with use_metric_log_limit(log_run_cap):
                 vmaf_primary = backends.vmaf_primary.compute(canon_ref, canon_cand)
-                if backends.vmaf_secondary is not None and (
-                    delta_dims_match or backends.canonicalizer is None
+                input_basis = delta_dims_match or backends.canonicalizer is None
+                if input_basis and (
+                    backends.vmaf_secondary is not None
+                    or (
+                        request.track == TRACK_COMPRESSION
+                        and scoring_config.compression_vmaf_basis == "miner_input"
+                    )
                 ):
                     # The gate asks what the MINER added, not what the challenge
                     # DAG added. Both anti-gaming models therefore use miner input.
+                    # With compression_vmaf_basis="miner_input" this primary run is
+                    # also the scored quality term, so it is measured even when no
+                    # secondary model is configured.
                     vmaf_delta_primary = backends.vmaf_primary.compute(
                         canon_input, canon_cand
                     )
+                if input_basis and backends.vmaf_secondary is not None:
                     vmaf_delta_secondary = backends.vmaf_secondary.compute(
                         canon_input, canon_cand
                     )
@@ -731,6 +743,52 @@ def _score_in_dir(
                     ),
                 },
             ) from exc
+
+    # 5b) Source-proximity residuals (compression only). Both are pure functions of
+    #     the three canonical streams already on disk: the luma residual reuses the
+    #     two VMAF runs above, the chroma residual is one exact plane-PSNR pass.
+    #     They decide nothing here — the population-relative verdict happens at
+    #     round composition — but every packet publishes them so the decision is
+    #     recomputable by anyone from the released evidence.
+    vmaf_residual: float | None = None
+    chroma: ChromaResidual | None = None
+    if (
+        request.track == TRACK_COMPRESSION
+        and backends.canonicalizer is not None
+        and dims_match
+        and delta_dims_match
+        and vmaf_primary is not None
+        and vmaf_delta_primary is not None
+    ):
+        vmaf_residual = vmaf_primary - vmaf_delta_primary
+        scope = current_process_scope()
+        try:
+            chroma = chroma_residual(
+                canon_cand,
+                canon_ref,
+                canon_input,
+                cancelled=(lambda: scope.cancelled) if scope else None,
+            )
+        except PlanePsnrError as exc:
+            if scope is not None and scope.cancelled:
+                raise MediaWorkCancelled(str(exc)) from exc
+            raise ScoreRejected(
+                422, {"error": "chroma_residual_unavailable", "detail": str(exc)}
+            ) from exc
+
+    # 5c) Scored quality basis (compression). "miner_input" scores and floors the
+    #     VMAF the miner can measure itself (the anti-gaming primary run); the
+    #     pristine-basis value stays published as vmaf_pristine for audit and for
+    #     the source-proximity residual above. Upscaling is always pristine based
+    #     (its input has a different geometry).
+    vmaf_basis = "pristine"
+    vmaf_scored = vmaf_primary
+    if (
+        request.track == TRACK_COMPRESSION
+        and scoring_config.compression_vmaf_basis == "miner_input"
+    ):
+        vmaf_basis = "miner_input"
+        vmaf_scored = vmaf_delta_primary  # None -> VmafFloorGate fails closed
 
     # 6) Gates, then composition (gates-first zeroing lives in compose_item_score).
     #    perceptual_checks="skip" swaps the three backend-driven perceptual gates
@@ -752,7 +810,7 @@ def _score_in_dir(
         candidate_path=canon_cand,
         input_info=input_info,
         input_path=canon_input,
-        vmaf_primary=vmaf_primary,
+        vmaf_primary=vmaf_scored,
         vmaf_secondary=vmaf_delta_secondary,
         vmaf_delta_primary=vmaf_delta_primary,
         vmaf_delta_secondary=vmaf_delta_secondary,
@@ -763,7 +821,9 @@ def _score_in_dir(
 
     breakdown = None
     metrics: dict[str, float | int | str | None] = {
-        "vmaf": vmaf_primary,
+        "vmaf": vmaf_scored,
+        "vmaf_basis": vmaf_basis,
+        "vmaf_pristine": vmaf_primary,
         "vmaf_secondary": vmaf_delta_secondary,
         "vmaf_model_delta_primary": vmaf_delta_primary,
         "vmaf_model_delta_basis": "miner_input",
@@ -782,15 +842,21 @@ def _score_in_dir(
     for gate_name, result in sorted(ctx.perceptual_results.items()):
         metrics[f"{gate_name}_measure"] = result.measure
         metrics[f"{gate_name}_passed"] = "true" if result.passed else "false"
+    if vmaf_residual is not None and chroma is not None:
+        metrics["vmaf_residual"] = vmaf_residual
+        metrics["psnr_uv_reference"] = chroma.psnr_uv_reference
+        metrics["psnr_uv_input"] = chroma.psnr_uv_input
+        metrics["chroma_residual"] = chroma.residual
+        metrics["source_proximity_basis"] = "pristine_minus_miner_input"
     if (
         request.track == TRACK_COMPRESSION
-        and vmaf_primary is not None
+        and vmaf_scored is not None
         and input_info.byte_size > 0
     ):
         breakdown = score_compression(
             candidate_bytes=cand_info.byte_size,
             reference_bytes=input_info.byte_size,
-            vmaf=vmaf_primary,
+            vmaf=vmaf_scored,
             config=scoring_config,
             vmaf_threshold=_param_float(params, "vmaf_threshold"),
         )
@@ -1026,6 +1092,24 @@ def build_health_checks(
 # --- app factory ---------------------------------------------------------------------
 
 
+async def _shutdown_scoring_executor(executor: ThreadPoolExecutor | None) -> None:
+    """Join owned workers without blocking request deadlines or escaping on cancel."""
+    if executor is None:
+        return
+    joined = asyncio.get_running_loop().run_in_executor(
+        None, partial(executor.shutdown, wait=True)
+    )
+    cancelled = None
+    while not joined.done():
+        try:
+            await asyncio.shield(joined)
+        except asyncio.CancelledError as exc:
+            cancelled = exc
+    joined.result()
+    if cancelled is not None:
+        raise cancelled
+
+
 def create_app(
     config: ScoringWorkerConfig,
     backends: ScoringBackends,
@@ -1036,7 +1120,49 @@ def create_app(
     scoring_cfg = scoring_config if scoring_config is not None else ScoringConfig()
     metrics = WorkerMetrics(registry if registry is not None else CollectorRegistry())
     config.work_dir.mkdir(parents=True, exist_ok=True)
-    app = FastAPI(title="vidaio-scoring-worker")
+    # A fixed CPU pool bounds thread-local models over the whole app lifetime,
+    # including successive request waves. The event loop's default pool cannot.
+    executor = (
+        ThreadPoolExecutor(
+            max_workers=config.max_concurrent, thread_name_prefix="scoring-worker"
+        )
+        if config.pieapp_device == "cpu"
+        else None
+    )
+    thread_backends = threading.local()
+    first_backend_lock = threading.Lock()
+    first_backend_available = True
+
+    def _backends_for_thread() -> ScoringBackends:
+        nonlocal first_backend_available
+        if not (
+            config.pieapp_device == "cpu"
+            and isinstance(backends.pieapp, PieAppTorchBackend)
+            and backends.pieapp.device == "cpu"
+        ):
+            return backends
+        cached = getattr(thread_backends, "backends", None)
+        if cached is None:
+            with first_backend_lock:
+                # Count the startup/preflight model within max_concurrent:
+                # the first scoring thread owns it; later threads clone it.
+                if first_backend_available:
+                    cached = backends
+                    first_backend_available = False
+                else:
+                    cached = replace(backends, pieapp=backends.pieapp.clone())
+            thread_backends.backends = cached
+        return cached
+
+    @contextlib.asynccontextmanager
+    async def lifespan(app: FastAPI):
+        try:
+            yield
+        finally:
+            await _shutdown_scoring_executor(executor)
+
+    app = FastAPI(title="vidaio-scoring-worker", lifespan=lifespan)
+    app.state.scoring_executor = executor
     semaphore = asyncio.Semaphore(config.max_concurrent)
     # ONE budget for the whole app: the guard has to be collective, or N
     # requests that each fit would still fill the volume between them.
@@ -1130,19 +1256,22 @@ def create_app(
         """
         loop = asyncio.get_running_loop()
         scope = MediaProcessScope()
+
+        def _score_on_thread() -> ItemScore:
+            return _score_sync(
+                request,
+                config,
+                scoring_cfg,
+                _backends_for_thread(),
+                scorer_version,
+                scope,
+                scratch_budget,
+            )
+
         try:
             future = loop.run_in_executor(
-                None,
-                partial(
-                    _score_sync,
-                    request,
-                    config,
-                    scoring_cfg,
-                    backends,
-                    scorer_version,
-                    scope,
-                    scratch_budget,
-                ),
+                executor,
+                _score_on_thread,
             )
         except BaseException:  # never hold a slot for work that never started
             semaphore.release()
@@ -1190,11 +1319,21 @@ def create_app(
             ) from exc
         except (TimeoutError, MediaToolTimeout, MediaWorkCancelled) as exc:
             metrics.scorings.labels(track=track, outcome="timeout").inc()
+            _LOG.warning(
+                "scoring timed out; the caller gets 504",
+                extra={"fields": {"track": track, "item_id": request.item_id, "detail": str(exc)[:600]}},
+            )
             raise HTTPException(
                 504, detail={"error": "scoring_timeout", "detail": str(exc)}
             ) from exc
         except MediaToolError as exc:
             metrics.scorings.labels(track=track, outcome="tool_error").inc()
+            # The only record of WHY a media tool failed: the caller sees a 502 body,
+            # but nothing else persists the cause (the authority logs only the status).
+            _LOG.warning(
+                "media tool failed; the caller gets 502",
+                extra={"fields": {"track": track, "item_id": request.item_id, "detail": str(exc)[:600]}},
+            )
             raise HTTPException(
                 502, detail={"error": "media_tool_failed", "detail": str(exc)}
             ) from exc
@@ -1379,6 +1518,12 @@ class ScoringWorker(BaseService):
             self.health.register_check(check_name, check)
         self.health.register_check("http_api_serving", lambda: not self._api_failed)
 
+    def close(self) -> None:
+        """Join all owned CPU scoring threads, including abandoned requests."""
+        executor = self.app.state.scoring_executor
+        if executor is not None:
+            executor.shutdown(wait=True)
+
     async def _serve_api(self, server: uvicorn.Server) -> None:
         """Run uvicorn, converting its startup ``sys.exit`` into a normal error.
 
@@ -1429,23 +1574,26 @@ class ScoringWorker(BaseService):
                     f" (port={self.config.port} error={_task_error(serve_task)})"
                 )
         finally:
-            server.should_exit = True
-            stop_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await stop_task
             try:
-                await serve_task
-            except asyncio.CancelledError:
-                raise
-            except BaseException:
-                # Re-raised deliberately: this worker's API failure has its own
-                # typed error (ApiServerFailed) and callers assert on it. It also
-                # satisfies the exit-code contract on its own — an exception out
-                # of run() is a NON-ZERO exit, which is all the supervisor needs
-                # to restart us. `fail_fatal` above has already flipped health and
-                # logged the reason CRITICAL; this just keeps the typed cause.
-                self._api_failed = True
-                raise
+                server.should_exit = True
+                stop_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await stop_task
+                try:
+                    await serve_task
+                except asyncio.CancelledError:
+                    raise
+                except BaseException:
+                    # Re-raised deliberately: this worker's API failure has its own
+                    # typed error (ApiServerFailed) and callers assert on it. It also
+                    # satisfies the exit-code contract on its own — an exception out
+                    # of run() is a NON-ZERO exit, which is all the supervisor needs
+                    # to restart us. `fail_fatal` above has already flipped health and
+                    # logged the reason CRITICAL; this just keeps the typed cause.
+                    self._api_failed = True
+                    raise
+            finally:
+                await _shutdown_scoring_executor(self.app.state.scoring_executor)
 
 
 def _task_error(task: "asyncio.Task[Any]") -> str:

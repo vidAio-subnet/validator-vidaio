@@ -21,6 +21,7 @@ from vidaio.challenge.commitment import (
     reveal_commitment,
     verify_reveal,
     verify_reveal_deep,
+    rebuild_dag_from_reveal,
 )
 from vidaio.challenge.config import (
     LAUNCH_MAX_ELIGIBILITY_SCAN_ASSETS,
@@ -30,17 +31,22 @@ from vidaio.challenge.config import (
 )
 from vidaio.challenge.dag import (
     DAG_VERSION,
+    SUPPORTED_DAG_VERSIONS,
     LAUNCH_UPSCALE_FACTORS,
     OPERATOR_REGISTRY,
     TRACK_RULES,
     UPSCALE_FACTORS,
     DegradationDag,
     DegradationOp,
+    SourceVariant,
     build_dag,
     canonical_json_dumps,
     dag_rng_from_seed,
     seed_to_bytes,
     to_ffmpeg_plan,
+    to_reference_plan,
+    source_ops,
+    track_rules,
 )
 from vidaio.challenge.pool import (
     Asset,
@@ -86,17 +92,22 @@ __all__ = [
     "MAX_CLIP_DURATION_OVERSHOOT_SECONDS",
     # dag
     "DAG_VERSION",
+    "SUPPORTED_DAG_VERSIONS",
     "LAUNCH_UPSCALE_FACTORS",
     "OPERATOR_REGISTRY",
     "TRACK_RULES",
     "UPSCALE_FACTORS",
     "DegradationDag",
     "DegradationOp",
+    "SourceVariant",
     "build_dag",
     "canonical_json_dumps",
     "dag_rng_from_seed",
     "seed_to_bytes",
     "to_ffmpeg_plan",
+    "to_reference_plan",
+    "source_ops",
+    "track_rules",
     # commitment
     "CHALLENGE_ANCHOR_DOMAIN",
     "ChallengeAnchor",
@@ -110,6 +121,7 @@ __all__ = [
     "reveal_commitment",
     "verify_reveal",
     "verify_reveal_deep",
+    "rebuild_dag_from_reveal",
     "deep_reveal_verifier",
     # pool
     "Asset",

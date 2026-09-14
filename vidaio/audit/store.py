@@ -33,6 +33,7 @@ import hashlib
 import io
 import os
 import tempfile
+import threading
 import uuid
 from enum import StrEnum
 from pathlib import Path
@@ -921,6 +922,7 @@ class _TransportBackedStore(_SetConventionMixin):
         allow_sealed_operations: bool = True,
     ) -> None:
         self._transport = transport
+        self._transport_init_lock = threading.Lock()
         self._connect = connect
         self._envelope: Envelope = envelope or PassthroughEnvelope()
         self._public_read_only = public_read_only
@@ -934,9 +936,11 @@ class _TransportBackedStore(_SetConventionMixin):
     @property
     def _t(self) -> _ObjectTransport:
         if self._transport is None:
-            if self._connect is None:  # pragma: no cover - guarded by every subclass
-                raise NotConfiguredError("no object-store transport configured")
-            self._transport = self._connect()
+            with self._transport_init_lock:
+                if self._transport is None:
+                    if self._connect is None:  # pragma: no cover - guarded by every subclass
+                        raise NotConfiguredError("no object-store transport configured")
+                    self._transport = self._connect()
         return self._transport
 
     # -- raw key primitives backing the set convention -----------------------------

@@ -170,6 +170,8 @@ async def test_fake_compression_round_trip_and_metrics(world: FakeWorld) -> None
     assert item.breakdown is not None
     assert item.breakdown.compression_rate == pytest.approx(0.5)
     assert item.metrics["vmaf"] == 93.0
+    assert item.metrics["vmaf_basis"] == "miner_input"  # scored + floored vs the served input
+    assert item.metrics["vmaf_pristine"] == 93.0  # pristine basis stays published for audit
     assert item.metrics["vmaf_model_delta"] == 0.0
     assert item.metrics["vmaf_model_delta_basis"] == "miner_input"
     assert ("reference", "output") in world.fake.vmaf_calls
@@ -194,8 +196,8 @@ async def test_fake_compression_round_trip_and_metrics(world: FakeWorld) -> None
 async def test_model_delta_gate_uses_two_miner_input_runs(world: FakeWorld) -> None:
     primary = RoleKeyedBackend(
         vmaf={
-            ("reference", "output"): 93.0,  # scored quality remains pristine-based
-            ("miner_input", "output"): 96.0,
+            ("reference", "output"): 93.0,  # pristine basis: published, not scored
+            ("miner_input", "output"): 96.0,  # served-input basis: the scored quality
         },
         media={
             "reference": _media(10_000),
@@ -222,7 +224,8 @@ async def test_model_delta_gate_uses_two_miner_input_runs(world: FakeWorld) -> N
         resp = await client.post("/score", json=_compression_body(world))
     assert resp.status_code == 200
     item = ItemScore.from_json(resp.json()["item_score_json"])
-    assert item.metrics["vmaf"] == 93.0
+    assert item.metrics["vmaf"] == 96.0
+    assert item.metrics["vmaf_pristine"] == 93.0
     assert item.metrics["vmaf_model_delta"] == 6.0
     assert not item.gate_passed
     assert any(v.code is ReasonCode.VMAF_MODEL_DELTA_EXCEEDED for v in item.violations)
@@ -231,6 +234,40 @@ async def test_model_delta_gate_uses_two_miner_input_runs(world: FakeWorld) -> N
         ("miner_input", "output"),
     ]
     assert secondary.vmaf_calls == [("miner_input", "output")]
+
+
+async def test_compression_vmaf_basis_config_selects_scored_reference(world: FakeWorld) -> None:
+    """compression_vmaf_basis decides which VMAF run is scored and floored: the served
+    input (default) or the sealed pristine (launch behaviour). Both runs are always
+    published so an audit can recompute either reading."""
+    def backends() -> ScoringBackends:
+        primary = RoleKeyedBackend(
+            vmaf={("reference", "output"): 84.0, ("miner_input", "output"): 92.0},
+            media={"reference": _media(10_000), "miner_input": _media(10_000), "output": _media(5_000)},
+        )
+        secondary = RoleKeyedBackend(vmaf={("miner_input", "output"): 91.0})
+        return ScoringBackends(
+            probe=primary, vmaf_primary=primary, vmaf_secondary=secondary,
+            pieapp=world.fake.pieapp, perceptual=world.fake, canonicalizer=None, versions={},
+        )
+    # default: served-input basis -> 92 clears the floor, quality term 0.92
+    async with _client(world, backends=backends()) as client:
+        resp = await client.post("/score", json=_compression_body(world))
+    item = ItemScore.from_json(resp.json()["item_score_json"])
+    assert item.gate_passed, item.violations
+    assert item.metrics["vmaf"] == 92.0 and item.metrics["vmaf_basis"] == "miner_input"
+    assert item.metrics["vmaf_pristine"] == 84.0
+    assert item.breakdown is not None and item.breakdown.quality_score == pytest.approx(0.92)
+    # pristine basis -> 84 is below the 85 floor: zeroed, and the published runs are unchanged
+    async with _client(
+        world, backends=backends(), scoring_config=ScoringConfig(compression_vmaf_basis="pristine")
+    ) as client:
+        resp = await client.post("/score", json=_compression_body(world))
+    item = ItemScore.from_json(resp.json()["item_score_json"])
+    assert not item.gate_passed
+    assert any(v.code is ReasonCode.VMAF_BELOW_FLOOR for v in item.violations)
+    assert item.metrics["vmaf"] == 84.0 and item.metrics["vmaf_basis"] == "pristine"
+    assert item.metrics["vmaf_model_delta_primary"] == 92.0
 
 
 async def test_fake_upscaling_full_round_with_derived_start_frame(

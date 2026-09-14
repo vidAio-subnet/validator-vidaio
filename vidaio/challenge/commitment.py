@@ -24,6 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from vidaio.challenge.dag import (
     DAG_VERSION,
+    SUPPORTED_DAG_VERSIONS,
     TRACK_RULES,
     DegradationDag,
     build_dag,
@@ -381,7 +382,7 @@ def verify_reveal(revealed: RevealedCommitment) -> bool:
     )
 
 
-def verify_reveal_deep(revealed: RevealedCommitment, dag_version: int = DAG_VERSION) -> bool:
+def verify_reveal_deep(revealed: RevealedCommitment, dag_version: int | None = None) -> bool:
     """Deep reveal check: the committed DAG must actually generate from the seed.
 
     Beyond the hash check, rebuild the DAG from the revealed seed via the sanctioned
@@ -396,11 +397,34 @@ def verify_reveal_deep(revealed: RevealedCommitment, dag_version: int = DAG_VERS
     # DAG for the COMMITTED track specifically. A commitment whose seed does not
     # regenerate the committed DAG for its own committed track is hand-picked, not
     # seed-determined. Unknown committed track => cannot regenerate => fail closed.
+    return rebuild_dag_from_reveal(revealed, dag_version=dag_version) is not None
+
+
+def rebuild_dag_from_reveal(
+    revealed: RevealedCommitment, dag_version: int | None = None
+) -> DegradationDag | None:
+    """Regenerate the committed DAG from the revealed seed, or None if no supported
+    dag_version reproduces the committed digest.
+
+    The commitment preimage does not carry the dag_version, so with `dag_version=None`
+    every SUPPORTED_DAG_VERSIONS is tried (newest first): a challenge dispatched under
+    v7 keeps verifying after a validator moves to v8, which is exactly the in-flight
+    window of a version roll. A pinned `dag_version` restricts the check to that one.
+    """
     rule = TRACK_RULES.get(revealed.track)
     if rule is None:
-        return False
-    dag = build_dag(revealed.track, dag_rng_from_seed(revealed.seed), dag_version=dag_version)
-    return dag.canonical_digest() == revealed.dag_digest
+        return None
+    versions = (
+        (dag_version,) if dag_version is not None else tuple(sorted(SUPPORTED_DAG_VERSIONS, reverse=True))
+    )
+    for version in versions:
+        try:
+            dag = build_dag(revealed.track, dag_rng_from_seed(revealed.seed), dag_version=version)
+        except ValueError:
+            continue
+        if dag.canonical_digest() == revealed.dag_digest:
+            return dag
+    return None
 
 
 def deep_reveal_verifier(dag_bytes: bytes) -> bool:

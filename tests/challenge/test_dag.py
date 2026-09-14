@@ -6,12 +6,18 @@ import pytest
 from vidaio.challenge import (
     DAG_VERSION,
     LAUNCH_UPSCALE_FACTORS,
+    SUPPORTED_DAG_VERSIONS,
     OPERATOR_REGISTRY,
     TRACK_RULES,
     UPSCALE_FACTORS,
+    DegradationDag,
+    SourceVariant,
     build_dag,
     dag_rng_from_seed,
+    source_ops,
     to_ffmpeg_plan,
+    to_reference_plan,
+    track_rules,
 )
 from vidaio.challenge.dag import (
     MAX_OPTIONAL_OPS,
@@ -93,24 +99,33 @@ def test_upscaling_downscale_factor_is_discrete() -> None:
 
 
 def test_launch_pools_are_explicitly_winnable_single_operator_tasks() -> None:
-    """DAG v7 launch tasks contain only the calibrated invertible operation."""
-    assert DAG_VERSION == 7
-    assert TRACK_RULES["compression"].required == ("codec_compress",)
+    """DAG v8 launch tasks: the source variant plus the calibrated invertible operation."""
+    assert DAG_VERSION == 8
+    assert TRACK_RULES["compression"].required == ("source_variant", "codec_compress")
     assert TRACK_RULES["compression"].optional == ()
-    assert TRACK_RULES["upscaling"].required == ("downscale",)
+    assert TRACK_RULES["upscaling"].required == ("source_variant", "downscale")
     assert TRACK_RULES["upscaling"].optional == ()
     for seed in range(1_000):
         compression = build_dag("compression", random.Random(seed))
         upscaling = build_dag("upscaling", random.Random(seed))
-        assert [op.op for op in compression.ops] == ["codec_compress"]
-        assert [op.op for op in upscaling.ops] == ["downscale"]
-        codec = compression.ops[0]
+        assert [op.op for op in compression.ops] == ["source_variant", "codec_compress"]
+        assert [op.op for op in upscaling.ops] == ["source_variant", "downscale"]
+        for variant in (compression.ops[0], upscaling.ops[0]):
+            assert isinstance(variant, SourceVariant)
+            for frac in (variant.crop_left, variant.crop_right, variant.crop_top, variant.crop_bottom):
+                assert 0.01 <= frac <= 0.03
+            assert 0.94 <= variant.gamma <= 1.06
+            assert 0.92 <= variant.saturation <= 1.08
+            assert -4.0 <= variant.hue_deg <= 4.0
+            assert 2.0 <= variant.noise_strength <= 5.0
+            assert 1 <= variant.noise_seed < 2**31
+        codec = compression.ops[1]
         assert codec.codec == "h264"
         assert codec.rate_mode == "crf"
         assert codec.crf in {8, 10, 12}
         assert codec.gop == 1
         assert (codec.chroma, codec.bit_depth) == ("420", 8)
-        downscale = upscaling.ops[0]
+        downscale = upscaling.ops[1]
         assert round(1 / downscale.scale_factor) in LAUNCH_UPSCALE_FACTORS
 
 
@@ -139,7 +154,7 @@ def test_launch_parameters_vary_across_seeds() -> None:
         build_dag("compression", random.Random(s)).canonical_digest()
         for s in range(40)
     }
-    assert len(digests) == 3  # one canonical document per private CRF 8/10/12
+    assert len(digests) == 40  # every seed draws its own source variant (v8)
 
 
 def test_unknown_track_and_version_rejected() -> None:
@@ -153,6 +168,7 @@ def test_registry_covers_spec_operators() -> None:
     # frame_drop stays registered (historical dag_version <= 2 documents must
     # deserialize) even though dag_version 3 excludes it from every pool.
     assert set(OPERATOR_REGISTRY) == {
+        "source_variant",
         "downscale",
         "gaussian_blur",
         "noise",
@@ -189,13 +205,33 @@ def test_frame_drop_never_sampled(track: str) -> None:
 
 def test_ffmpeg_plan_snapshot_fixed_seed() -> None:
     """Full plan for seed 20260820 (compression). Any change here means the DAG's
-    meaning changed and DAG_VERSION must be bumped. DAG_VERSION 7 pins the
-    calibrated codec-only launch draw."""
+    meaning changed and DAG_VERSION must be bumped. DAG_VERSION 8 pins the
+    calibrated codec-only launch draw behind the source-variant stage."""
     dag = build_dag("compression", random.Random(20260820))
     assert dag.canonical_digest() == (
-        "c6958adc68ce911df89d05ee96f0ed92966e698188f9398711e0f6d8c07b0099"
+        "bce1bebe41cc905f24370c6e02dd43fa9b83ca219c5de6b7e55579a01c71bf2e"
     )
-    assert [op.op for op in dag.ops] == ["codec_compress"]
+    assert [op.op for op in dag.ops] == ["source_variant", "codec_compress"]
+    assert to_reference_plan(dag, "pristine.mkv", "reference.mkv") == [
+        [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-i",
+            "pristine.mkv",
+            "-filter_complex",
+            "[0:v]crop=trunc((iw-iw*0.0391)/2)*2:trunc((ih-ih*0.0516)/2)*2"
+            ":trunc(iw*0.015/2)*2:trunc(ih*0.0284/2)*2,"
+            "eq=gamma=0.9951:saturation=1.0404,hue=h=-0.9028,"
+            "noise=alls=3.5841:allf=t:all_seed=154957849[out]",
+            "-map",
+            "[out]",
+            "-c:v",
+            "ffv1",
+            "-an",
+            "reference.mkv",
+        ],
+    ]
     plan = to_ffmpeg_plan(dag, "in.mkv", "out.mp4")
     assert plan == [
         [
@@ -211,11 +247,54 @@ def test_ffmpeg_plan_snapshot_fixed_seed() -> None:
             "-pix_fmt",
             "yuv420p",
             "-crf",
-            "12",
+            "10",
             "-an",
             "out.mp4",
         ],
     ]
+
+
+def test_dag_version_7_still_regenerates_byte_for_byte() -> None:
+    """Commitments dispatched under v7 must keep verifying after the v8 roll: the v7
+    pools (no source stage) stay buildable and reproduce the launch snapshot."""
+    assert SUPPORTED_DAG_VERSIONS == (7, 8)
+    assert track_rules(7)["compression"].required == ("codec_compress",)
+    assert track_rules(7)["upscaling"].required == ("downscale",)
+    dag = build_dag("compression", random.Random(20260820), dag_version=7)
+    assert dag.dag_version == 7
+    assert dag.canonical_digest() == (
+        "c6958adc68ce911df89d05ee96f0ed92966e698188f9398711e0f6d8c07b0099"
+    )
+    assert [op.op for op in dag.ops] == ["codec_compress"]
+    assert dag.ops[0].crf == 12
+    assert to_reference_plan(dag, "pristine.mkv", "reference.mkv") == []
+    with pytest.raises(ValueError):
+        build_dag("compression", random.Random(0), dag_version=6)
+    with pytest.raises(ValueError):
+        track_rules(9)
+
+
+def test_source_variant_is_reference_only_and_even_geometry() -> None:
+    """The source stage never enters the miner-input plan; it renders the reference
+    with even crop offsets/sizes (4:2:0 safe) and a seeded, reproducible grain."""
+    for seed in range(50):
+        dag = build_dag("compression", random.Random(seed))
+        variant = dag.ops[0]
+        assert isinstance(variant, SourceVariant)
+        assert source_ops(dag) == [variant]
+        input_plan = to_ffmpeg_plan(dag, "reference.mkv", "input.mkv")
+        assert all("source_variant" not in " ".join(cmd) and "crop=" not in " ".join(cmd) for cmd in input_plan)
+        assert input_plan[0][input_plan[0].index("-i") + 1] == "reference.mkv"
+        ref_plan = to_reference_plan(dag, "pristine.mkv", "reference.mkv")
+        assert len(ref_plan) == 1 and ref_plan[0][-1] == "reference.mkv"
+        graph = ref_plan[0][ref_plan[0].index("-filter_complex") + 1]
+        assert graph.count("trunc(") == 4 and "/2)*2" in graph
+        assert f"all_seed={variant.noise_seed}" in graph
+        assert ("hflip" in graph) == variant.flip
+    # historical documents without a source stage keep the copy-is-reference path
+    legacy = DegradationDag(dag_version=7, task_type="compression", ops=[build_dag("compression", random.Random(3)).ops[1]])
+    assert to_reference_plan(legacy, "pristine.mkv", "reference.mkv") == []
+    assert len(to_ffmpeg_plan(legacy, "reference.mkv", "input.mkv")) == 1
 
 
 def test_artifact_mask_plan_snapshot() -> None:
@@ -292,7 +371,7 @@ def test_artifact_mask_never_uses_drawbox_again(seed: int) -> None:
 def test_plan_chains_through_intermediates() -> None:
     dag = build_dag("compression", random.Random(11))
     plan = to_ffmpeg_plan(dag, "in.mkv", "out.mp4")
-    assert len(plan) == len(dag.ops)
+    assert len(plan) == len(dag.ops) - len(source_ops(dag))
     # every command reads the previous command's output; final writes out.mp4
     current = "in.mkv"
     for cmd in plan:

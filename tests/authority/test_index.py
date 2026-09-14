@@ -61,6 +61,42 @@ def test_get_unknown_is_none(index: EpochIndex) -> None:
     assert index.latest() is None
 
 
+def test_submission_migration_preserves_existing_epoch_rows_and_schema(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    from vidaio.authority import index as index_module
+
+    migrations = index_module.MIGRATIONS_DIR
+    old_migrations = tmp_path / "old-migrations"
+    old_migrations.mkdir()
+    for name in ("0001_epoch_index.sql", "0002_gap_tombstones.sql"):
+        (old_migrations / name).write_text((migrations / name).read_text())
+    db_path = tmp_path / "existing-authority.db"
+    with monkeypatch.context() as old_version:
+        old_version.setattr(index_module, "MIGRATIONS_DIR", old_migrations)
+        index = EpochIndex.open(db_path)
+        finalized = _finalized(7)
+        index.record_finalized(finalized, finalized_at="2026-08-20T12:00:00+00:00")
+        anchored = index.set_anchor(7, txid="0xexisting", block=99)
+        original_schema = index._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name='authority_epochs'"
+        ).fetchone()[0]
+        index.close()
+
+    upgraded = EpochIndex.open(db_path)
+    try:
+        assert upgraded.get(7) == anchored
+        assert upgraded._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name='authority_epochs'"
+        ).fetchone()[0] == original_schema
+        assert upgraded.pending_anchor_submissions() == []
+        assert upgraded._conn.execute(
+            "SELECT count(*) FROM schema_migrations WHERE name='0003_anchor_submissions.sql'"
+        ).fetchone()[0] == 1
+    finally:
+        upgraded.close()
+
+
 def test_latest_is_highest_epoch_id(index: EpochIndex) -> None:
     for eid in (10, 15, 12):
         index.record_finalized(_finalized(eid), finalized_at="2026-08-20T12:00:00+00:00")

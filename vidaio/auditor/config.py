@@ -106,6 +106,9 @@ class AuditorConfig(BaseModel):
     #: "real" -> ffmpeg/libvmaf recompute; "fake" -> an injected recomputer only.
     backend: str = "real"
 
+    #: Maximum independent per-item audits in flight; one preserves serial order.
+    recompute_concurrency: int = Field(default=1, strict=True)
+
     #: strict verify_bundle (absent anchors count as failures). Default True — the
     #: v2 manifest carries the committed score-packet merkle root + per-item inclusion
     #: proofs, so strict merkle inclusion is proved for every sampled item (in addition
@@ -153,4 +156,6 @@ class AuditorConfig(BaseModel):
     def _sane(self) -> "AuditorConfig":
         if self.backend not in ("real", "fake"):
             raise ValueError(f"backend must be 'real' or 'fake', got {self.backend!r}")
+        if not 1 <= self.recompute_concurrency <= 8:
+            raise ValueError("recompute_concurrency must be in [1, 8]")
         return self

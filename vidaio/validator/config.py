@@ -15,7 +15,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 # A production challenge fetch includes a finalized Bittensor commitment write
@@ -109,6 +109,10 @@ class ValidatorConfig(BaseModel):
     challenge_resolve_timeout_seconds: float = 30.0
     #: scoring runs VMAF/PieAPP — allow it real time
     scoring_request_timeout_seconds: float = 600.0
+    #: Maximum per-miner scoring calls in flight; one preserves sequential scoring.
+    scoring_concurrency: int = Field(default=1, strict=True)
+    #: Total Retry-After sleep allowed for scoring-worker 503 load shedding.
+    scoring_shed_wait_seconds: float = 120.0
 
     # -- orphaned-challenge sweep (the lost-RESPONSE blind spot) ---------------
     #: Startup recovery also sweeps GET /challenges?status=dispatched: a
@@ -190,6 +194,10 @@ class ValidatorConfig(BaseModel):
             raise ValueError("max_chain_snapshot_age_seconds must be >= 0")
         if self.min_stake < 0:
             raise ValueError("min_stake must be >= 0")
+        if not 1 <= self.scoring_concurrency <= 16:
+            raise ValueError("scoring_concurrency must be in [1, 16]")
+        if not 0 <= self.scoring_shed_wait_seconds < float("inf"):
+            raise ValueError("scoring_shed_wait_seconds must be finite and >= 0")
         for name in (
             "warrant_probe_timeout_seconds",
             "miner_request_timeout_seconds",

@@ -14,8 +14,11 @@ from vidaio.audit.canonical import canonical_json_bytes
 from vidaio.audit.recompute import ScorePacketShape, verify_bundle
 from vidaio.audit.store import ArtifactKind, IntegrityError
 from vidaio.scoring.content_duplicate_evidence import (
-    ContentRoundEvidence, ContentDuplicateWitness, InvalidContentEvidence,
-    content_duplicate_identity, derive_components, derive_edges, validate_member_packet,
+    CONTENT_EVIDENCE_RULE_V1, CONTENT_EVIDENCE_RULE_V2, ContentRoundEvidence, ContentRoundEvidenceV1,
+    ContentRoundEvidenceV2, ContentDuplicateWitness, ContentShareWitness, InvalidContentEvidence,
+    content_duplicate_identity_v1 as content_duplicate_identity,
+    content_duplicate_identity as content_share_identity,
+    derive_components, derive_edges, validate_member_packet,
 )
 
 MAX_CONTENT_METADATA = 16 * 1024 * 1024
@@ -43,7 +46,7 @@ def measured_bundle(template: AuditBundle, member: Any, packet: ScorePacketShape
 
 
 def verify_round(
-    context: ContentRoundEvidence, template: AuditBundle, store: Any,
+    context: ContentRoundEvidence | ContentRoundEvidenceV2 | ContentRoundEvidenceV1, template: AuditBundle, store: Any,
     recomputer: Any, *, chronology: Callable[[AuditBundle], Any] | None = None,
     reveal_verifier: Any = None,
 ) -> tuple[ComponentResult, ...]:
@@ -130,13 +133,16 @@ def verify_round(
     # All available members must reproduce their exact full graph, including edges
     # across claimed components. Partial availability is never a fabricated PASS.
     if len(verified) == len(context.roster):
-        if derive_edges(verified) != context.edges or derive_components(verified) != context.components:
+        if (derive_edges(verified, evidence_rule=context.evidence_rule) != context.edges
+                or derive_components(verified, evidence_rule=context.evidence_rule) != context.components):
             raise InvalidContentEvidence("independent archived-media component graph differs")
     return tuple(results)
 
 
 def validate_zero_packet(packet: Any, bundle: AuditBundle, witness: ContentDuplicateWitness) -> None:
     context = witness.round_evidence
+    if context.evidence_rule != CONTENT_EVIDENCE_RULE_V1:
+        raise InvalidContentEvidence("legacy content zero requires canonical_content/1 evidence")
     member = next(member for member in context.roster if member.uid == witness.loser_uid)
     expected_identity = content_duplicate_identity(
         committed_scorer_version=context.committed_scorer_version,
@@ -164,6 +170,70 @@ def validate_zero_packet(packet: Any, bundle: AuditBundle, witness: ContentDupli
         raise InvalidContentEvidence("content zero is not the exact canonical signed-loser decision")
 
 
+def validate_share_packet(
+    packet: Any, bundle: AuditBundle, witness: ContentShareWitness, store: Any,
+) -> None:
+    """Bind either share role to the reference winner's archived measured score."""
+    if not isinstance(witness, ContentShareWitness):
+        raise InvalidContentEvidence("content share requires a schema-v2 witness")
+    witness = ContentShareWitness.model_validate_json(witness.to_json())
+    context = witness.round_evidence
+    if (witness.component_uids not in context.components
+            or witness.winner_uid != context.winner(witness.component_uids)):
+        raise InvalidContentEvidence("content share reference differs from its component")
+    member = next(member for member in context.roster if member.uid == witness.member_uid)
+    winner = next(member for member in context.roster if member.uid == witness.winner_uid)
+    original = ScorePacketShape.model_validate_json(
+        store.get_limited(winner.score_packet, MAX_CONTENT_METADATA))
+    validate_member_packet(winner, original, context)
+    if (original.gate_passed is not True or original.score <= 0
+            or original.score != witness.winner_score):
+        raise InvalidContentEvidence("content share winner_score differs from its original measured packet")
+    obj = packet.model_dump(mode="json") if hasattr(packet, "model_dump") else packet
+    allowed_ids = {member.receipt.metadata.task_id,
+                   f"{member.receipt.metadata.task_id}-c{context.commitment_anchor.dispatch_ordering_key}"}
+    expected_identity = content_share_identity(
+        committed_scorer_version=context.committed_scorer_version,
+        track=context.track, scoring_config_digest=context.scoring_config_digest,
+        evidence_rule=context.evidence_rule,
+    )
+    if (obj.get("item_id") not in allowed_ids or obj.get("challenge_id") != context.challenge_id
+            or obj.get("track") != context.track or obj.get("miner_hotkey") != member.hotkey
+            or obj.get("content_digest") != member.output.digest
+            or obj.get("scorer_version") != expected_identity
+            or obj.get("scoring_config_digest") != context.scoring_config_digest
+            or obj.get("score") != witness.share
+            or bundle.miner_output != member.output or bundle.miner_receipt != member.receipt
+            or bundle.challenge_anchor != context.commitment_anchor):
+        raise InvalidContentEvidence("content share is not bound to its exact signed member decision")
+    if witness.role == "loser":
+        n = len(witness.component_uids)
+        expected_violation = [{"code": "DUPLICATE_CONTENT", "detail":
+            f"auditable same-content component of {n}; equal share 1/{n}; anchor-salted reference uid {witness.winner_uid}",
+            "limit": None, "measured": None}]
+        if (obj.get("gate_passed") is not False or obj.get("violations") != expected_violation
+                or obj.get("breakdown") is not None or obj.get("skips", [])
+                or obj.get("backend_versions") != {}
+                or obj.get("canonicalization_plan_digest") is not None
+                or obj.get("pieapp_start_frame") is not None
+                or any(obj.get(key) is not None for key in
+                       ("canonical_content_digest", "content_fingerprint", "encoded_size"))
+                or obj.get("metrics") != {"content_duplicate_witness": witness.to_json()}):
+            raise InvalidContentEvidence("content loser share is not the exact canonical signed-member decision")
+    else:
+        original_obj = original.model_dump(mode="json")
+        copied_fields = ("breakdown", "backend_versions", "skips", "pieapp_start_frame",
+                         "canonicalization_plan_digest", "canonical_content_digest",
+                         "content_fingerprint", "encoded_size")
+        if (obj.get("gate_passed") is not True or obj.get("violations") != []
+                or obj.get("breakdown") is None
+                or any(obj.get(key, [] if key == "skips" else None) != original_obj[key]
+                       for key in copied_fields)
+                or obj.get("metrics") != {**original.metrics,
+                                          "content_duplicate_witness": witness.to_json()}):
+            raise InvalidContentEvidence("content winner share does not preserve its original measured packet")
+
+
 def audit_manifest_rounds(service: Any, log: Any, store: Any, recomputer: Any, *, prior_log: Any = None) -> tuple[Any, ...]:
     """Check complete post-group economics in both own and beacon audit modes."""
     import json
@@ -171,6 +241,7 @@ def audit_manifest_rounds(service: Any, log: Any, store: Any, recomputer: Any, *
     from vidaio.auditor.report import ItemVerdict, ItemVerdictKind
     from vidaio.scoring.content_duplicate_evidence import (
         parse_content_round, content_witness_from_packet, is_content_duplicate_identity,
+        content_identity_version,
     )
 
     if log.schema_version < 17:
@@ -201,7 +272,11 @@ def audit_manifest_rounds(service: Any, log: Any, store: Any, recomputer: Any, *
                                                          max_bytes=MAX_CONTENT_METADATA))
                 score = obj.get("score")
                 if isinstance(score, (int, float)) and not isinstance(score, bool) and score > 0 and obj.get("gate_passed") is not True:
-                    raise InvalidContentEvidence("positive score claims a failed gate; cannot evade complete content index")
+                    witness = (content_witness_from_packet(obj)
+                               if content_identity_version(obj.get("scorer_version")) in (2, 3, 4) else None)
+                    if (not isinstance(witness, ContentShareWitness) or witness.member_uid != uid
+                            or witness.role != "loser" or score != witness.share):
+                        raise InvalidContentEvidence("positive score claims a failed gate; cannot evade complete content index")
                 key = (ref.challenge_id, uid, obj.get("cycle_sequence"))
                 if key in final:
                     raise InvalidContentEvidence("duplicate finalized round/uid/ordering identity")
@@ -227,6 +302,23 @@ def audit_manifest_rounds(service: Any, log: Any, store: Any, recomputer: Any, *
                 reveal_verifier=service._reveal_verifier)
             members = {member.uid: member for member in context.roster}
             ordering = context.commitment_anchor.dispatch_ordering_key
+            versions = {
+                content_identity_version(final[key][0].get("scorer_version")) or 1
+                for result in results
+                if len(result.uids) >= 2 and result.uids not in context.skipped_components
+                for uid in result.uids
+                if (key := (context.challenge_id, uid, ordering)) in final
+            }
+            if len(versions) > 1:
+                labels = "/".join(f"v{version}" for version in sorted(versions))
+                raise InvalidContentEvidence(f"mixed {labels} content economics in one round")
+            share_version = {
+                CONTENT_EVIDENCE_RULE_V1: 2, CONTENT_EVIDENCE_RULE_V2: 3,
+            }.get(context.evidence_rule, 4)
+            if (versions and versions != {share_version}
+                    and not (context.evidence_rule == CONTENT_EVIDENCE_RULE_V1 and versions == {1})):
+                raise InvalidContentEvidence("content identity version differs from round evidence_rule")
+            shared_round = versions == {share_version}
             for result in results:
                 skipped = result.uids in context.skipped_components
                 keys = {(context.challenge_id, uid, ordering) for uid in result.uids}
@@ -249,6 +341,7 @@ def audit_manifest_rounds(service: Any, log: Any, store: Any, recomputer: Any, *
                             result.detail, entry.round_digest)
                     continue
                 winner = context.winner(result.uids)
+                component_share = None
                 for uid in result.uids:
                     member = members[uid]
                     key = (context.challenge_id, uid, ordering)
@@ -262,7 +355,27 @@ def audit_manifest_rounds(service: Any, log: Any, store: Any, recomputer: Any, *
                     if key not in final:
                         raise InvalidContentEvidence(f"eligible uid {uid} is absent from finalized component decisions")
                     obj, ref = final[key]
-                    if uid == winner:
+                    if shared_round and len(result.uids) >= 2:
+                        witness = content_witness_from_packet(obj)
+                        if (content_identity_version(obj.get("scorer_version")) != share_version
+                                or not isinstance(witness, ContentShareWitness)
+                                or witness.round_evidence != context
+                                or witness.component_uids != result.uids
+                                or witness.winner_uid != winner or witness.member_uid != uid
+                                or obj.get("score") != witness.share):
+                            raise InvalidContentEvidence("share witness differs from complete epoch round index")
+                        terms = (witness.winner_score, witness.share)
+                        if component_share is not None and component_share != terms:
+                            raise InvalidContentEvidence("content component members disagree on winner_score/share")
+                        component_share = terms
+                        share_bundle = template.model_copy(update={
+                            "miner_output": member.output, "miner_receipt": member.receipt,
+                            "challenge_anchor": context.commitment_anchor,
+                        })
+                        validate_share_packet(obj, share_bundle, witness, store)
+                        if obj.get("cycle_sequence") != ordering or obj.get("excluded") is not False:
+                            raise InvalidContentEvidence("content share fold ordering/exclusion differs")
+                    elif uid == winner:
                         original = json.loads(store.get_limited(member.score_packet, MAX_CONTENT_METADATA))
                         expected = dict(original, item_id=f"{member.receipt.metadata.task_id}-c{ordering}",
                                         challenge_id=context.challenge_id, track=context.track,

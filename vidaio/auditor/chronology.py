@@ -213,7 +213,9 @@ def verify_challenge_chronology(
         return _fail("miner response signature is invalid")
 
     packet = _read_packet(store, bundle)
-    if packet is not None and str(packet.get("scorer_version", "")).startswith("validator-content-duplicate/1+"):
+    from vidaio.scoring.content_duplicate_evidence import content_identity_version
+    content_version = None if packet is None else content_identity_version(packet.get("scorer_version"))
+    if content_version == 1:
         from vidaio.scoring.content_duplicate_evidence import content_witness_from_packet
         from vidaio.auditor.content_evidence import validate_zero_packet
         try:
@@ -233,6 +235,32 @@ def verify_challenge_chronology(
                     return _skip(f"content component signature verifier unavailable: {exc}")
                 if not valid:
                     return _fail("content component miner response signature is invalid")
+        except Exception as exc:
+            return _fail(f"content component witness is invalid: {exc}")
+    elif content_version in (2, 3, 4):
+        from vidaio.scoring.content_duplicate_evidence import ContentShareWitness, content_witness_from_packet
+        from vidaio.auditor.content_evidence import ContentEvidenceUnavailable, validate_share_packet
+        try:
+            witness = content_witness_from_packet(packet)
+            if not isinstance(witness, ContentShareWitness):
+                raise ValueError("content share identity requires a schema-v2 witness")
+            validate_share_packet(packet, bundle, witness, store)
+            for member in witness.round_evidence.roster:
+                if member.uid not in witness.component_uids:
+                    continue
+                if (member.receipt.metadata.commitment_anchor != anchor
+                        or member.receipt.metadata.input_digest != bundle.challenge_input.digest
+                        or member.receipt.input_size != bundle.challenge_input.byte_size
+                        or member.receipt.validator_hotkey != receipt.validator_hotkey):
+                    return _fail("content component receipt differs from authenticated challenge")
+                try:
+                    valid = bool(receipt_verifier(member.receipt))
+                except Exception as exc:
+                    return _skip(f"content component signature verifier unavailable: {exc}")
+                if not valid:
+                    return _fail("content component miner response signature is invalid")
+        except (OSError, FileNotFoundError, ContentEvidenceUnavailable) as exc:
+            return _skip(f"content share winner original packet unavailable: {exc}")
         except Exception as exc:
             return _fail(f"content component witness is invalid: {exc}")
     if packet is not None and is_duplicate_identity(packet.get("scorer_version")):

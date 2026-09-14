@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from functools import partial
 
 import pytest
 
@@ -188,9 +189,9 @@ async def test_startup_recovery_resolves_challenges_stranded_by_a_crash(
 
 
 async def test_run_recovers_at_startup_and_drains_at_shutdown(
-    validator, challenge_client, conn
+    validator, challenge_client, conn, monkeypatch
 ):
-    """Both ends of the process lifecycle drain the in-flight table."""
+    """A stopped service gets two retries before any new round may start."""
     miner_manager.record_inflight_challenge(
         conn,
         challenge_id="ch-late",
@@ -198,19 +199,279 @@ async def test_run_recovers_at_startup_and_drains_at_shutdown(
         track="compression",
         fetched_at=miner_manager.utc_now_iso(),
     )
-    # the challenge service is down at startup, so recovery cannot drain it
-    challenge_client.fail_resolve_ids = {"ch-late"}
+    attempts = []
+    resolve = challenge_client.resolve_challenge
+
+    async def unavailable_twice(challenge_id, outcome, owner=""):
+        attempts.append(challenge_id)
+        if len(attempts) <= 2:
+            raise RuntimeError("challenge service is stopped")
+        await resolve(challenge_id, outcome, owner=owner)
+
+    monkeypatch.setattr(challenge_client, "resolve_challenge", unavailable_twice)
+    monkeypatch.setattr(
+        validator,
+        "_recover_startup_challenges",
+        partial(validator._recover_startup_challenges, retry_seconds=0.001),
+    )
 
     async def one_round() -> None:
-        challenge_client.fail_resolve_ids.clear()  # service comes back
+        assert challenge_client.resolves == [("ch-late", "expired")]
+        assert attempts == ["ch-late"] * 3
+        miner_manager.record_inflight_challenge(
+            conn,
+            challenge_id="ch-shutdown",
+            round_id="r1",
+            track="compression",
+            fetched_at=miner_manager.utc_now_iso(),
+        )
         validator.request_stop()
 
     validator.run_round = one_round
     await asyncio.wait_for(validator.run(), timeout=5.0)
 
-    # the SHUTDOWN drain caught what the startup pass could not
-    assert challenge_client.resolves == [("ch-late", "expired")]
+    assert challenge_client.resolves == [
+        ("ch-late", "expired"),
+        ("ch-shutdown", "expired"),
+    ]
     assert miner_manager.inflight_challenges(conn) == []
+
+
+async def test_startup_retries_unavailable_orphan_listing(
+    validator, challenge_client, monkeypatch
+):
+    """A lost-response orphan needs recovery even when the local table is empty."""
+    challenge_client.lose_response(
+        "ch-orphan", track="compression", age_seconds=7200, owner=VALIDATOR_IDENTITY
+    )
+    list_dispatched = challenge_client.list_dispatched
+    attempts = 0
+
+    async def unavailable_twice(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 2:
+            raise RuntimeError("challenge service is stopped")
+        return await list_dispatched(*args, **kwargs)
+
+    monkeypatch.setattr(challenge_client, "list_dispatched", unavailable_twice)
+    await asyncio.wait_for(
+        validator._recover_startup_challenges(retry_seconds=0.001), timeout=1
+    )
+
+    assert attempts == 3
+    assert challenge_client.resolves == [("ch-orphan", "expired")]
+
+
+async def test_startup_retries_unavailable_orphan_resolution(
+    validator, challenge_client, monkeypatch
+):
+    challenge_client.lose_response(
+        "ch-orphan", track="compression", age_seconds=7200, owner=VALIDATOR_IDENTITY
+    )
+    resolve = challenge_client.resolve_challenge
+    attempts = 0
+
+    async def unavailable_twice(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 2:
+            raise RuntimeError("challenge service is stopped")
+        await resolve(*args, **kwargs)
+
+    monkeypatch.setattr(challenge_client, "resolve_challenge", unavailable_twice)
+    await asyncio.wait_for(
+        validator._recover_startup_challenges(retry_seconds=0.001), timeout=1
+    )
+
+    assert attempts == 3
+    assert challenge_client.resolves == [("ch-orphan", "expired")]
+
+
+async def test_startup_does_not_retry_an_orphan_ownership_refusal(
+    validator, challenge_client
+):
+    challenge_client.lose_response(
+        "ch-orphan", track="compression", age_seconds=7200, owner=VALIDATOR_IDENTITY
+    )
+    challenge_client.recorded_owners["ch-orphan"] = OTHER_VALIDATOR_IDENTITY
+
+    await asyncio.wait_for(
+        validator._recover_startup_challenges(retry_seconds=0.001), timeout=1
+    )
+
+    assert challenge_client.resolve_owners == [VALIDATOR_IDENTITY]
+    assert challenge_client.resolves == []
+    assert "ch-orphan" in challenge_client.dispatched
+
+
+async def test_startup_retry_budget_exhaustion_allows_rounds_and_retains_rows(
+    validator, challenge_client, conn, monkeypatch, caplog
+):
+    miner_manager.record_inflight_challenge(
+        conn,
+        challenge_id="ch-pending",
+        round_id="r0",
+        track="compression",
+        fetched_at=miner_manager.utc_now_iso(),
+    )
+    challenge_client.fail_resolve_ids = {"ch-pending"}
+    monkeypatch.setattr(
+        validator,
+        "_recover_startup_challenges",
+        partial(
+            validator._recover_startup_challenges,
+            retry_seconds=0.005,
+            timeout_seconds=0.05,
+        ),
+    )
+    round_started = False
+
+    async def one_round():
+        nonlocal round_started
+        round_started = True
+        assert [r["challenge_id"] for r in miner_manager.inflight_challenges(conn)] == [
+            "ch-pending"
+        ]
+        assert metric(validator, "vidaio_validator_challenge_resolve_failures_total") >= 2
+        challenge_client.fail_resolve_ids.clear()
+        validator.request_stop()
+
+    monkeypatch.setattr(validator, "run_round", one_round)
+    await asyncio.wait_for(validator.run(), timeout=1)
+
+    assert round_started
+    assert any("retry budget exhausted" in r.getMessage() for r in caplog.records)
+    assert challenge_client.resolves == [("ch-pending", "expired")]
+
+
+async def test_startup_retry_budget_includes_and_cancels_pending_requests(
+    validator, challenge_client, conn, monkeypatch, caplog
+):
+    miner_manager.record_inflight_challenge(
+        conn,
+        challenge_id="ch-pending",
+        round_id="r0",
+        track="compression",
+        fetched_at=miner_manager.utc_now_iso(),
+    )
+    calls = 0
+    finished = False
+
+    async def unavailable(*args, **kwargs):
+        nonlocal calls, finished
+        calls += 1
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await asyncio.sleep(0)
+            finished = True
+
+    monkeypatch.setattr(challenge_client, "resolve_challenge", unavailable)
+    await asyncio.wait_for(
+        validator._recover_startup_challenges(timeout_seconds=0.02), timeout=1
+    )
+
+    assert calls == 1
+    assert finished  # cancellation cleanup was joined before returning
+    assert [r["challenge_id"] for r in miner_manager.inflight_challenges(conn)] == [
+        "ch-pending"
+    ]
+    assert any("retry budget exhausted" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("during_backoff", [False, True])
+async def test_stop_interrupts_startup_recovery_without_another_drain(
+    validator, challenge_client, conn, monkeypatch, caplog, during_backoff
+):
+    miner_manager.record_inflight_challenge(
+        conn,
+        challenge_id="ch-pending",
+        round_id="r0",
+        track="compression",
+        fetched_at=miner_manager.utc_now_iso(),
+    )
+    entered = asyncio.Event()
+    calls = 0
+    finished = False
+    rounds = []
+
+    async def unavailable(*args, **kwargs):
+        nonlocal calls, finished
+        calls += 1
+        entered.set()
+        try:
+            if during_backoff:
+                raise RuntimeError("challenge service is stopped")
+            await asyncio.Event().wait()
+        finally:
+            await asyncio.sleep(0)
+            finished = True
+
+    async def unexpected_round():
+        rounds.append(True)
+
+    async def wait_for_backoff():
+        while not any(
+            "recovery incomplete; retrying" in r.getMessage() for r in caplog.records
+        ):
+            await asyncio.sleep(0)
+
+    monkeypatch.setattr(challenge_client, "resolve_challenge", unavailable)
+    monkeypatch.setattr(validator, "run_round", unexpected_round)
+    run_task = asyncio.create_task(validator.run())
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        if during_backoff:
+            await asyncio.wait_for(wait_for_backoff(), timeout=1)
+        validator.request_stop()
+        await asyncio.wait_for(run_task, timeout=1)
+    finally:
+        if not run_task.done():
+            run_task.cancel()
+        await asyncio.gather(run_task, return_exceptions=True)
+
+    assert calls == 1
+    assert finished
+    assert rounds == []
+    assert [r["challenge_id"] for r in miner_manager.inflight_challenges(conn)] == [
+        "ch-pending"
+    ]
+
+
+async def test_startup_retries_do_not_unpark_a_repeated_ownership_refusal(
+    make_validator, challenge_client, conn, monkeypatch
+):
+    validator = make_validator(config={"unpark_challenges": True})
+    park_a_foreign_challenge(challenge_client, conn)
+    miner_manager.record_inflight_challenge(
+        conn,
+        challenge_id="ch-pending",
+        round_id="r0",
+        track="compression",
+        fetched_at=miner_manager.utc_now_iso(),
+    )
+    resolve = challenge_client.resolve_challenge
+    attempts = []
+
+    async def pending_once(challenge_id, outcome, owner=""):
+        attempts.append(challenge_id)
+        if challenge_id == "ch-pending" and attempts.count(challenge_id) == 1:
+            raise RuntimeError("challenge service is stopped")
+        await resolve(challenge_id, outcome, owner=owner)
+
+    monkeypatch.setattr(challenge_client, "resolve_challenge", pending_once)
+    await asyncio.wait_for(
+        validator._recover_startup_challenges(retry_seconds=0.001), timeout=1
+    )
+
+    assert attempts.count("ch-foreign") == 1
+    assert attempts.count("ch-pending") == 2
+    assert [r["challenge_id"] for r in miner_manager.parked_challenges(conn)] == [
+        "ch-foreign"
+    ]
+    assert miner_manager.inflight_challenges(conn) == []
+    assert metric(validator, "vidaio_validator_challenge_resolve_forbidden_total") == 1
 
 
 # --- the LOST RESPONSE (the gap the in-flight table cannot see) ---------------

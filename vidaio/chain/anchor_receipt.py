@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from vidaio.chain.adapter import ChainAdapter, ChainCommitmentRecord
@@ -72,6 +73,8 @@ async def wait_for_finalized_anchor_receipt(
     poll_seconds: float = DEFAULT_ANCHOR_RECEIPT_POLL_SECONDS,
     require_head_digest: bool = False,
     require_block_hash: bool = False,
+    inclusion_block: int | None = None,
+    archive_reader: Callable[..., str | None] | None = None,
 ) -> FinalizedAnchorReceipt:
     """Wait for one already-submitted anchor to become independently provable.
 
@@ -88,6 +91,12 @@ async def wait_for_finalized_anchor_receipt(
     domain-matches the payload but which do not expose a separate head-digest seam.
     ``require_block_hash`` similarly reflects the challenge receipt schema; epoch
     pointers persist the inclusion height rather than a block hash.
+
+    ``inclusion_block`` lets an authority recovering durable extrinsic evidence
+    verify its exact inclusion directly. The mutable current slot may already
+    differ after a restart; finalized archive state at that block stays decisive.
+    An authority may also supply an archive reader that pins an uncached
+    canonical finalized hash rather than an SDK's earlier best-chain hash cache.
     """
     if timeout_seconds <= 0:
         raise ValueError("anchor receipt timeout must be positive")
@@ -95,18 +104,25 @@ async def wait_for_finalized_anchor_receipt(
         raise ValueError("anchor receipt poll interval must be positive")
     if not SHA256_HEX.fullmatch(expected_digest):
         raise ValueError("expected anchor digest must be lowercase sha256 hex")
+    if inclusion_block is not None and (
+        isinstance(inclusion_block, bool)
+        or not isinstance(inclusion_block, int)
+        or inclusion_block < 0
+    ):
+        raise ValueError("anchor inclusion block must be a nonnegative integer")
 
     head_reader = getattr(chain, "read_anchor", None)
     block_reader = getattr(chain, "read_anchor_block", None)
     finalized_reader = getattr(chain, "finalized_block", None)
-    archive_reader = getattr(chain, "read_anchor_at", None)
+    archive_reader = archive_reader or getattr(chain, "read_anchor_at", None)
     block_hash_reader = getattr(chain, "block_hash", None)
 
     required = {
-        "read_anchor_block": block_reader,
         "finalized_block": finalized_reader,
         "read_anchor_at": archive_reader,
     }
+    if inclusion_block is None:
+        required["read_anchor_block"] = block_reader
     if require_head_digest:
         required["read_anchor"] = head_reader
     if require_block_hash:
@@ -118,12 +134,10 @@ async def wait_for_finalized_anchor_receipt(
             f"missing {', '.join(sorted(missing))}"
         )
 
-    assert callable(block_reader)
     assert callable(finalized_reader)
     assert callable(archive_reader)
     deadline = time.monotonic() + timeout_seconds
     last_observation = "receipt was not yet visible"
-    inclusion_block: int | None = None
 
     async def _retry(reason: str) -> None:
         nonlocal last_observation
@@ -139,6 +153,7 @@ async def wait_for_finalized_anchor_receipt(
 
     while True:
         if inclusion_block is None:
+            assert callable(block_reader)
             try:
                 observed = (
                     await asyncio.to_thread(

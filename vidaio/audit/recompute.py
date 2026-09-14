@@ -95,6 +95,13 @@ DEFAULT_TOLERANCES: Mapping[str, float] = MappingProxyType(
         "tone_manipulation_measure": 1e-9,
         "color_grayscale_measure": 1e-9,
         "chroma_uv_measure": 1e-9,
+        # Source-proximity residuals: the luma residual is a difference of two
+        # libvmaf runs (each with the 0.05 allowance above); the chroma PSNRs are
+        # integer-exact plane sums with one log10 per frame — last-decimal only.
+        "vmaf_residual": 0.10,
+        "psnr_uv_reference": 1e-6,
+        "psnr_uv_input": 1e-6,
+        "chroma_residual": 1e-6,
         "final_score": 1e-5,
         "score": 1e-5,
     }
@@ -180,6 +187,13 @@ _DUPLICATE_SCORER_NAME = "validator-exact-duplicate/1"
 _DUPLICATE_SCORER_PREFIX = f"{_DUPLICATE_SCORER_NAME}+"
 _DUPLICATE_WITNESS_METRIC = "duplicate_witness"
 _CONTENT_SCORER_PREFIX = "validator-content-duplicate/1+"
+_CONTENT_SCORER_PREFIX_V2 = "validator-content-duplicate/2+"
+_CONTENT_SCORER_PREFIX_V3 = "validator-content-duplicate/3+"
+_CONTENT_SCORER_PREFIX_V4 = "validator-content-duplicate/4+"
+_CONTENT_SHARE_PREFIXES = (_CONTENT_SCORER_PREFIX_V2, _CONTENT_SCORER_PREFIX_V3, _CONTENT_SCORER_PREFIX_V4)
+_CONTENT_SCORER_PREFIXES = (_CONTENT_SCORER_PREFIX, *_CONTENT_SHARE_PREFIXES)
+#: Round-composition source-proximity zero (vidaio.scoring.source_proximity_evidence).
+_SOURCE_SCORER_PREFIX = "validator-source-proximity/1+"
 _DUPLICATE_SELECTION_RULE = "anchor_hash_hotkey/1"
 _DUPLICATE_EVIDENCE_RULE = "sha256_exact_output/1"
 _DUPLICATE_ORDER_DOMAIN = b"vidaio:duplicate-order:anchor-hash-hotkey:v1\x00"
@@ -238,8 +252,9 @@ class ScorePacketShape(BaseModel):
     item_id: str
     challenge_id: str
     track: str
-    #: The authoritative value rankings consume — gates-first: 0.0 whenever
-    #: gate_passed is False. Must be finite and within [0, 1]: an Infinity/NaN
+    #: The authoritative value rankings consume. A validated content-share loser
+    #: is the sole positive-score exception when gate_passed is False.
+    #: Must be finite and within [0, 1]: an Infinity/NaN
     #: or out-of-range score is MALFORMED at parse time, before any recompute.
     score: float
     gate_passed: bool
@@ -318,8 +333,8 @@ class RecomputedScore(BaseModel):
     #: Versions detected by the independent scoring composition.  The verifier
     #: compares this complete map to the packet-bound bundle pins.
     backend_versions: dict[str, str]
-    #: Recomputed top-level outcome, gates-first: score MUST be 0.0 when
-    #: gate_passed is False. Compared against the packet's authoritative fields.
+    #: Recomputed top-level outcome. A validated content-share loser may carry a
+    #: positive score with gate_passed False; every other failed gate scores zero.
     score: float
     gate_passed: bool
     #: Fresh gate evidence and formula breakdown. These are not trusted packet
@@ -581,28 +596,67 @@ def _expected_packet_scorer(
     worker, track, and locked scoring config. Legacy validator-zero packets are
     refused because authority-observed failures are not reproducible proof.
     """
-    if packet.scorer_version.startswith(_CONTENT_SCORER_PREFIX):
+    if packet.scorer_version.startswith(_CONTENT_SCORER_PREFIXES):
         try:
-            raw = packet.metrics["content_duplicate_witness"]
-            witness = json.loads(raw)
-            if canonical_json_bytes(witness).decode() != raw:
-                raise ValueError("content witness is not canonical JSON")
-            context = witness["round_evidence"]
-            if (context["committed_scorer_version"] != committed_scorer
-                    or context["track"] != committed_track or packet.track != committed_track
-                    or context["scoring_config_digest"] != packet.scoring_config_digest):
+            from vidaio.scoring.content_duplicate_evidence import (
+                CONTENT_EVIDENCE_RULE,
+                CONTENT_EVIDENCE_RULE_V1,
+                CONTENT_EVIDENCE_RULE_V2,
+                ContentDuplicateWitnessV1,
+                ContentShareWitness,
+                content_duplicate_identity,
+                content_duplicate_identity_v1,
+                content_identity_version,
+                content_witness_from_packet,
+            )
+
+            witness = content_witness_from_packet(packet)
+            context = witness.round_evidence
+            if (context.committed_scorer_version != committed_scorer
+                    or context.track != committed_track or packet.track != committed_track
+                    or context.scoring_config_digest != packet.scoring_config_digest):
                 raise ValueError("content witness differs from committed scorer/track/config")
-            digest = sha256_hex(canonical_json_bytes({
-                "convention": "validator-content-duplicate/1",
-                "committed_scorer_version": committed_scorer, "track": committed_track,
-                "scoring_config_digest": packet.scoring_config_digest,
-                "evidence_rule": "canonical_content/1", "selection_rule": "anchor_hash_hotkey/1",
-                "fingerprint_version": 1, "hamming_max": 6,
-                "matched_frames_min": 30, "size_delta_percent": 1,
-            }))
-            return f"{_CONTENT_SCORER_PREFIX}{digest[:12]}", ""
+            version = content_identity_version(packet.scorer_version)
+            expected_rule = {
+                2: CONTENT_EVIDENCE_RULE_V1, 3: CONTENT_EVIDENCE_RULE_V2, 4: CONTENT_EVIDENCE_RULE,
+            }.get(version, CONTENT_EVIDENCE_RULE_V1)
+            if context.evidence_rule != expected_rule:
+                raise ValueError("content scorer identity and round evidence rule differ")
+            if version in (2, 3, 4):
+                if not isinstance(witness, ContentShareWitness):
+                    raise ValueError("content share identity requires a schema-v2 witness")
+                return content_duplicate_identity(
+                    committed_scorer_version=committed_scorer, track=committed_track,
+                    scoring_config_digest=packet.scoring_config_digest,
+                    evidence_rule=context.evidence_rule,
+                ), ""
+            if not isinstance(witness, ContentDuplicateWitnessV1):
+                raise ValueError("legacy content zero identity requires a schema-v1 witness")
+            return content_duplicate_identity_v1(
+                committed_scorer_version=committed_scorer, track=committed_track,
+                scoring_config_digest=packet.scoring_config_digest,
+            ), ""
         except (KeyError, TypeError, ValueError) as exc:
             return None, f"invalid content witness identity: {exc}"
+    if packet.scorer_version.startswith(_SOURCE_SCORER_PREFIX):
+        try:
+            from vidaio.scoring.source_proximity_evidence import (
+                source_proximity_identity,
+                source_witness_from_packet,
+            )
+
+            witness = source_witness_from_packet(packet)
+            context = witness.round_evidence
+            if (context.committed_scorer_version != committed_scorer
+                    or context.track != committed_track or packet.track != committed_track
+                    or context.scoring_config_digest != packet.scoring_config_digest):
+                raise ValueError("source witness differs from committed scorer/track/config")
+            return source_proximity_identity(
+                committed_scorer_version=committed_scorer, track=committed_track,
+                scoring_config_digest=packet.scoring_config_digest,
+            ), ""
+        except (KeyError, TypeError, ValueError) as exc:
+            return None, f"invalid source-proximity witness identity: {exc}"
     if packet.scorer_version.startswith(_DUPLICATE_SCORER_PREFIX):
         witness, error = _parse_duplicate_witness(packet)
         if witness is None:
@@ -1496,8 +1550,28 @@ def verify_bundle(
                         "; ".join(backend_problems),
                     )
                 )
-            # 5d. Internal gates-first invariant of the packet itself.
-            if not packet.gate_passed and packet.score != 0.0:
+            # 5d. Only a fully validated historical/current loser share can override gate zeroing.
+            if (not packet.gate_passed and packet.score != 0.0
+                    and packet.scorer_version.startswith(_CONTENT_SHARE_PREFIXES)):
+                from vidaio.auditor.content_evidence import (
+                    ContentEvidenceUnavailable, validate_share_packet,
+                )
+                from vidaio.scoring.content_duplicate_evidence import (
+                    ContentShareWitness, content_witness_from_packet,
+                )
+                try:
+                    witness = content_witness_from_packet(packet)
+                    if not isinstance(witness, ContentShareWitness) or witness.role != "loser":
+                        raise ValueError("positive score with a failed gate requires a content loser share")
+                    validate_share_packet(packet, bundle, witness, store)
+                except (OSError, FileNotFoundError, ContentEvidenceUnavailable) as exc:
+                    checks.append(_skip("packet_consistency", ARTIFACT_MISSING, str(exc), strict=strict))
+                except Exception as exc:
+                    checks.append(_fail("packet_consistency", CONTENT_EVIDENCE_MISMATCH,
+                                        f"invalid content loser share: {exc}"))
+                else:
+                    checks.append(_ok("packet_consistency"))
+            elif not packet.gate_passed and packet.score != 0.0:
                 checks.append(
                     _fail(
                         "packet_consistency",
@@ -1657,11 +1731,16 @@ def verify_bundle(
         for k in (ArtifactKind.CHALLENGE_INPUT, ArtifactKind.MINER_OUTPUT)
     ):
         try:
-            if packet.scorer_version.startswith(_CONTENT_SCORER_PREFIX):
+            if packet.scorer_version.startswith(_CONTENT_SCORER_PREFIXES):
                 content_recompute = getattr(recomputer, "recompute_content_duplicate", None)
                 if not callable(content_recompute):
-                    raise RuntimeError("content zero requires complete archived-component recomputation")
+                    raise RuntimeError("content packet requires complete archived-component recomputation")
                 recomputed = content_recompute(bundle, artifacts, store)
+            elif packet.scorer_version.startswith(_SOURCE_SCORER_PREFIX):
+                source_recompute = getattr(recomputer, "recompute_source_proximity", None)
+                if not callable(source_recompute):
+                    raise RuntimeError("source-proximity packet requires complete archived-roster recomputation")
+                recomputed = source_recompute(bundle, artifacts, store)
             elif packet.scorer_version.startswith(_DUPLICATE_SCORER_PREFIX):
                 duplicate_recompute = getattr(recomputer, "recompute_duplicate", None)
                 if (

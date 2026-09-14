@@ -44,6 +44,16 @@ Version history
      DAG deserialization and a later, separately calibrated version. This
      prevents the validator from minting rounds whose own degradations make the
      production quality/size gates impossible for the shipped baselines.
+  8  Source variant. A new first stage ("source") realizes a SourceVariant
+     operator on the sealed reference itself before any degradation runs, so the
+     reference the validator scores against and the input the miner receives
+     share a per-challenge, seed-drawn transform of the pristine (horizontal
+     flip, a small per-side crop, mild gamma/saturation/hue shifts and seeded
+     low-strength grain). The served clip therefore no longer matches its public
+     original — a reverse video/image search finds nothing usable, and an output
+     derived from the public original scores as the wrong geometry and colour.
+     Both tracks require it. Realized as one lossless FFV1 step from the verified
+     pristine copy to reference.mkv (to_reference_plan); to_ffmpeg_plan skips it.
 
 FrameDrop exclusion (dag_version 3 — documented P1 scope cut)
 -------------------------------------------------------------
@@ -132,9 +142,11 @@ from typing import Annotated, Any, ClassVar, Literal, Union
 
 from pydantic import BaseModel, ConfigDict, Field
 
-# v7 is the explicitly calibrated launch pool: codec-only compression and
-# downscale-only upscaling. Historical operator models remain deserializable.
-DAG_VERSION = 7
+# v8 = the v7 launch pools plus the source-variant stage (module docstring, entry 8).
+# Historical operator models remain deserializable; v7 also remains BUILDABLE so the
+# audit layer can still regenerate (verify_reveal_deep) commitments dispatched under it.
+DAG_VERSION = 8
+SUPPORTED_DAG_VERSIONS: tuple[int, ...] = (7, 8)
 
 # Optional-operator count range (unchanged since dag_version 3; structure is
 # versioned, not config).
@@ -153,10 +165,11 @@ UPSCALE_FACTORS: tuple[int, ...] = (2, 4)
 # back to live inference generation requires calibration and a DAG_VERSION bump.
 LAUNCH_UPSCALE_FACTORS: tuple[int, ...] = (2,)
 
+STAGE_SOURCE = "source"  # applied to the sealed REFERENCE, not to the miner input
 STAGE_CAPTURE = "capture"
 STAGE_EDIT = "edit"
 STAGE_DELIVERY = "delivery"
-STAGE_ORDER = (STAGE_CAPTURE, STAGE_EDIT, STAGE_DELIVERY)
+STAGE_ORDER = (STAGE_SOURCE, STAGE_CAPTURE, STAGE_EDIT, STAGE_DELIVERY)
 
 
 def canonical_json_dumps(payload: Any) -> str:
@@ -237,6 +250,68 @@ class DegradationOp(BaseModel):
             "-an",
             output_path,
         ]
+
+
+class SourceVariant(DegradationOp):
+    """Seed-drawn transform of the sealed reference (dag_version 8, stage "source").
+
+    Realized on the verified pristine copy to produce reference.mkv; every later
+    operator (and so the miner input) derives from the transformed reference, which
+    keeps scoring exact while making the served clip unsearchable: a flipped,
+    cropped, colour-shifted, grained clip does not match its public original, and
+    an output rebuilt from that original scores as the wrong geometry and colour.
+
+    Ranges are deliberately mild (they change fingerprints, not the task): crop
+    1-3 % per side, gamma 0.94-1.06, saturation 0.92-1.08, hue +-4 deg, ffmpeg noise
+    strength 2-5 (0-100 scale) with a drawn seed so the grain is reproducible.
+    Crop offsets and the resulting dimensions are forced even so 4:2:0 chroma stays
+    exact for any resolution.
+    """
+
+    stage: ClassVar[str] = STAGE_SOURCE
+    op: Literal["source_variant"] = "source_variant"
+    flip: bool
+    crop_left: float  # fraction of width, uniform [0.01, 0.03]
+    crop_right: float
+    crop_top: float  # fraction of height, uniform [0.01, 0.03]
+    crop_bottom: float
+    gamma: float  # uniform [0.94, 1.06]
+    saturation: float  # uniform [0.92, 1.08]
+    hue_deg: float  # uniform [-4, 4]
+    noise_strength: float  # uniform [2, 5] (ffmpeg noise alls, 0-100 scale)
+    noise_seed: int  # randint [1, 2**31 - 1]
+
+    @classmethod
+    def sample(cls, rng: random.Random) -> "SourceVariant":
+        return cls(
+            flip=rng.random() < 0.5,
+            crop_left=_u(rng, 0.01, 0.03),
+            crop_right=_u(rng, 0.01, 0.03),
+            crop_top=_u(rng, 0.01, 0.03),
+            crop_bottom=_u(rng, 0.01, 0.03),
+            gamma=_u(rng, 0.94, 1.06),
+            saturation=_u(rng, 0.92, 1.08),
+            hue_deg=_u(rng, -4.0, 4.0),
+            noise_strength=_u(rng, 2.0, 5.0),
+            noise_seed=rng.randint(1, 2**31 - 1),
+        )
+
+    def filter_expr(self) -> str:
+        # Even offsets and even output size: trunc(x/2)*2 on every term.
+        w = f"trunc((iw-iw*{round(self.crop_left + self.crop_right, 6)})/2)*2"
+        h = f"trunc((ih-ih*{round(self.crop_top + self.crop_bottom, 6)})/2)*2"
+        x = f"trunc(iw*{self.crop_left}/2)*2"
+        y = f"trunc(ih*{self.crop_top}/2)*2"
+        parts = []
+        if self.flip:
+            parts.append("hflip")
+        parts += [
+            f"crop={w}:{h}:{x}:{y}",
+            f"eq=gamma={self.gamma}:saturation={self.saturation}",
+            f"hue=h={self.hue_deg}",
+            f"noise=alls={self.noise_strength}:allf=t:all_seed={self.noise_seed}",
+        ]
+        return ",".join(parts)
 
 
 class Downscale(DegradationOp):
@@ -629,6 +704,7 @@ class MotionBlur(DegradationOp):
 
 OperatorUnion = Annotated[
     Union[
+        SourceVariant,
         Downscale,
         GaussianBlur,
         Noise,
@@ -644,6 +720,7 @@ OperatorUnion = Annotated[
 ]
 
 _OPERATOR_CLASSES: tuple[type[DegradationOp], ...] = (
+    SourceVariant,
     Downscale,
     GaussianBlur,
     Noise,
@@ -695,9 +772,27 @@ def _rule(
 # future pool expansion needs real-media calibration at production gates and a
 # DAG_VERSION bump.
 TRACK_RULES: dict[str, TrackRule] = {
+    "compression": TrackRule(required=("source_variant", "codec_compress"), optional=()),
+    "upscaling": TrackRule(required=("source_variant", "downscale"), optional=()),
+}
+
+#: dag_version 7 pools (codec-only / downscale-only, no source stage). Kept so v7
+#: commitments still regenerate byte-for-byte; never used for new challenges.
+_TRACK_RULES_V7: dict[str, TrackRule] = {
     "compression": TrackRule(required=("codec_compress",), optional=()),
     "upscaling": TrackRule(required=("downscale",), optional=()),
 }
+
+
+def track_rules(dag_version: int) -> dict[str, TrackRule]:
+    """The operator pools in force for a supported dag_version."""
+    if dag_version == 7:
+        return _TRACK_RULES_V7
+    if dag_version == DAG_VERSION:
+        return TRACK_RULES
+    raise ValueError(
+        f"unsupported dag_version {dag_version}; this build supports {SUPPORTED_DAG_VERSIONS}"
+    )
 
 
 # --- the DAG --------------------------------------------------------------------------
@@ -742,11 +837,8 @@ def build_dag(
     Everything non-public — operator subset, order, and every parameter — is drawn
     solely from `rng`, which the caller seeds from the private challenge seed.
     """
-    if dag_version != DAG_VERSION:
-        raise ValueError(
-            f"unsupported dag_version {dag_version}; this build supports {DAG_VERSION}"
-        )
-    rule = TRACK_RULES.get(task_type)
+    rules = track_rules(dag_version)  # raises for unsupported versions
+    rule = rules.get(task_type)
     if rule is None:
         raise ValueError(
             f"unknown task_type {task_type!r}; known: {sorted(TRACK_RULES)}"
@@ -778,12 +870,35 @@ def to_ffmpeg_plan(
     Non-final stages write lossless FFV1/MKV intermediates named
     `<output_path>.stageNN.mkv`; the final stage writes `output_path`.
     """
+    ops = [op for op in dag.ops if op.stage != STAGE_SOURCE]
     plan: list[list[str]] = []
     current = input_path
-    for i, op in enumerate(dag.ops):
-        out = (
-            output_path if i == len(dag.ops) - 1 else f"{output_path}.stage{i:02d}.mkv"
-        )
+    for i, op in enumerate(ops):
+        out = output_path if i == len(ops) - 1 else f"{output_path}.stage{i:02d}.mkv"
+        plan.append(op.command(current, out))
+        current = out
+    return plan
+
+
+def source_ops(dag: DegradationDag) -> list[DegradationOp]:
+    """The stage-"source" operators (applied to the reference, never to the input)."""
+    return [op for op in dag.ops if op.stage == STAGE_SOURCE]
+
+
+def to_reference_plan(
+    dag: DegradationDag, pristine_path: str, reference_path: str
+) -> list[list[str]]:
+    """ffmpeg argv plans realizing the source stage: verified pristine copy -> reference.
+
+    Empty when the DAG has no source stage (historical documents); the caller then
+    keeps the pristine copy as the reference. Non-final steps write lossless FFV1
+    intermediates named `<reference_path>.srcNN.mkv`.
+    """
+    ops = source_ops(dag)
+    plan: list[list[str]] = []
+    current = pristine_path
+    for i, op in enumerate(ops):
+        out = reference_path if i == len(ops) - 1 else f"{reference_path}.src{i:02d}.mkv"
         plan.append(op.command(current, out))
         current = out
     return plan

@@ -911,6 +911,63 @@ def _verify_pieapp_weights(path: Path) -> None:
         )
 
 
+_PIEAPP_PATCH_BATCH_SIZE = 64
+
+
+def _bounded_pieapp_model(model: Any, torch: Any) -> Any:
+    """Bound CPU convolution workspace without rebatching PIQ's score layers.
+
+    PIQ passes every 64x64 image patch to its feature model at once. Native
+    CPU convolution materializes an im2col workspace for that entire batch;
+    conv2 alone needs about 25 GB for a 1080p image. Feature extraction treats
+    patches independently, so process bounded batches with the same model and
+    copy their outputs into complete, ordered feature/weight matrices. PIQ
+    still supplies those full matrices to its unchanged fully connected score
+    layers and final reductions, preserving their shapes and arithmetic order.
+
+    Define the module only after the optional Torch import. Registering the
+    original model as a child preserves its parameter/device/eval handling.
+    """
+    # The canonical CPU policy disables these acceleration backends. Their
+    # kernel choice can depend on batch size, so preserve the original model
+    # in development runtimes that enable either one. Read flags without
+    # modifying process-global policy shared with other scoring threads.
+    if torch.backends.mkldnn.enabled or torch._C._get_nnpack_enabled():
+        return model
+    batch_size = _PIEAPP_PATCH_BATCH_SIZE
+
+    class _BoundedFeatures(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self._model = model
+
+        def forward(self, patches: Any) -> tuple[Any, Any]:
+            count = patches.shape[0]
+            if count <= batch_size:
+                return self._model(patches)
+
+            first_features, first_weights = self._model(patches[:batch_size])
+            features = first_features.new_empty((count, *first_features.shape[1:]))
+            weights = first_weights.new_empty((count, *first_weights.shape[1:]))
+            features[:batch_size].copy_(first_features)
+            weights[:batch_size].copy_(first_weights)
+            del first_features, first_weights
+            for start in range(batch_size, count, batch_size):
+                stop = min(start + batch_size, count)
+                chunk_features, chunk_weights = self._model(patches[start:stop])
+                features[start:stop].copy_(chunk_features)
+                weights[start:stop].copy_(chunk_weights)
+                del chunk_features, chunk_weights
+            return features, weights
+
+        def compute_difference(
+            self, features_diff: Any, weights_diff: Any
+        ) -> tuple[Any, Any]:
+            return self._model.compute_difference(features_diff, weights_diff)
+
+    return _BoundedFeatures()
+
+
 class _PiqPieAppRuntime:
     """Lazily imported PIQ runtime; construction may load cached model weights."""
 
@@ -953,6 +1010,8 @@ class _PiqPieAppRuntime:
             self._metric = piq.PieAPP(
                 reduction="mean", data_range=1.0, stride=27, enable_grad=False
             ).to(self._device)
+            if device == "cpu":
+                self._metric.model = _bounded_pieapp_model(self._metric.model, torch)
             self._metric.eval()
         except Exception as exc:  # missing/corrupt model cache is deployment config
             raise NotConfiguredError(
@@ -1084,6 +1143,15 @@ class PieAppTorchBackend:
         self._runtime_loader = _runtime_loader or _PiqPieAppRuntime
         self._runtime: Any | None = None
         self._lock = threading.Lock()
+
+    def clone(self) -> "PieAppTorchBackend":
+        """Create an independent model/lock with the same immutable scoring inputs."""
+        return PieAppTorchBackend(
+            device=self.device,
+            sample_window=self.sample_window,
+            _runtime_loader=self._runtime_loader,
+            _backend_version=self.version,
+        )
 
     def ensure_ready(self) -> None:
         """Load the model/weights without media; fail if the deployment is incomplete."""

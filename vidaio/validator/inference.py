@@ -135,10 +135,15 @@ from vidaio.scoring import (
     mint_duplicate_packet,
 )
 from vidaio.scoring.content_duplicate_evidence import (
-    ContentMember, ContentRoundEvidence, ContentDuplicateWitness, InvalidContentEvidence,
-    derive_edges, derive_components, validate_member_packet, mint_content_duplicate_packet,
+    ContentMember, ContentRoundEvidence, ContentShareWitness, InvalidContentEvidence,
+    derive_edges, derive_components, validate_member_packet, mint_content_share_packet,
 )
+from vidaio.scoring.config import TRACK_COMPRESSION
 from vidaio.scoring.result import config_digest
+from vidaio.scoring.source_proximity_evidence import (
+    InvalidSourceEvidence, SourceMember, SourceProximityWitness, SourceRoundEvidence,
+    derive_flags, derive_medians, mint_source_proximity_packet, packet_residuals,
+)
 from vidaio.services.artifact_auth import (
     ArtifactClientAuth,
     CallableHotkeySigner,
@@ -755,6 +760,8 @@ class RoundReport:
     #: uid -> reason for an evidence-backed economic zero: a byte-exact duplicate,
     #: or ``availability:<reason>`` backed by the exact signed dispatch observation.
     zeroed: dict[int, str] = field(default_factory=dict)
+    #: uid -> component size for an evidence-backed equal share of one measurement.
+    shared: dict[int, str] = field(default_factory=dict)
     #: uid -> excused system/protocol failure which deliberately did NOT affect EWMA.
     #: Miner-attributable reasons move to ``zeroed`` only with signed request evidence.
     non_punitive_skips: dict[int, str] = field(default_factory=dict)
@@ -1551,7 +1558,18 @@ class InferenceValidator(BaseService):
         if reason is not None:
             return self._skip_round(report, reason)
         try:
-            block = self.chain.current_block()
+            try:
+                # The adapter bounds this live read with its existing RPC timeout.
+                # A throttled metagraph snapshot must not backdate a new round.
+                block = self.chain.best_head_block()
+            except Exception as exc:
+                block = self.chain.current_block()
+                self.log.warning(
+                    "fresh round-start head read failed; using cached block",
+                    extra=log_fields(
+                        cached_block=block, error=f"{type(exc).__name__}: {exc}"
+                    ),
+                )
             miners = self.eligible_neurons()
         except Exception as exc:
             # A never-refreshed adapter raises ChainStateUnavailable rather than
@@ -1659,6 +1677,7 @@ class InferenceValidator(BaseService):
                 block=block,
                 scored=len(report.scored),
                 zeroed=len(report.zeroed),
+                shared=len(report.shared),
                 non_punitive_skips=len(report.non_punitive_skips),
                 skipped_unknown_track=len(report.skipped_unknown_track),
                 scoring_failed=len(report.scoring_failed),
@@ -1749,19 +1768,55 @@ class InferenceValidator(BaseService):
                     else None
                 ),
             )
-            measured_packets: list[PacketEvidence] = []
-            for uid, response in dedup.kept:
-                packet = await self._score_one(
-                    item,
-                    neuron_by_uid[uid],
-                    response,
-                    report,
-                    scores=scores,
-                    availability=availability,
-                )
-                if packet is None:
-                    continue  # scoring infra failed / packet unbound — miner unharmed
-                measured_packets.append(packet)
+            scoring_started = time.monotonic()
+            sem = asyncio.Semaphore(cfg.scoring_concurrency)
+
+            async def score_miner(uid: int, response: MinerTaskResponse) -> PacketEvidence | None:
+                async with sem:
+                    return await self._score_one(
+                        item,
+                        neuron_by_uid[uid],
+                        response,
+                        report,
+                        scores=scores,
+                        availability=availability,
+                    )
+
+            scoring_tasks = [asyncio.create_task(score_miner(uid, response)) for uid, response in dedup.kept]
+            scoring_batch = asyncio.gather(*scoring_tasks)
+            try:
+                # Own cancellation here so repeated caller cancellations cannot
+                # interrupt a worker request's first cancellation cleanup.
+                results = await asyncio.shield(scoring_batch)
+            except BaseException:
+                # Queued semaphore waiters may cancel before active requests finish
+                # unwinding. Drain them all before the finally block deletes media.
+                for task in scoring_tasks:
+                    if not task.done() and not task.cancelling():
+                        task.cancel()
+                if scoring_tasks:
+                    drain = asyncio.create_task(asyncio.wait(scoring_tasks))
+                    while not drain.done():
+                        try:
+                            await asyncio.shield(drain)
+                        except asyncio.CancelledError:
+                            # Further shutdown cancellations cannot release media
+                            # while scoring requests are still unwinding.
+                            continue
+                # The shielded gather can finish with a cancellation exception
+                # after its caller has left; consume it before re-raising ours.
+                if scoring_batch.done() and not scoring_batch.cancelled():
+                    scoring_batch.exception()
+                raise
+            measured_packets = [packet for packet in results if packet is not None]
+            self.log.info(
+                "track scored",
+                extra=log_fields(track=track, n_kept=len(dedup.kept), n_measured=len(measured_packets),
+                    concurrency=cfg.scoring_concurrency, seconds=time.monotonic() - scoring_started),
+            )
+            # Source-proximity verdicts come first: an output derived from the sealed
+            # pristine must never win (or seed) a same-content equal share.
+            measured_packets = self._apply_source_proximity(item, measured_packets, report)
             # Group only after the worker measured and archived the exact survivors.
             # Nothing from this track enters the round fold before content decisions.
             measured_packets, content_round = self._apply_content_duplicates(item, measured_packets, report)
@@ -1770,8 +1825,7 @@ class InferenceValidator(BaseService):
             for packet in measured_packets:
                 evidence.append(packet)
                 scores[packet.uid] = packet.score
-                if report.zeroed.get(packet.uid) != "duplicate_content":
-                    report.scored[packet.uid] = packet.score
+                report.scored[packet.uid] = packet.score
                 self.m_scored.labels(track=track).inc()
             # A duplicate changes EWMA only after both real signed outputs have
             # been archived into a canonical witness. Any missing/invalid evidence
@@ -2079,9 +2133,14 @@ class InferenceValidator(BaseService):
         `list_dispatched`, or one that does not accept `owner`, skips the sweep
         rather than failing startup or expiring somebody else's work.
         """
+        expired, _ = await self._sweep_orphaned_challenges()
+        return expired
+
+    async def _sweep_orphaned_challenges(self) -> tuple[list[str], bool]:
+        """Return expired ids and whether an unavailable operation needs retry."""
         max_age = self.config.orphan_sweep_age_seconds
         if max_age <= 0:
-            return []
+            return [], False
         owner = self.config.identity.strip()
         if not owner:
             self.m_sweep_skipped.labels(reason="no_identity").inc()
@@ -2090,10 +2149,10 @@ class InferenceValidator(BaseService):
                 " this validator cannot tell its own dispatched challenges from"
                 " another validator's and must expire none of them",
             )
-            return []
+            return [], False
         lister = getattr(self.challenge_client, "list_dispatched", None)
         if not callable(lister):
-            return []
+            return [], False
         try:
             dispatched = await with_timeout(
                 lister(max_age, owner=owner),
@@ -2108,14 +2167,14 @@ class InferenceValidator(BaseService):
                 " live challenge",
                 extra=log_fields(owner=owner),
             )
-            return []
+            return [], False
         except Exception as exc:
             self.log.warning(
                 "dispatched-challenge sweep unavailable; orphans (if any) stay"
-                " checked out until the next startup",
+                " checked out until recovery retries",
                 extra=log_fields(error=f"{type(exc).__name__}: {exc}"),
             )
-            return []
+            return [], True
         # Parked rows are excluded from the DRAIN, not from existence: the sweep
         # must still treat them as ours-and-recorded, or it would expire a
         # challenge whose stranded row an operator is deliberately holding.
@@ -2127,6 +2186,7 @@ class InferenceValidator(BaseService):
             for row in miner_manager.parked_challenges(self.conn)
         }
         expired: list[str] = []
+        retry_needed = False
         for entry in dispatched:
             challenge_id = str(getattr(entry, "challenge_id", "") or "")
             if not challenge_id or challenge_id in known:
@@ -2154,6 +2214,8 @@ class InferenceValidator(BaseService):
             except ChallengeAlreadyTerminal:
                 continue  # somebody else drained it between the list and now
             except Exception as exc:
+                if not isinstance(exc, ChallengeOwnershipRefused):
+                    retry_needed = True
                 self.m_challenge_resolve_failures.inc()
                 self.log.error(
                     "orphaned challenge could not be expired; it stays checked out",
@@ -2173,7 +2235,7 @@ class InferenceValidator(BaseService):
                     track=str(getattr(entry, "track", "")),
                 ),
             )
-        return expired
+        return expired, retry_needed
 
     def _publish_parked_metric(self) -> list[Any]:
         """Refresh the parked gauge from the table; returns the parked rows."""
@@ -2221,11 +2283,18 @@ class InferenceValidator(BaseService):
         is surfaced on the gauge and in a startup log line so the stranded
         service-side assets are never silently forgotten.
         """
-        if self.config.unpark_challenges:
+        drained, _ = await self._recover_inflight_challenges_once(startup=True)
+        return drained
+
+    async def _recover_inflight_challenges_once(
+        self, *, startup: bool
+    ) -> tuple[int, bool]:
+        """Run one recovery pass without repeating operator startup actions."""
+        if startup and self.config.unpark_challenges:
             self.unpark_challenges()
         stranded = miner_manager.inflight_challenges(self.conn)
         partial = miner_manager.uncommitted_rounds(self.conn)
-        if stranded or partial:
+        if startup and (stranded or partial):
             self.log.warning(
                 "recovering after an unclean shutdown",
                 extra=log_fields(
@@ -2234,9 +2303,9 @@ class InferenceValidator(BaseService):
                 ),
             )
         drained = await self._drain_inflight_challenges()
-        await self.sweep_orphaned_challenges()
+        _, sweep_needs_retry = await self._sweep_orphaned_challenges()
         parked = self._publish_parked_metric()
-        if parked:
+        if startup and parked:
             self.log.warning(
                 "PARKED challenge obligations exist: their resolves were"
                 " positively refused (403 not_owner) and they will NOT be retried"
@@ -2249,7 +2318,73 @@ class InferenceValidator(BaseService):
                 ),
             )
         self._recovered_inflight = True
-        return drained
+        retry_needed = bool(miner_manager.inflight_challenges(self.conn)) or sweep_needs_retry
+        return drained, retry_needed
+
+    async def _recover_startup_challenges(
+        self, *, retry_seconds: float = 30.0, timeout_seconds: float = 600.0
+    ) -> None:
+        """Retry startup obligations before rounds, bounded by time and shutdown.
+
+        The budget includes requests as well as backoff. Cancellation is joined
+        before returning, so a retry cannot overlap a live round or resolve one
+        of its newly fetched challenges. Unfinished obligations stay durable.
+        """
+        attempts = 0
+
+        async def recover() -> None:
+            nonlocal attempts
+            while not self.stopping.is_set():
+                attempts += 1
+                try:
+                    _, retry_needed = await self._recover_inflight_challenges_once(
+                        startup=attempts == 1
+                    )
+                except Exception:
+                    self.log.exception(
+                        "startup challenge recovery pass failed; retrying",
+                        extra=log_fields(attempt=attempts),
+                    )
+                    retry_needed = True
+                if not retry_needed:
+                    return
+                self.log.warning(
+                    "startup challenge recovery incomplete; retrying",
+                    extra=log_fields(
+                        attempt=attempts, retry_seconds=retry_seconds
+                    ),
+                )
+                await asyncio.sleep(retry_seconds)
+
+        recovery_task = asyncio.create_task(recover())
+        stop_task = asyncio.create_task(self.stopping.wait())
+        tasks = (recovery_task, stop_task)
+        try:
+            done, _ = await asyncio.wait(
+                tasks,
+                timeout=timeout_seconds,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if recovery_task in done:
+                await recovery_task
+            elif stop_task not in done:
+                self.log.warning(
+                    "startup challenge recovery retry budget exhausted; continuing"
+                    " with unfinished obligations retained",
+                    extra=log_fields(
+                        attempts=attempts,
+                        timeout_seconds=timeout_seconds,
+                        stranded_challenges=[
+                            str(row["challenge_id"])
+                            for row in miner_manager.inflight_challenges(self.conn)
+                        ],
+                    ),
+                )
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     @staticmethod
     def task_id_for(item: ChallengeItem, uid: int) -> str:
@@ -2938,6 +3073,104 @@ class InferenceValidator(BaseService):
             miner_receipt_json=loser_receipt.model_dump_json(),
         )
 
+    def _apply_source_proximity(
+        self, item: ChallengeItem, packets: list[PacketEvidence], report: RoundReport,
+    ) -> list[PacketEvidence]:
+        """Zero outputs that sit closer to the sealed pristine than to the served input.
+
+        Population-relative (round medians of the published ``vmaf_residual`` and
+        ``chroma_residual`` metrics), compression only, and minted exactly like a
+        content decision: every eligible measured packet joins a uid-sorted roster
+        bound to its archived packet/output/receipt, the verdict is derived from the
+        roster alone, and each flagged uid receives an archived SOURCE_PROXIMITY zero
+        packet whose only metric is the canonical witness. Unflagged packets are
+        returned untouched. Any evidence problem for a flagged uid becomes a visible
+        non-punitive skip — never a zero without independently auditable proof.
+        """
+        if item.track != TRACK_COMPRESSION or self._store is None or item.commitment_anchor is None:
+            return packets
+        measured: dict[int, tuple[PacketEvidence, ItemScore]] = {}
+        members: list[SourceMember] = []
+        for evidence in packets:
+            packet = ItemScore.model_validate_json(evidence.packet_json)
+            residuals = packet_residuals(packet)
+            if (not packet.gate_passed or packet.score <= 0.0 or packet.breakdown is None
+                    or residuals is None or not evidence.audit_ref or not evidence.miner_output_ref
+                    or not evidence.challenge_input_ref or not evidence.reference_original_ref
+                    or not evidence.miner_receipt_json):
+                continue
+            try:
+                members.append(SourceMember(
+                    uid=evidence.uid, hotkey=evidence.miner_hotkey,
+                    score_packet=ArtifactRef(kind=ArtifactKind.SCORE_PACKET, digest=evidence.packet_digest,
+                        byte_size=len(evidence.packet_json.encode()), backend_key=evidence.audit_ref),
+                    output=ArtifactRef.model_validate_json(evidence.miner_output_ref),
+                    receipt=MinerArtifactReceipt.model_validate_json(evidence.miner_receipt_json),
+                    vmaf_residual=residuals[0], chroma_residual=residuals[1]))
+                measured[evidence.uid] = (evidence, packet)
+            except (ValueError, TypeError) as exc:
+                self.log.warning("measured packet excluded from source-proximity roster",
+                    extra=log_fields(uid=evidence.uid, error=str(exc)))
+        roster = tuple(sorted(members, key=lambda member: member.uid))
+        if not roster or not derive_flags(roster):
+            return packets
+        first = measured[roster[0].uid][0]
+        try:
+            vmaf_median, chroma_median = derive_medians(roster)
+            context = SourceRoundEvidence(
+                challenge_id=item.dispatch.challenge_id, item_id=item.dispatch.challenge_id, track=item.track,
+                commitment_anchor=item.commitment_anchor,
+                challenge_input=ArtifactRef.model_validate_json(first.challenge_input_ref),
+                reference_original=ArtifactRef.model_validate_json(first.reference_original_ref),
+                committed_scorer_version=self.scoring_pin(), scoring_config_digest=config_digest(self.scoring),
+                roster=roster, vmaf_residual_median=vmaf_median, chroma_residual_median=chroma_median,
+                flagged=derive_flags(roster))
+        except (ValueError, TypeError) as exc:
+            self.log.error("source-proximity round evidence could not be built; no verdict minted",
+                extra=log_fields(track=item.track, error=str(exc), violation="SOURCE_EVIDENCE_UNAVAILABLE"))
+            return packets
+        replacements: dict[int, PacketEvidence] = {}
+        skipped: set[int] = set()
+        for uid in context.flagged:
+            evidence, _packet = measured[uid]
+            try:
+                member = context.member(uid)
+                if (ArtifactRef.model_validate_json(evidence.challenge_input_ref) != context.challenge_input
+                        or ArtifactRef.model_validate_json(evidence.reference_original_ref) != context.reference_original):
+                    raise InvalidSourceEvidence("flagged member mixes archived challenge/reference inputs")
+                for ref in (member.score_packet, member.output, context.challenge_input, context.reference_original):
+                    if not self._store.exists(ref):
+                        raise AuditStoreFailure("flagged member references unavailable archived media or packet")
+                witness = SourceProximityWitness(round_evidence=context, member_uid=uid)
+                packet = mint_source_proximity_packet(witness=witness, config=self.scoring)
+                packet_json = packet.to_json()
+                digest = hashlib.sha256(packet_json.encode()).hexdigest()
+                audit_ref = self._archive_packet(packet_json, digest)
+                if audit_ref is None:
+                    raise AuditStoreFailure("source-proximity verdicts require archived witness packets")
+                replacements[uid] = replace(evidence, packet_digest=digest, packet_json=packet_json,
+                    scorer_version=packet.scorer_version or "", score=0.0, audit_ref=audit_ref)
+            except Exception as exc:
+                skipped.add(uid)
+                report.non_punitive_skips[uid] = "source_evidence_unavailable"
+                report.scored.pop(uid, None)
+                report.zeroed.pop(uid, None)
+                report.shared.pop(uid, None)
+                if uid not in report.scoring_failed:
+                    report.scoring_failed.append(uid)
+                self.log.error("source-proximity verdict lacked independently auditable evidence; skipped non-punitively",
+                    extra=log_fields(uid=uid, error=str(exc), violation="SOURCE_EVIDENCE_UNAVAILABLE"))
+        for uid, replacement in replacements.items():
+            vmaf_excess, chroma_excess = context.excess(uid)
+            report.zeroed[uid] = "source_proximity"
+            report.scored.pop(uid, None)
+            report.shared.pop(uid, None)
+            self.log.warning("output derived from the sealed pristine reference; zeroed with complete round evidence",
+                extra=log_fields(uid=uid, track=item.track, vmaf_residual_excess=round(vmaf_excess, 4),
+                    chroma_residual_excess_db=round(chroma_excess, 4), roster=len(context.roster),
+                    round_digest=context.digest(), violation="SOURCE_PROXIMITY"))
+        return [replacements.get(packet.uid, packet) for packet in packets if packet.uid not in skipped]
+
     def _apply_content_duplicates(
         self, item: ChallengeItem, packets: list[PacketEvidence], report: RoundReport,
     ) -> tuple[list[PacketEvidence], dict[str, object] | None]:
@@ -2952,6 +3185,7 @@ class InferenceValidator(BaseService):
                 report.non_punitive_skips[uid] = "duplicate_evidence_unavailable"
                 report.scored.pop(uid, None)
                 report.zeroed.pop(uid, None)
+                report.shared.pop(uid, None)
                 if uid not in report.scoring_failed:
                     report.scoring_failed.append(uid)
             self.log.error("content component lacked independently auditable evidence; skipped non-punitively",
@@ -3032,19 +3266,20 @@ class InferenceValidator(BaseService):
                 winner = context.winner(component)
                 staged: dict[int, PacketEvidence] = {}
                 try:
+                    winner_score = measured[winner][1].score
+                    share = winner_score / len(component)
                     for uid in component:
-                        if uid == winner:
-                            continue
-                        witness = ContentDuplicateWitness(round_evidence=context, component_uids=component,
-                            winner_uid=winner, loser_uid=uid)
-                        packet = mint_content_duplicate_packet(witness=witness, config=self.scoring)
+                        witness = ContentShareWitness(round_evidence=context, component_uids=component,
+                            winner_uid=winner, member_uid=uid, winner_score=winner_score, share=share)
+                        packet = mint_content_share_packet(witness=witness, config=self.scoring,
+                            measured_packet=measured[uid][1] if uid == winner else None)
                         packet_json = packet.to_json()
                         digest = hashlib.sha256(packet_json.encode()).hexdigest()
                         audit_ref = self._archive_packet(packet_json, digest)
                         if audit_ref is None:
-                            raise AuditStoreFailure("content zeros require archived witness packets")
+                            raise AuditStoreFailure("content shares require archived witness packets")
                         staged[uid] = replace(measured[uid][0], packet_digest=digest, packet_json=packet_json,
-                            scorer_version=packet.scorer_version or "", score=0.0, audit_ref=audit_ref)
+                            scorer_version=packet.scorer_version or "", score=share, audit_ref=audit_ref)
                 except Exception as exc:
                     failed.add(component)
                     skip(component, exc)
@@ -3053,10 +3288,14 @@ class InferenceValidator(BaseService):
             if not failed:
                 break
             skipped_components.update(failed)
-        for uid in replacements:
-            report.zeroed[uid] = "duplicate_content"
-            self.log.warning("same-content duplicate zero backed by complete signed component evidence",
-                extra=log_fields(uid=uid, track=item.track, reason="duplicate_content", round_digest=context.digest()))
+        component_sizes = {uid: len(component) for component in context.components for uid in component}
+        for uid, replacement in replacements.items():
+            n = component_sizes[uid]
+            report.shared[uid] = f"duplicate_content:{n}"
+            report.scored[uid] = replacement.score
+            report.zeroed.pop(uid, None)
+            self.log.warning("same-content component shared equally, backed by complete signed component evidence",
+                extra=log_fields(uid=uid, track=item.track, n=n, share=replacement.score, round_digest=context.digest()))
         result = [replacements.get(packet.uid, packet) for packet in packets if packet.uid not in skipped]
         return result, {"challenge_id": context.challenge_id, "item_id": context.item_id, "track": context.track,
                         "round_json": context.to_json(), "round_digest": context.digest()}
@@ -3163,22 +3402,56 @@ class InferenceValidator(BaseService):
             # scorer_version is bound in _expected_bindings either way.
             scorer_version=cfg.scorer_version or None,
         )
+        waited_so_far = 0.0
+
+        async def score_with_shed_wait() -> ScoreResponse | httpx.HTTPStatusError:
+            nonlocal waited_so_far
+            while True:
+                try:
+                    return await with_timeout(
+                        self.scoring_client.score(request),
+                        cfg.scoring_request_timeout_seconds,
+                        f"score uid={neuron.uid}",
+                    )
+                except httpx.HTTPStatusError as exc:
+                    if exc.response.status_code != 503:
+                        raise
+                    try:
+                        delay = int(exc.response.headers.get("Retry-After", "5"))
+                    except ValueError:
+                        delay = 5
+                    delay = min(delay, 30) if delay > 0 else 5
+                    if waited_so_far + delay > cfg.scoring_shed_wait_seconds:
+                        # Return the terminal shed so retry_async cannot spend a
+                        # generic attempt or issue a request beyond this budget.
+                        return exc
+                    self.log.warning(
+                        "scoring worker shed the request; retrying",
+                        extra=log_fields(uid=neuron.uid, delay=delay, waited_so_far=waited_so_far),
+                    )
+                    await asyncio.sleep(delay)
+                    waited_so_far += delay
+
         try:
             # Scoring is a pure recompute over pinned digests — idempotent, retry-safe.
             result = await retry_async(
-                lambda: with_timeout(
-                    self.scoring_client.score(request),
-                    cfg.scoring_request_timeout_seconds,
-                    f"score uid={neuron.uid}",
-                ),
+                score_with_shed_wait,
                 attempts=2,
                 base_delay=0.1,
             )
+            if isinstance(result, httpx.HTTPStatusError):
+                raise result
         except Exception as exc:
             report.scoring_failed.append(neuron.uid)
+            detail = ""
+            if isinstance(exc, httpx.HTTPStatusError):
+                # str(exc) is only the status line; the worker's reason lives in the body
+                # ({"error": "media_tool_failed", "detail": ...}) — keep it or the failure
+                # is undiagnosable once the metric counter is the only trace left.
+                detail = exc.response.text[:600]
             self.log.error(
                 "scoring worker failed; miner not accumulated this round",
-                extra=log_fields(uid=neuron.uid, error=str(exc)),
+                extra=log_fields(uid=neuron.uid, error=str(exc), detail=detail),
             )
             return None
         expected = hashlib.sha256(result.item_score_json.encode("utf-8")).hexdigest()
@@ -3294,9 +3567,14 @@ class InferenceValidator(BaseService):
         # review #5: before the first round, resolve whatever a previous process
         # left checked out — otherwise the pool answers `pool_exhausted` forever.
         try:
-            await self.recover_inflight_challenges()
+            await self._recover_startup_challenges()
         except Exception:
             self.log.exception("startup challenge recovery failed; continuing")
+        if self.stopping.is_set():
+            # Recovery already joined any interrupted requests. No round has
+            # begun, so leave its durable rows for the next startup instead of
+            # starting another potentially blocked drain during shutdown.
+            return
         try:
             while not self.stopping.is_set():
                 try:

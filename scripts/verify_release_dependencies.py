@@ -47,7 +47,8 @@ CPU_UPSCALING_SMOKE_DURATION_SECONDS = 10.0
 
 
 def _verify_launch_calibration_contract() -> dict[str, Any]:
-    """Lock the code-side half of the real-media v7 calibration.
+    """Lock the code-side half of the real-media launch calibration (DAG v8 = the
+    calibrated v7 pools behind the source-variant stage).
 
     The measured vectors live in the internal launch-calibration record.
     This release-image gate prevents an operator pool, factor, codec input, or
@@ -70,8 +71,8 @@ def _verify_launch_calibration_contract() -> dict[str, Any]:
     from vidaio.miner.config import MinerConfig
     from vidaio.miner.gpu_worker import _VARIANTS
 
-    if DAG_VERSION != 7:
-        raise RuntimeError(f"launch calibration is for DAG v7, got v{DAG_VERSION}")
+    if DAG_VERSION != 8:
+        raise RuntimeError(f"launch calibration is for DAG v8, got v{DAG_VERSION}")
     if LAUNCH_UPSCALE_FACTORS != (2,) or not set(LAUNCH_UPSCALE_FACTORS) < set(
         UPSCALE_FACTORS
     ):
@@ -94,8 +95,8 @@ def _verify_launch_calibration_contract() -> dict[str, Any]:
             f"{LAUNCH_MAX_ELIGIBILITY_SCAN_ASSETS}"
         )
     expected_rules = {
-        "compression": (("codec_compress",), ()),
-        "upscaling": (("downscale",), ()),
+        "compression": (("source_variant", "codec_compress"), ()),
+        "upscaling": (("source_variant", "downscale"), ()),
     }
     actual_rules = {
         track: (rule.required, rule.optional) for track, rule in TRACK_RULES.items()
@@ -105,9 +106,19 @@ def _verify_launch_calibration_contract() -> dict[str, Any]:
     for seed in range(256):
         compression = build_dag("compression", random.Random(seed))
         upscaling = build_dag("upscaling", random.Random(seed))
-        if len(compression.ops) != 1 or compression.ops[0].op != "codec_compress":
+        if [op.op for op in compression.ops] != ["source_variant", "codec_compress"]:
             raise RuntimeError(f"seed {seed} left the codec-only launch pool")
-        codec = compression.ops[0]
+        for variant in (compression.ops[0], upscaling.ops[0]):
+            crops = (variant.crop_left, variant.crop_right, variant.crop_top, variant.crop_bottom)
+            if not (
+                all(0.01 <= c <= 0.03 for c in crops)
+                and 0.94 <= variant.gamma <= 1.06
+                and 0.92 <= variant.saturation <= 1.08
+                and -4.0 <= variant.hue_deg <= 4.0
+                and 2.0 <= variant.noise_strength <= 5.0
+            ):
+                raise RuntimeError(f"seed {seed} drifted from the mild source-variant ranges")
+        codec = compression.ops[1]
         if (
             codec.codec,
             codec.rate_mode,
@@ -122,9 +133,8 @@ def _verify_launch_calibration_contract() -> dict[str, Any]:
         }:
             raise RuntimeError(f"seed {seed} drifted from calibrated codec input")
         if (
-            len(upscaling.ops) != 1
-            or upscaling.ops[0].op != "downscale"
-            or round(1 / upscaling.ops[0].scale_factor) != 2
+            [op.op for op in upscaling.ops] != ["source_variant", "downscale"]
+            or round(1 / upscaling.ops[1].scale_factor) != 2
         ):
             raise RuntimeError(f"seed {seed} left the calibrated 2x launch pool")
     baselines = {

@@ -12,6 +12,7 @@ from vidaio.challenge import (
     record_commitment,
     record_commitment_anchor,
     retire_asset,
+    rebuild_dag_from_reveal,
     reveal_commitment,
     verify_reveal,
     verify_reveal_deep,
@@ -168,6 +169,46 @@ def test_verify_reveal_deep_rejects_hand_picked_dag(conn) -> None:
     revealed = reveal_commitment(conn, c.commit_hash, AT)
     assert verify_reveal(revealed)
     assert not verify_reveal_deep(revealed)
+
+
+def test_verify_reveal_deep_accepts_a_dag_version_7_commitment() -> None:
+    """The preimage carries no dag_version: a challenge committed under v7 (no source
+    stage) must still deep-verify after the validator moves to v8, and the rebuilt
+    DAG must be the v7 one so the auditor recomputes its real parameters."""
+    dag_v7 = build_dag("compression", dag_rng_from_seed(SEED), dag_version=7)
+    commitment = ChallengeCommitment.create(
+        "asset_0001", dag_v7, SEED, "scorer-v1", "compression", dispatch_ordering_key=0
+    )
+    revealed = RevealedCommitment(
+        clean_asset_id="asset_0001",
+        dag_digest=dag_v7.canonical_digest(),
+        seed=SEED,
+        scorer_version="scorer-v1",
+        track="compression",
+        dispatch_ordering_key=0,
+        commit_hash=commitment.commit_hash,
+        revealed_at=AT,
+    )
+    assert verify_reveal_deep(revealed)
+    rebuilt = rebuild_dag_from_reveal(revealed)
+    assert rebuilt is not None and rebuilt.dag_version == 7
+    assert [op.op for op in rebuilt.ops] == ["codec_compress"]
+    # pinned to the wrong version it fails, as it should
+    assert not verify_reveal_deep(revealed, dag_version=8)
+    # and a v8 commitment rebuilds as v8
+    dag_v8 = build_dag("compression", dag_rng_from_seed(SEED))
+    rebuilt8 = rebuild_dag_from_reveal(
+        RevealedCommitment(
+            clean_asset_id="asset_0001", dag_digest=dag_v8.canonical_digest(), seed=SEED,
+            scorer_version="scorer-v1", track="compression", dispatch_ordering_key=0,
+            commit_hash=ChallengeCommitment.create(
+                "asset_0001", dag_v8, SEED, "scorer-v1", "compression", dispatch_ordering_key=0
+            ).commit_hash,
+            revealed_at=AT,
+        )
+    )
+    assert rebuilt8 is not None and rebuilt8.dag_version == 8
+    assert [op.op for op in rebuilt8.ops] == ["source_variant", "codec_compress"]
 
 
 def test_verify_reveal_deep_rejects_bad_hash() -> None:

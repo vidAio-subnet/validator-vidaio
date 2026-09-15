@@ -160,7 +160,7 @@ class TestInferenceShares:
             cfg,
             [
                 mk_miner(1, score=0.9),
-                mk_miner(2, score=0.099, track="upscaling"),
+                mk_miner(2, score=0.049, track="upscaling"),
             ],
         )
         assert shares == {1: pytest.approx(0.8)}

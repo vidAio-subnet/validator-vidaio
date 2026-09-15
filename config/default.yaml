@@ -209,7 +209,7 @@ tokenomics:
   ewma_decay: 0.75
   idle_burn_share: 0.2
   idle_inference_share: 0.8
-  minimum_payout_score: 0.1
+  minimum_payout_score: 0.05
   payout_min_alpha_stake: 0.0
   podium_competition_share: 0.4
   podium_inference_share: 0.6

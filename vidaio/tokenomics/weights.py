@@ -14,7 +14,7 @@ from vidaio.tokenomics.state import EmissionState, MinerSnapshot, RewardWindowSt
 logger = get_logger("vidaio.tokenomics.weights")
 
 _LAUNCH_TOP_N_PER_TRACK = 5
-_LAUNCH_MINIMUM_PAYOUT_SCORE = 0.10
+_LAUNCH_MINIMUM_PAYOUT_SCORE = 0.05  # 0.10 -> 0.05 on 2026-09-15: the upscaling score curve tops out near 0.10, the pool burned
 _LAUNCH_TRACK_WEIGHTS = {"compression": 0.8, "upscaling": 0.2}
 _LAUNCH_STATE_SHARES = {
     "idle_inference_share": 0.80,
@@ -50,7 +50,7 @@ def ensure_locked_levers(config: TokenomicsConfig) -> None:
             f"top_n_per_track must stay {_LAUNCH_TOP_N_PER_TRACK} for launch"
         )
     if config.minimum_payout_score != _LAUNCH_MINIMUM_PAYOUT_SCORE:
-        raise ValueError("minimum_payout_score must stay 0.10 for launch")
+        raise ValueError("minimum_payout_score must stay 0.05 (launch pin, lowered 2026-09-15)")
     if config.track_weights != _LAUNCH_TRACK_WEIGHTS:
         raise ValueError(
             "track_weights must stay compression=0.8/upscaling=0.2 for launch"

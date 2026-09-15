@@ -20,7 +20,7 @@ class TokenomicsConfig(BaseModel):
     emission_liquidation_weigh_factor: float = 5.0
     ewma_decay: float = 0.75
     top_n_per_track: int = 5
-    minimum_payout_score: float = 0.10
+    minimum_payout_score: float = 0.05
     # Inference eligibility only; never scales a score or a competition award.
     payout_min_alpha_stake: float = 0.0
 

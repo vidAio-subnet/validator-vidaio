@@ -314,7 +314,11 @@ class Orchestrator(BaseService):
         conn: sqlite3.Connection | None = None,
         chain: ChainAdapter | None = None,
         clock: Any = None,
+        hotkey_verify_fn: Any = None,
     ) -> None:
+        #: Signature verifier for self-signed enrollment. ``None`` = real sr25519
+        #: hotkey verification; report-mode stacks inject their simulated verifier.
+        self._hotkey_verify_fn = hotkey_verify_fn
         cfg = section(raw_config, "orchestrator", OrchestratorConfig)
         super().__init__(raw_config, metrics_port=cfg.metrics_port)
         self.cfg = cfg
@@ -423,6 +427,7 @@ class Orchestrator(BaseService):
         self.health.register_check("engine_tick", self._check_tick_age)
         self.health.register_check("control_api", self._check_control_api)
         self.control_app = self._build_control_app()
+        self.public_app = self._build_public_app()
 
     # ---- control API -----------------------------------------------------------
 
@@ -437,28 +442,67 @@ class Orchestrator(BaseService):
             return None
         from vidaio.competition.orchestrator.control import create_control_app
 
-        # P2: self-signed enrollment needs the registered-hotkey guard; only a
-        # real chain can back the registry (report mode enrolls in-process).
-        hotkey_guard = None
-        if self._chain_mode == "bittensor" and self.chain is not None:
-            from vidaio.services.hotkey_auth import (
-                HotkeyAuthConfig,
-                HotkeyAuthGuard,
-                RegisteredHotkeyRegistry,
-            )
-
-            hk_cfg = section(self.raw_config, "hotkey_auth", HotkeyAuthConfig)
-            if hk_cfg.mode != "off":
-                hotkey_guard = HotkeyAuthGuard(
-                    RegisteredHotkeyRegistry(
-                        self.chain,
-                        ttl_seconds=hk_cfg.registry_ttl_seconds,
-                        max_stale_seconds=hk_cfg.registry_max_stale_seconds,
-                    ),
-                    hk_cfg,
-                )
         return create_control_app(
-            self, token=self.cfg.control_token, hotkey_guard=hotkey_guard
+            self, token=self.cfg.control_token, hotkey_guard=self._hotkey_guard()
+        )
+
+    def _hotkey_guard(self) -> Any | None:
+        """The one registered-hotkey guard shared by both HTTP surfaces.
+
+        A real chain always backs it. A report-mode stack gets one only when it
+        injected its simulated verifier, so local rehearsals exercise the same signed
+        enrollment path without ever accepting simulated signatures on a real chain.
+        """
+        if getattr(self, "_hotkey_guard_built", False):
+            return self._hotkey_guard_value
+        self._hotkey_guard_built = True
+        self._hotkey_guard_value = None
+        if self.chain is None:
+            return None
+        if self._chain_mode != "bittensor" and self._hotkey_verify_fn is None:
+            return None
+        if self._chain_mode == "bittensor" and self._hotkey_verify_fn is not None:
+            raise ValueError(
+                "a custom hotkey signature verifier is never valid on a real chain"
+            )
+        from vidaio.services.hotkey_auth import (
+            HotkeyAuthConfig,
+            HotkeyAuthGuard,
+            RegisteredHotkeyRegistry,
+        )
+
+        hk_cfg = section(self.raw_config, "hotkey_auth", HotkeyAuthConfig)
+        if hk_cfg.mode == "off":
+            return None
+        kwargs: dict[str, Any] = {}
+        if self._hotkey_verify_fn is not None:
+            kwargs["verify_fn"] = self._hotkey_verify_fn
+        self._hotkey_guard_value = HotkeyAuthGuard(
+            RegisteredHotkeyRegistry(
+                self.chain,
+                ttl_seconds=hk_cfg.registry_ttl_seconds,
+                max_stale_seconds=hk_cfg.registry_max_stale_seconds,
+            ),
+            hk_cfg,
+            **kwargs,
+        )
+        return self._hotkey_guard_value
+
+    def _build_public_app(self) -> Any | None:
+        if not self.cfg.public_enabled:
+            return None
+        from vidaio.competition.orchestrator.public_api import create_public_app
+        from vidaio.services.hotkey_auth import HotkeyAuthConfig
+
+        hk_cfg = section(self.raw_config, "hotkey_auth", HotkeyAuthConfig)
+        return create_public_app(
+            self,
+            hotkey_guard=self._hotkey_guard(),
+            min_enroll_alpha_stake=hk_cfg.min_enroll_alpha_stake,
+            allowed_repo_hosts=tuple(self.cfg.git_allowed_hosts),
+            enroll_limit_per_hour=self.cfg.public_enroll_limit_per_hour,
+            read_limit_per_minute=self.cfg.public_read_limit_per_minute,
+            trust_forwarded_for=self.cfg.public_trust_forwarded_for,
         )
 
     def now(self) -> datetime:
@@ -554,6 +598,27 @@ class Orchestrator(BaseService):
                     host=self.cfg.control_host, port=self.cfg.control_port
                 ),
             )
+        public_server: uvicorn.Server | None = None
+        if self.public_app is not None:
+            public_server = uvicorn.Server(
+                uvicorn.Config(
+                    self.public_app,
+                    host=self.cfg.public_host,
+                    port=self.cfg.public_port,
+                    log_config=None,
+                    access_log=False,
+                )
+            )
+            # Deliberately NOT in `tasks`: losing the public surface must never stop
+            # the competition driver; it is logged and visible in health instead.
+            public_task = asyncio.create_task(
+                public_server.serve(), name="orchestrator-public"
+            )
+            public_task.add_done_callback(self._public_api_exited)
+            self.log.info(
+                "public competitions API listening",
+                extra=log_fields(host=self.cfg.public_host, port=self.cfg.public_port),
+            )
         stop_task = asyncio.create_task(self.stopping.wait(), name="orchestrator-stop")
         try:
             await asyncio.wait({*tasks, stop_task}, return_when=asyncio.FIRST_COMPLETED)
@@ -573,10 +638,21 @@ class Orchestrator(BaseService):
             self.request_stop()
             if server is not None:
                 server.should_exit = True
+            if public_server is not None:
+                public_server.should_exit = True
             for task in tasks:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await asyncio.wait_for(task, timeout=30)
             stop_task.cancel()
+
+    def _public_api_exited(self, task: "asyncio.Task[Any]") -> None:
+        if self.stopping.is_set() or task.cancelled():
+            return
+        exc = task.exception()
+        self.log.error(
+            "public competitions API exited; enrollment is unreachable until restart",
+            extra=log_fields(error=repr(exc) if exc is not None else None),
+        )
 
     async def _tick_loop(self) -> None:
         while not self.stopping.is_set():
@@ -607,6 +683,7 @@ class Orchestrator(BaseService):
         self._last_step_monotonic = time.monotonic()
         self.m_last_tick.set(time.time())
         competition_id = repo.running_competition_id(self.conn)
+        self._release_idle_runner(competition_id)
         if competition_id is None:
             return
         if pers.is_halted(self.conn, competition_id):
@@ -641,6 +718,29 @@ class Orchestrator(BaseService):
         finally:
             self.m_stage_seconds.labels(phase=comp.status.value).observe(
                 time.monotonic() - stage_started
+            )
+
+    def _release_idle_runner(self, competition_id: str | None) -> None:
+        """Let a renewable runner drop its remote runtime when no phase needs it.
+
+        Only BUILDING and EVALUATING execute sandboxes. Holding a remote runtime
+        through a days-long enrollment window is what let it die unnoticed; the
+        runner itself ignores the release while an operation is in flight or inside
+        its idle grace, so a pre-anchor baseline build is never cut short.
+        """
+        release = getattr(self.runner, "release", None)
+        if not callable(release):
+            return
+        if competition_id is not None:
+            comp = repo.get_competition(self.conn, competition_id)
+            if comp is not None and comp.status in (Phase.BUILDING, Phase.EVALUATING):
+                return
+        try:
+            release()
+        except Exception as exc:  # noqa: BLE001 - never let cleanup stop the tick
+            self.log.warning(
+                "sandbox runtime release failed",
+                extra=log_fields(error=f"{type(exc).__name__}: {exc}"),
             )
 
     def _release_due_upscaling_references(self, now: datetime) -> bool:
@@ -1255,6 +1355,25 @@ class Orchestrator(BaseService):
         auditable but are never mixed into scoring. Any uncertainty halts before
         a new GPU batch executes.
         """
+        # A renewable runner holds no remote runtime while idle: create (or replace a
+        # dead) one now. A replacement carries a new session id, so the fence below
+        # treats it exactly like a process restart.
+        acquire = getattr(self.runner, "acquire", None)
+        if callable(acquire):
+            configure = getattr(self.runner, "configure", None)
+            if callable(configure):
+                resources = repo.get_manifest(self.conn, competition_id).sandbox_resources
+                configure(None if resources is None else resources.model_dump())
+            try:
+                await asyncio.to_thread(acquire)
+            except Exception as exc:
+                self._halt(
+                    competition_id,
+                    "sandbox runtime could not be acquired: "
+                    f"{type(exc).__name__}: {exc}",
+                    now,
+                )
+                return False
         try:
             fence = self._modal_runtime_fence()
         except Exception as exc:

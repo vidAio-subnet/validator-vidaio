@@ -38,6 +38,56 @@ class MinerSnapshot:
             raise ValueError("alpha_stake must be finite and >= 0")
 
 
+def _optional_unit(name: str, value: float | None) -> None:
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a number or None")
+    if not math.isfinite(float(value)) or not 0.0 <= float(value) <= 1.0:
+        raise ValueError(f"{name} must be finite and in [0, 1]")
+
+
+@dataclass(frozen=True, slots=True)
+class CompetitionRules:
+    """Per-competition result rules, fixed in the manifest anchored before enrollment.
+
+    ``crown_margin`` is the inclusive relative improvement over the rerun baseline that
+    opens a CROWN window. ``crown_min_score`` is an additional absolute score the winner
+    must reach to crown (how an operator raises the bar from one competition to the
+    next without any mutable baseline state). ``podium_min_margin`` /
+    ``podium_min_score`` are the inclusive conditions a contender must meet to hold a
+    paid podium rank at all. ``None`` means "no such condition".
+    """
+
+    crown_margin: float
+    crown_min_score: float | None = None
+    podium_min_margin: float | None = None
+    podium_min_score: float | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.crown_margin, bool)
+            or not isinstance(self.crown_margin, (int, float))
+            or not math.isfinite(float(self.crown_margin))
+            or not 0.0 < float(self.crown_margin) <= 10.0
+        ):
+            raise ValueError("crown_margin must be finite and in (0, 10]")
+        _optional_unit("crown_min_score", self.crown_min_score)
+        _optional_unit("podium_min_score", self.podium_min_score)
+        if self.podium_min_margin is not None and (
+            isinstance(self.podium_min_margin, bool)
+            or not isinstance(self.podium_min_margin, (int, float))
+            or not math.isfinite(float(self.podium_min_margin))
+            or not -1.0 <= float(self.podium_min_margin) <= 10.0
+        ):
+            raise ValueError("podium_min_margin must be finite and in [-1, 10]")
+        if (
+            self.podium_min_margin is not None
+            and float(self.podium_min_margin) > float(self.crown_margin)
+        ):
+            raise ValueError("podium_min_margin cannot exceed crown_margin")
+
+
 @dataclass(frozen=True, slots=True)
 class ContenderResult:
     """A ranked contender; margin is always derived, never accepted as input."""
@@ -72,8 +122,12 @@ class CompetitionResult:
     baseline_score: float | None
     baseline_version: int
     baseline_artifact_digest: str
+    #: Manifest-anchored per-competition rules; ``None`` = the protocol defaults.
+    rules: CompetitionRules | None = None
 
     def __post_init__(self) -> None:
+        if self.rules is not None and not isinstance(self.rules, CompetitionRules):
+            raise ValueError("competition rules must be a CompetitionRules value")
         if not self.competition_id:
             raise ValueError("competition_id must be non-empty")
         if not self.track:

@@ -1,0 +1,4 @@
+CODEC=svtav1
+CRF=38
+PRESET=8
+MODE=fixed

@@ -501,6 +501,25 @@ def create_control_app(
         )
         return {"competition_id": competition_id, "released": released}
 
+    @app.post("/competitions/{competition_id}/abort")
+    async def abort_competition(
+        competition_id: str, body: ClearHaltRequest, request: Request
+    ):
+        """Audited operator abort: frees the single running slot of a stuck run."""
+        authenticate(request)
+        require_competition(competition_id)
+        try:
+            terminal = orch.engine.abort(
+                orch.conn, competition_id, orch.now(),
+                operator=body.operator, reason=body.reason,
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "abort_refused", "message": str(exc)},
+            ) from exc
+        return {"competition_id": competition_id, "status": terminal.value}
+
     @app.post("/competitions/{competition_id}/halt/clear")
     async def clear_halt(competition_id: str, body: ClearHaltRequest, request: Request):
         authenticate(request)

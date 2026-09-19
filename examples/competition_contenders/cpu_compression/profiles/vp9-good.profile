@@ -1,0 +1,4 @@
+CODEC=vp9
+CRF=38
+PRESET=3
+MODE=fixed

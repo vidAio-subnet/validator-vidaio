@@ -192,6 +192,12 @@ build/rerun adapter, and watcher scheduler to be injected into
 serves and verifies version zero but does not advance executable state. That gap
 must not be filled with a direct database or HTTP write.
 
+The bar of a competition no longer depends on promotion: each manifest can carry its own
+anchored `result_rules` (`crown_margin`, `crown_min_score`, podium conditions), so an
+operator raises the crown bar between competitions without any mutable baseline state.
+The registry then simply serves the stable reference executable every contender is
+compared against.
+
 This state is never implicit. `automatic_promotion_enabled=true` without an
 injected watcher fails startup, as does injecting a watcher while the flag is
 false. Production preflight rejects a disabled flag unless the deployment sets

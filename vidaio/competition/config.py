@@ -49,5 +49,13 @@ class CompetitionConfig(BaseModel):
     #: Ceiling on the manifest's evaluation batch-size upper bound (comp-01: 1-5).
     evaluation_batch_size_max: int = Field(default=16, ge=1)
 
+    #: Require compression manifests to precommit their ordered hidden items (the
+    #: upscaling track always does). Production enables it; the schema default stays
+    #: off so previously anchored compression manifests remain loadable.
+    require_item_commitments: bool = False
+    #: Ceilings on a manifest's per-competition sandbox compute envelope.
+    sandbox_cpu_max: float = Field(default=64.0, gt=0)
+    sandbox_memory_mb_max: int = Field(default=131072, ge=256)
+    sandbox_batch_timeout_seconds_max: int = Field(default=14400, ge=60)
     #: Floor on the enrollment alpha-stake gate (0 disables the floor).
     minimum_alpha_stake_min: float = Field(default=0.0, ge=0)

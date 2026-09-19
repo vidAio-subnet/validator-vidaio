@@ -104,7 +104,8 @@ challenge_service:
   scorer_identity_max_stale_seconds: 300
   scorer_identity_reverify_seconds: 60
   scoring_worker_url: http://127.0.0.1:8201
-competition: {}
+competition:
+  require_item_commitments: true
 core:
   data_dir: ./data
   db_filename: vidaio.db
@@ -143,12 +144,19 @@ orchestrator:
   control_token: ''
   git_allowed_hosts:
   - github.com
+  git_host_credentials: {}
   git_read_only_token: ''
   modal_app_name: ''
   modal_creation_confirmation: ''
   modal_environment_name: ''
   modal_gpu: L4
   modal_run_label: ''
+  public_enabled: false
+  public_enroll_limit_per_hour: 12
+  public_host: 127.0.0.1
+  public_port: 8510
+  public_read_limit_per_minute: 120
+  public_trust_forwarded_for: false
   sandbox_backend: modal
 registry:
   allow_disabled_automatic_promotion_for_testnet: false

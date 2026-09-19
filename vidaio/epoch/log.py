@@ -48,6 +48,7 @@ from vidaio.challenge.dag import TRACK_RULES
 from vidaio.tokenomics.quantize import quantize_u16
 from vidaio.tokenomics.state import (
     CompetitionResult,
+    CompetitionRules,
     ContenderResult,
     MinerSnapshot,
     RewardWindowState,
@@ -599,6 +600,42 @@ class CompetitionAuditSubject(BaseModel):
         }
 
 
+class CompetitionRulesInput(BaseModel):
+    """Manifest-anchored per-competition result rules, committed with the result.
+
+    The values are a verbatim copy of the manifest's ``result_rules`` block; auditors
+    open the anchored manifest and require equality, so the authority cannot choose
+    them after seeing the scores. Absent rules are omitted from canonical bytes, which
+    keeps every log without them byte-identical to the pre-rules encoding.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    crown_margin: float = Field(gt=0, le=10, allow_inf_nan=False)
+    crown_min_score: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
+    podium_min_margin: float | None = Field(
+        default=None, ge=-1, le=10, allow_inf_nan=False
+    )
+    podium_min_score: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def _ordered(self) -> "CompetitionRulesInput":
+        if (
+            self.podium_min_margin is not None
+            and self.podium_min_margin > self.crown_margin
+        ):
+            raise EpochLogInvalid("podium_min_margin cannot exceed crown_margin")
+        return self
+
+    def _canonical_obj(self) -> dict[str, Any]:
+        return {
+            "crown_margin": self.crown_margin,
+            "crown_min_score": self.crown_min_score,
+            "podium_min_margin": self.podium_min_margin,
+            "podium_min_score": self.podium_min_score,
+        }
+
+
 class CompetitionInput(BaseModel):
     """Committed, CPU-recomputable inputs of one economic competition result.
 
@@ -636,6 +673,8 @@ class CompetitionInput(BaseModel):
     baseline_provenance_digest: str = Field(pattern=SHA256_HEX_PATTERN)
     baseline_provenance_bytes: int = Field(gt=0)
     aggregation_version: Literal["mean_item_score.v2"] = "mean_item_score.v2"
+    #: Per-competition result rules copied from the anchored manifest (None = defaults).
+    rules: CompetitionRulesInput | None = None
     items: tuple[CompetitionAuditItem, ...] = Field(min_length=1)
     subjects: tuple[CompetitionAuditSubject, ...] = Field(min_length=2)
 
@@ -752,6 +791,12 @@ class CompetitionInput(BaseModel):
         return self
 
     def _canonical_obj(self) -> dict[str, Any]:
+        obj = self._canonical_core()
+        if self.rules is not None:
+            obj["rules"] = self.rules._canonical_obj()
+        return obj
+
+    def _canonical_core(self) -> dict[str, Any]:
         return {
             "competition_id": self.competition_id,
             "track": self.track,
@@ -1198,6 +1243,19 @@ def _competition_obj(result: CompetitionResult | None) -> dict[str, Any] | None:
         "baseline_score": result.baseline_score,
         "baseline_version": result.baseline_version,
         "baseline_artifact_digest": result.baseline_artifact_digest,
+        # Omitted when absent: logs without per-competition rules keep their bytes.
+        **(
+            {}
+            if result.rules is None
+            else {
+                "rules": {
+                    "crown_margin": result.rules.crown_margin,
+                    "crown_min_score": result.rules.crown_min_score,
+                    "podium_min_margin": result.rules.podium_min_margin,
+                    "podium_min_score": result.rules.podium_min_score,
+                }
+            }
+        ),
     }
 
 
@@ -1224,7 +1282,23 @@ def _competition_from_obj(value: dict[str, Any] | None) -> CompetitionResult | N
         ),
         baseline_version=int(value["baseline_version"]),
         baseline_artifact_digest=value["baseline_artifact_digest"],
+        rules=(
+            None
+            if value.get("rules") is None
+            else CompetitionRules(
+                crown_margin=float(value["rules"]["crown_margin"]),
+                crown_min_score=_optional_float(value["rules"].get("crown_min_score")),
+                podium_min_margin=_optional_float(
+                    value["rules"].get("podium_min_margin")
+                ),
+                podium_min_score=_optional_float(value["rules"].get("podium_min_score")),
+            )
+        ),
     )
+
+
+def _optional_float(value: Any) -> float | None:
+    return None if value is None else float(value)
 
 
 def _reward_window_obj(state: RewardWindowState) -> dict[str, Any]:
@@ -2098,6 +2172,11 @@ class EpochLog(BaseModel):
                     competition_input_obj["baseline_provenance_bytes"]
                 ),
                 aggregation_version=competition_input_obj["aggregation_version"],
+                rules=(
+                    None
+                    if competition_input_obj.get("rules") is None
+                    else CompetitionRulesInput(**competition_input_obj["rules"])
+                ),
                 items=tuple(
                     CompetitionAuditItem(
                         challenge_id=item["challenge_id"],

@@ -94,7 +94,10 @@ from vidaio.competition.anchor_evidence import (
     CompetitionAnchorUnavailable,
     verify_competition_anchor_on_chain,
 )
-from vidaio.competition.item_commitment import evaluation_item_commitment
+from vidaio.competition.item_commitment import (
+    compression_item_commitment,
+    evaluation_item_commitment,
+)
 from vidaio.competition.manifest import CompetitionManifest
 
 from vidaio.auditor.config import AuditorConfig, SamplePolicy
@@ -1248,6 +1251,18 @@ class Auditor:
                     raise ValueError(
                         "earning competition manifest has no archived executable baseline"
                     )
+                manifest_rules = (
+                    None
+                    if manifest.result_rules is None
+                    else manifest.result_rules.model_dump()
+                )
+                committed_rules = (
+                    None if comp_input.rules is None else comp_input.rules.model_dump()
+                )
+                if manifest_rules != committed_rules:
+                    raise ValueError(
+                        "competition result rules differ from the anchored manifest"
+                    )
                 expected_commitment = {
                     "manifest_digest": comp_input.manifest_digest,
                     "baseline_version": manifest.baseline.version,
@@ -1338,6 +1353,46 @@ class Auditor:
                                 "open its anchored manifest commitment"
                             )
 
+                compression_commitments = (
+                    manifest.evaluation_item_commitments
+                    if manifest.track == "compression"
+                    else None
+                )
+                if compression_commitments is None and manifest.track == "compression":
+                    if any(item.item_commitment is not None for item in comp_input.items):
+                        raise ValueError(
+                            "compression competition input carries item commitments "
+                            "the anchored manifest never made"
+                        )
+                if compression_commitments is not None:
+                    if len(comp_input.items) != len(compression_commitments):
+                        raise ValueError(
+                            f"compression competition input has {len(comp_input.items)} "
+                            "item(s), but the anchored manifest commits "
+                            f"{len(compression_commitments)}"
+                        )
+                    for expected_index, (item, committed) in enumerate(
+                        zip(comp_input.items, compression_commitments, strict=True)
+                    ):
+                        if item.item_index != expected_index or item.input_sha256 is None:
+                            raise ValueError(
+                                f"compression evaluation item {expected_index} has an "
+                                "incomplete or reordered commitment preimage"
+                            )
+                        derived_item_commitment = compression_item_commitment(
+                            competition_id=comp_input.competition_id,
+                            item_index=expected_index,
+                            input_sha256=item.input_sha256,
+                        )
+                        if (
+                            item.item_commitment != derived_item_commitment
+                            or committed != derived_item_commitment
+                        ):
+                            raise ValueError(
+                                f"compression evaluation item {expected_index} does not "
+                                "open its anchored manifest commitment"
+                            )
+
                 census_by_hotkey = {entry.hotkey: entry for entry in log.miner_census}
                 if len(census_by_hotkey) != len(log.miner_census):
                     raise ValueError("competition close-block census repeats a hotkey")
@@ -1413,6 +1468,14 @@ class Auditor:
                                 f"competition bundle identity {actual_bundle_identity!r} "
                                 f"differs from committed item/subject identity "
                                 f"{expected_bundle_identity!r}"
+                            )
+                        if (
+                            compression_commitments is not None
+                            and bundle.challenge_input.digest != item.input_sha256
+                        ):
+                            raise ValueError(
+                                "compression competition bundle input bytes differ from "
+                                "the committed evaluation item"
                             )
                         if comp_input.track == "upscaling":
                             binding = bundle.competition_item

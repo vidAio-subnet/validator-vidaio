@@ -20,6 +20,13 @@ from vidaio.chain.anchor_receipt import (
 )
 
 
+class GitHostCredential(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    username: str = Field(default="x-access-token", min_length=1)
+    token: SecretStr
+
+
 class OrchestratorConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -77,11 +84,20 @@ class OrchestratorConfig(BaseModel):
     git_read_only_token: SecretStr = SecretStr("")
     git_username: str = "x-access-token"
     git_allowed_hosts: tuple[str, ...] = ("github.com",)
+    #: Optional per-host read-only credentials, ``{host: {username, token}}``. A host
+    #: without an entry uses ``git_username`` / ``git_read_only_token``. Inject with
+    #: VIDAIO__ORCHESTRATOR__GIT_HOST_CREDENTIALS (JSON); never commit tokens.
+    git_host_credentials: dict[str, "GitHostCredential"] = Field(default_factory=dict)
     git_executable: str = "git"
     git_checkout_timeout_seconds: float = Field(default=180.0, gt=0)
     git_checkout_max_bytes: int = Field(default=512 * 1024 * 1024, gt=0)
     git_log_max_bytes: int = Field(default=1024 * 1024, gt=0)
     git_poll_seconds: float = Field(default=0.1, gt=0)
+
+    #: REPORT MODE ONLY: directory whose sub-directories are contender repositories,
+    #: addressed as ``https://<allowed host>/<name>.git``. Lets a chainless rehearsal use
+    #: the real enrollment surface without a Git server. Ignored on a real chain.
+    report_repo_root: Path | None = None
 
     # ---- docker sandbox resource limits ----------------------------------------
     sandbox_memory: str = "2g"
@@ -111,6 +127,18 @@ class OrchestratorConfig(BaseModel):
     control_token: str = ""
     control_host: str = "127.0.0.1"
     control_port: int = 8500
+
+    # ---- public competitions API (discovery + self-signed enrollment) -----------
+    #: Token-free surface miners reach (see orchestrator/public_api.py). Enrollment
+    #: on it is refused unless registry-backed hotkey auth runs in ``enforce``.
+    #: Put it behind the deployment's TLS reverse proxy; set
+    #: ``public_trust_forwarded_for`` only when that proxy is the sole client.
+    public_enabled: bool = False
+    public_host: str = "127.0.0.1"
+    public_port: int = 8510
+    public_enroll_limit_per_hour: int = Field(default=12, ge=1)
+    public_read_limit_per_minute: int = Field(default=120, ge=1)
+    public_trust_forwarded_for: bool = False
 
     #: In-step attempts to archive one contender's submission tarball before the
     #: failure is classified (a CONTENDER-fault tree is rejected; an INFRA failure

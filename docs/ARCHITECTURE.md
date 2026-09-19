@@ -692,8 +692,8 @@ Inference eligibility is not “whoever showed up gets a full share”:
 
 ```mermaid
 flowchart LR
-    ROUNDS["Round scores"] --> EWMA["EWMA with inactivity decay"]
-    EWMA --> FLOOR{"Absolute score at least 0.10?"}
+    ROUNDS["Round scores"] --> EWMA["EWMA (folds only when a new score arrives)"]
+    EWMA --> FLOOR{"Absolute score at least 0.05?"}
     FLOOR -->|"no"| ZERO["No payout"]
     FLOOR -->|"yes"| DEDUP["Coldkey and concrete-IP dedup"]
     DEDUP --> RANK["Deterministic rank"]

@@ -106,6 +106,70 @@ class LocalRepoProvider:
         """Mapped fixture trees are caller-owned and intentionally retained."""
 
 
+class DirectoryRepoProvider:
+    """Report-mode provider: ``https://<host>/<name>.git`` -> ``<root>/<name>``.
+
+    Lets a chainless rehearsal drive the real enrollment surface (https URL on an
+    allow-listed host, commit and tree pins) without a Git server. When the directory is
+    a Git work tree, the pinned commit and tree are verified against its HEAD; the
+    returned checkout is a private copy without ``.git``. Never selected on a real chain.
+    """
+
+    _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
+
+    def __init__(
+        self, root: str | Path, *, scratch_root: str | Path, git_path: str = "git"
+    ) -> None:
+        self._root = Path(root)
+        self._scratch = Path(scratch_root)
+        self._scratch.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self._git = git_path
+
+    def _source(self, repo_url: str) -> Path:
+        parts = urlsplit(repo_url)
+        name = parts.path.strip("/")
+        if name.endswith(".git"):
+            name = name[:-4]
+        if parts.scheme != "https" or "/" in name or not self._NAME.fullmatch(name):
+            raise CheckoutRejectedError(
+                "report-mode repo_url must be https://<host>/<name>.git"
+            )
+        source = self._root / name
+        if not source.is_dir():
+            raise CheckoutError(f"no local repository directory for {repo_url!r}")
+        return source
+
+    def checkout(self, repo_url: str, commit_sha: str) -> Path:
+        return self.checkout_pinned(repo_url, commit_sha, "")
+
+    def checkout_pinned(self, repo_url: str, commit_sha: str, tree_sha: str) -> Path:
+        source = self._source(repo_url)
+        if (source / ".git").exists():
+            for ref, expected, what in (
+                ("HEAD^{commit}", commit_sha, "commit"),
+                ("HEAD^{tree}", tree_sha, "tree"),
+            ):
+                if not expected:
+                    continue
+                actual = subprocess.run(
+                    [self._git, "-C", str(source), "rev-parse", ref],
+                    check=True, capture_output=True, text=True, timeout=60,
+                ).stdout.strip()
+                if actual != expected:
+                    raise CheckoutRejectedError(
+                        f"{what} pin {expected} does not match the repository HEAD {actual}"
+                    )
+        target = Path(tempfile.mkdtemp(prefix="vidaio-next-checkout-", dir=self._scratch))
+        checkout = target / "repo"
+        shutil.copytree(source, checkout, ignore=shutil.ignore_patterns(".git"))
+        return checkout
+
+    def release(self, checkout: str | Path) -> None:
+        path = Path(checkout).resolve()
+        if self._scratch.resolve() in path.parents:
+            shutil.rmtree(path.parent, ignore_errors=True)
+
+
 class GitRepoProvider:
     """Create-only HTTPS Git provider for independently pinned submissions.
 
@@ -133,7 +197,20 @@ class GitRepoProvider:
         max_checkout_bytes: int = 512 * 1024 * 1024,
         max_log_bytes: int = 1024 * 1024,
         poll_seconds: float = 0.1,
+        host_credentials: Mapping[str, tuple[str, str]] | None = None,
     ) -> None:
+        #: Optional per-host ``(username, read-only token)`` overriding the default
+        #: pair, so the operator's own baseline host and a public forge can each get
+        #: exactly their own credential (a token is only ever sent to its own host).
+        self._host_credentials: dict[str, tuple[str, str]] = {}
+        for host, (host_user, host_token) in (host_credentials or {}).items():
+            for what, value in (("username", host_user), ("token", host_token)):
+                if not value or "\x00" in value or "\n" in value:
+                    raise ValueError(
+                        f"Git host credential {what} for {host!r} must be non-empty "
+                        "and single-line"
+                    )
+            self._host_credentials[host.strip().lower()] = (host_user, host_token)
         if not read_only_token or "\x00" in read_only_token or "\n" in read_only_token:
             raise ValueError("read_only_token must be non-empty and single-line")
         if not username or "\x00" in username or "\n" in username:
@@ -190,7 +267,7 @@ class GitRepoProvider:
             encoding="utf-8",
         )
         askpass.chmod(0o700)
-        env = self._git_env(askpass)
+        env = self._git_env(askpass, host=(urlsplit(repo_url).hostname or "").lower())
         try:
             self._run_git(
                 ["init", "--quiet", str(checkout)],
@@ -363,7 +440,10 @@ class GitRepoProvider:
                 f"host/port with no query or fragment (allowed: {sorted(self._allowed_hosts)})"
             )
 
-    def _git_env(self, askpass: Path) -> dict[str, str]:
+    def _git_env(self, askpass: Path, *, host: str = "") -> dict[str, str]:
+        username, token = self._host_credentials.get(
+            host, (self._username, self._token)
+        )
         env = {name: os.environ[name] for name in _ENV_ALLOWLIST if name in os.environ}
         env.update(
             {
@@ -376,8 +456,8 @@ class GitRepoProvider:
                 "GIT_ASKPASS_REQUIRE": "force",
                 "GIT_ALLOW_PROTOCOL": "https",
                 "GIT_CEILING_DIRECTORIES": str(self._root.resolve()),
-                "VIDAIO_NEXT_GIT_USERNAME": self._username,
-                "VIDAIO_NEXT_GIT_TOKEN": self._token,
+                "VIDAIO_NEXT_GIT_USERNAME": username,
+                "VIDAIO_NEXT_GIT_TOKEN": token,
             }
         )
         return env

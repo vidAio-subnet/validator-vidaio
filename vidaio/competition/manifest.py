@@ -94,6 +94,58 @@ class ArchivedBaseline(BaseModel):
         return data
 
 
+class ResultRules(BaseModel):
+    """Per-competition result rules, fixed by the digest anchored before enrollment.
+
+    * ``crown_margin`` — inclusive relative improvement over the rerun baseline that
+      turns the result into a CROWN (the protocol default applies when the whole block
+      is absent).
+    * ``crown_min_score`` — optional absolute mean score the winner must also reach to
+      CROWN. Operators raise the bar between competitions with this value (for example
+      the previous winning score) instead of any mutable baseline state.
+    * ``podium_min_margin`` / ``podium_min_score`` — optional inclusive conditions a
+      contender must meet to hold a paid rank. A place nobody qualifies for is not
+      reassigned.
+
+    The block is public with the manifest before anyone enrolls and identical for every
+    contender; nothing here can name or favour an identity.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    crown_margin: float = Field(gt=0, le=10, allow_inf_nan=False)
+    crown_min_score: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
+    podium_min_margin: float | None = Field(
+        default=None, ge=-1, le=10, allow_inf_nan=False
+    )
+    podium_min_score: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def _ordered(self) -> "ResultRules":
+        if (
+            self.podium_min_margin is not None
+            and self.podium_min_margin > self.crown_margin
+        ):
+            raise ValueError("podium_min_margin cannot exceed crown_margin")
+        return self
+
+
+class SandboxResources(BaseModel):
+    """Compute every contender gets for this competition (identical for all).
+
+    ``batch_timeout_seconds`` bounds ONE sandbox batch, i.e. ``evaluation_batch_size``
+    items; with a batch size of one it is the per-item time budget. The block is part
+    of the anchored digest, so contenders know the exact envelope before they enroll.
+    Absent = the operator's process-wide defaults.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    cpu: float = Field(gt=0, le=64, allow_inf_nan=False)
+    memory_mb: int = Field(ge=256, le=262144)
+    batch_timeout_seconds: int = Field(ge=60, le=21600)
+
+
 class EvaluationBatchSizeBounds(BaseModel):
     """Items per sandbox batch (comp-01: 1-5)."""
 
@@ -158,6 +210,11 @@ class CompetitionManifest(BaseModel):
     container_size_limit_gb: float = Field(gt=0)
     scoring_version: str = Field(min_length=1)
     baseline: ArchivedBaseline | None = None
+    #: Optional per-competition crown/podium conditions. Omitted from canonical JSON
+    #: when absent so every previously anchored digest is unchanged.
+    result_rules: ResultRules | None = None
+    #: Optional per-competition sandbox compute envelope (omitted when absent).
+    sandbox_resources: SandboxResources | None = None
 
     @field_validator("start_time", "enrollment_deadline", "finalization_time", "end_time")
     @classmethod
@@ -223,13 +280,15 @@ class CompetitionManifest(BaseModel):
                 raise ValueError(
                     "upscaling manifest requires precommitted evaluation items"
                 )
-        elif (
-            self.allowed_upscale_factors is not None
-            or self.evaluation_item_commitments is not None
+        elif self.allowed_upscale_factors is not None:
+            raise ValueError(
+                "allowed_upscale_factors is valid only for the upscaling track"
+            )
+        elif self.evaluation_item_commitments is not None and not (
+            self.evaluation_item_commitments
         ):
             raise ValueError(
-                "upscaling factor/item commitments are valid only for the "
-                "upscaling track"
+                "evaluation_item_commitments must be omitted or non-empty"
             )
         return self
 
@@ -241,7 +300,12 @@ class CompetitionManifest(BaseModel):
         # Backward-compatible digest fence: these fields did not exist in the v1
         # compression manifest.  An absent value must not rewrite an anchored digest
         # merely because newer code loaded the old JSON.
-        for field in ("allowed_upscale_factors", "evaluation_item_commitments"):
+        for field in (
+            "allowed_upscale_factors",
+            "evaluation_item_commitments",
+            "result_rules",
+            "sandbox_resources",
+        ):
             if payload[field] is None:
                 del payload[field]
         return json.dumps(
@@ -283,6 +347,31 @@ def validate_against_config(manifest: CompetitionManifest, cfg: CompetitionConfi
             f"evaluation_batch_size.max {manifest.evaluation_batch_size.max} exceeds "
             f"max {cfg.evaluation_batch_size_max}"
         )
+    if (
+        cfg.require_item_commitments
+        and manifest.track == "compression"
+        and not manifest.evaluation_item_commitments
+    ):
+        raise ManifestBoundsError(
+            "compression manifests must precommit their hidden items "
+            "(evaluation_item_commitments); competition.require_item_commitments is on"
+        )
+    if manifest.sandbox_resources is not None:
+        res = manifest.sandbox_resources
+        if res.cpu > cfg.sandbox_cpu_max:
+            raise ManifestBoundsError(
+                f"sandbox_resources.cpu {res.cpu} exceeds max {cfg.sandbox_cpu_max}"
+            )
+        if res.memory_mb > cfg.sandbox_memory_mb_max:
+            raise ManifestBoundsError(
+                f"sandbox_resources.memory_mb {res.memory_mb} exceeds max "
+                f"{cfg.sandbox_memory_mb_max}"
+            )
+        if res.batch_timeout_seconds > cfg.sandbox_batch_timeout_seconds_max:
+            raise ManifestBoundsError(
+                f"sandbox_resources.batch_timeout_seconds {res.batch_timeout_seconds} "
+                f"exceeds max {cfg.sandbox_batch_timeout_seconds_max}"
+            )
     if manifest.minimum_alpha_stake < cfg.minimum_alpha_stake_min:
         raise ManifestBoundsError(
             f"minimum_alpha_stake {manifest.minimum_alpha_stake} below "

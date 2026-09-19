@@ -1,0 +1,4 @@
+CODEC=x264
+CRF=23
+PRESET=veryfast
+MODE=fixed

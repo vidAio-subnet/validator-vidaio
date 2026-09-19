@@ -17,7 +17,7 @@ from typing import Mapping
 
 from vidaio.epoch.log import CompetitionInput
 from vidaio.tokenomics.rank_curve import dedup_ip_key
-from vidaio.tokenomics.state import CompetitionResult, ContenderResult
+from vidaio.tokenomics.state import CompetitionResult, CompetitionRules, ContenderResult
 
 
 class CompetitionEconomicResultError(ValueError):
@@ -224,6 +224,23 @@ def _v14_result_provenance(
     )
 
 
+def _competition_rules(competition: CompetitionInput) -> CompetitionRules | None:
+    committed = getattr(competition, "rules", None)
+    if committed is None:
+        return None
+    try:
+        return CompetitionRules(
+            crown_margin=committed.crown_margin,
+            crown_min_score=committed.crown_min_score,
+            podium_min_margin=committed.podium_min_margin,
+            podium_min_score=committed.podium_min_score,
+        )
+    except ValueError as exc:
+        raise CompetitionEconomicResultError(
+            f"committed competition rules are invalid: {exc}"
+        ) from exc
+
+
 def derive_competition_economics(
     competition: CompetitionInput,
     packet_scores: Mapping[str, float],
@@ -259,6 +276,10 @@ def derive_competition_economics(
         raise CompetitionEconomicResultError(
             "an economic competition requires at least one contender"
         )
+    # Every committed, non-deduplicated contender stays in the result (the epoch log
+    # binds the result to exactly that identity set). The anchored podium conditions
+    # select the PAID ranks later, in the reward-window fold.
+    rules = _competition_rules(competition)
     contenders.sort(key=lambda value: (-value.score, value.hotkey, value.uid))
     applied_at, baseline_version, baseline_artifact_digest = _v14_result_provenance(
         competition
@@ -272,6 +293,7 @@ def derive_competition_economics(
         baseline_score=baseline.score,
         baseline_version=baseline_version,
         baseline_artifact_digest=baseline_artifact_digest,
+        rules=rules,
     )
     return CompetitionEconomicDerivation(
         result=result,

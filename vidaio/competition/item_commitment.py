@@ -15,6 +15,7 @@ import re
 
 EVALUATION_ITEM_COMMITMENT_V1_DOMAIN = "vidaio.competition.evaluation-item.v1"
 EVALUATION_ITEM_COMMITMENT_DOMAIN = "vidaio.competition.evaluation-item.v2"
+COMPRESSION_ITEM_COMMITMENT_DOMAIN = "vidaio.competition.compression-item.v1"
 
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 _UPSCALE_FACTORS = frozenset({2, 4})
@@ -116,3 +117,33 @@ __all__ = [
     "evaluation_item_commitment",
     "evaluation_item_preimage",
 ]
+
+
+def compression_item_commitment(
+    *, competition_id: str, item_index: int, input_sha256: str
+) -> str:
+    """Commitment to one hidden COMPRESSION item: the exact bytes contenders receive.
+
+    A compression item's reference is its input, so the digest of those bytes plus the
+    ordered index inside the named competition is the whole preimage. The ordered list
+    lives in the manifest digest anchored before enrollment, which lets anyone prove
+    afterwards which hidden clips were evaluated and that none was swapped.
+    """
+    if not competition_id:
+        raise ValueError("competition_id must be non-empty")
+    if type(item_index) is not int or item_index < 0:
+        raise ValueError("item_index must be a non-negative integer")
+    if _SHA256_HEX.fullmatch(input_sha256) is None:
+        raise ValueError("input_sha256 must be lowercase sha256 hex")
+    preimage = json.dumps(
+        {
+            "competition_id": competition_id,
+            "domain": COMPRESSION_ITEM_COMMITMENT_DOMAIN,
+            "input_sha256": input_sha256,
+            "item_index": item_index,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return hashlib.sha256(preimage).hexdigest()

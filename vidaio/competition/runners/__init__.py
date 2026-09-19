@@ -40,6 +40,7 @@ from vidaio.competition.runners.repo import (
     PinnedRepoProvider,
     ReleasableRepoProvider,
     RepoProvider,
+    DirectoryRepoProvider,
     checkout_pinned,
     release_checkout,
 )
@@ -53,6 +54,7 @@ __all__ = [
     "RepoProvider",
     "PinnedRepoProvider",
     "ReleasableRepoProvider",
+    "DirectoryRepoProvider",
     "checkout_pinned",
     "release_checkout",
     "LocalRepoProvider",

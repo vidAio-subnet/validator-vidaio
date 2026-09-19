@@ -21,7 +21,10 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from vidaio.core.db import apply_migrations
 from vidaio.competition.manifest import ArchivedBaseline, CompetitionManifest
-from vidaio.competition.item_commitment import evaluation_item_commitment
+from vidaio.competition.item_commitment import (
+    compression_item_commitment,
+    evaluation_item_commitment,
+)
 from vidaio.competition.states import Phase, RUNNING_PHASES
 
 MIGRATIONS_DIR = Path(__file__).parent / "migrations"
@@ -449,13 +452,37 @@ def add_evaluation_item(
             upscale_factor is not None
             or target_width is not None
             or target_height is not None
-            or item_commitment is not None
         ):
             raise ValueError(
-                "compression evaluation items cannot carry upscaling "
-                "factor/geometry/commitment"
+                "compression evaluation items cannot carry upscaling factor/geometry"
             )
-        derived_commitment = None
+        committed = manifest.evaluation_item_commitments
+        if committed is None:
+            if item_commitment is not None:
+                raise ValueError(
+                    "this compression manifest precommits no items; an item "
+                    "commitment cannot be supplied"
+                )
+            derived_commitment = None
+        else:
+            if item_index >= len(committed):
+                raise ValueError(
+                    f"item_index {item_index} has no precommitted manifest entry"
+                )
+            derived_commitment = compression_item_commitment(
+                competition_id=competition_id,
+                item_index=item_index,
+                input_sha256=input_sha256,
+            )
+            if derived_commitment != committed[item_index]:
+                raise ValueError(
+                    "compression evaluation item bytes do not match the manifest "
+                    f"commitment for index {item_index}"
+                )
+            if item_commitment is not None and item_commitment != derived_commitment:
+                raise ValueError(
+                    "caller-supplied item_commitment disagrees with the canonical preimage"
+                )
     else:
         if reference_sha256 is None or reference_bytes is None:
             raise ValueError(
@@ -664,17 +691,42 @@ def validate_evaluation_item_bindings(
                 )
         return rows
 
-    for row in rows:
+    committed = manifest.evaluation_item_commitments
+    if committed is not None and len(rows) != len(committed):
+        raise EvaluationItemBindingError(
+            f"compression item matrix has {len(rows)} row(s), but the manifest "
+            f"commits {len(committed)}"
+        )
+    for expected_index, row in enumerate(rows):
         if (
             row["reference_sha256"] != row["input_sha256"]
             or row["reference_bytes"] != row["input_bytes"]
             or row["upscale_factor"] is not None
             or row["target_width"] is not None
             or row["target_height"] is not None
-            or row["item_commitment"] is not None
         ):
             raise EvaluationItemBindingError(
                 f"compression item {row['item_index']} is not normalized to reference=input"
+            )
+        if committed is None:
+            if row["item_commitment"] is not None:
+                raise EvaluationItemBindingError(
+                    f"compression item {row['item_index']} carries a commitment the "
+                    "manifest never made"
+                )
+            continue
+        if int(row["item_index"]) != expected_index:
+            raise EvaluationItemBindingError(
+                f"compression item order skips/reorders index {expected_index}"
+            )
+        derived = compression_item_commitment(
+            competition_id=competition_id,
+            item_index=expected_index,
+            input_sha256=str(row["input_sha256"]),
+        )
+        if row["item_commitment"] != derived or committed[expected_index] != derived:
+            raise EvaluationItemBindingError(
+                f"compression item {expected_index} does not match its manifest commitment"
             )
     return rows
 

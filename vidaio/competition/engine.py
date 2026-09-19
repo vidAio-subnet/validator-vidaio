@@ -756,6 +756,33 @@ class LifecycleEngine:
         table are allowed: SCHEDULED, VALIDATING, BUILDING)."""
         return self._apply(conn, competition_id, Phase.FAILED, now, reason=reason)
 
+    def abort(
+        self,
+        conn: sqlite3.Connection,
+        competition_id: str,
+        now: datetime,
+        *,
+        operator: str,
+        reason: str,
+    ) -> Phase:
+        """Operator abort from any non-terminal phase; returns the terminal phase.
+
+        ENROLLING uses the spec's CANCELLED edge, every other live phase FAILS. The
+        operator and reason are persisted on the append-only transition event.
+        """
+        comp = repo.get_competition(conn, competition_id)
+        if comp is None:
+            raise IllegalTransition(
+                competition_id, None, Phase.FAILED, None, "unknown competition"
+            )
+        target = Phase.CANCELLED if comp.status is Phase.ENROLLING else Phase.FAILED
+        text = f"operator abort by {operator.strip()}: {reason.strip()}"
+        self._apply(
+            conn, competition_id, target, now, reason=text,
+            payload={"operator": operator.strip(), "abort_reason": reason.strip()},
+        )
+        return target
+
     def cancel(
         self, conn: sqlite3.Connection, competition_id: str, now: datetime, reason: str
     ) -> bool:

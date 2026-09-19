@@ -587,7 +587,7 @@ class GoldenWorld:
         }
 
 
-def build_golden_world(root: Path) -> GoldenWorld:
+def build_golden_world(root: Path, *, manifest_overrides: dict | None = None) -> GoldenWorld:
     scoring_config = ScoringConfig()
     challenge_config = ChallengeConfig()
     tokenomics_config = TokenomicsConfig()
@@ -598,7 +598,7 @@ def build_golden_world(root: Path) -> GoldenWorld:
         # refuses a plaintext holdout at rest unless the config says so explicitly.
         allow_plaintext_holdout=True,
     )
-    manifest = build_manifest()
+    manifest = build_manifest(**(manifest_overrides or {}))
     store = make_store(audit_config)
     baseline_archive_ref = store.put(
         BASELINE_ARCHIVE_BYTES, ArtifactKind.SUBMISSION_ARCHIVE

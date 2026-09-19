@@ -291,3 +291,67 @@ def test_docker_build_releases_checkout_after_build_context_is_consumed(
         "docker-tag",
         "release",
     ]
+
+
+def test_per_host_credentials_are_sent_only_to_their_host(tmp_path):
+    from vidaio.competition.runners.repo import GitRepoProvider
+
+    provider = GitRepoProvider(
+        scratch_root=tmp_path / "scratch",
+        read_only_token="default-token",
+        username="default-user",
+        allowed_hosts=("github.com", "git.example.org"),
+        host_credentials={"GitHub.com": ("x-access-token", "forge-token")},
+    )
+    askpass = tmp_path / "askpass.sh"
+    forge = provider._git_env(askpass, host="github.com")
+    other = provider._git_env(askpass, host="git.example.org")
+    assert forge["VIDAIO_NEXT_GIT_TOKEN"] == "forge-token"
+    assert forge["VIDAIO_NEXT_GIT_USERNAME"] == "x-access-token"
+    assert other["VIDAIO_NEXT_GIT_TOKEN"] == "default-token"
+    assert other["VIDAIO_NEXT_GIT_USERNAME"] == "default-user"
+
+    import pytest
+
+    with pytest.raises(ValueError):
+        GitRepoProvider(
+            scratch_root=tmp_path / "bad",
+            read_only_token="t",
+            host_credentials={"github.com": ("u", "")},
+        )
+
+
+def test_directory_provider_maps_https_names_and_verifies_pins(tmp_path):
+    import subprocess
+
+    import pytest
+
+    from vidaio.competition.runners.errors import CheckoutError, CheckoutRejectedError
+    from vidaio.competition.runners.repo import DirectoryRepoProvider
+
+    root = tmp_path / "repos"
+    repo = root / "solution-a"
+    repo.mkdir(parents=True)
+    (repo / "Dockerfile").write_text("FROM scratch\n")
+    env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+           "GIT_COMMITTER_EMAIL": "t@t", "PATH": __import__("os").environ["PATH"]}
+    for args in (["init", "-q"], ["add", "-A"], ["commit", "-qm", "x"]):
+        subprocess.run(["git", "-C", str(repo), *args], check=True, env=env)
+    commit = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
+                            capture_output=True, text=True).stdout.strip()
+    tree = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD^{tree}"], check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+    provider = DirectoryRepoProvider(root, scratch_root=tmp_path / "scratch")
+    checkout = provider.checkout_pinned("https://rehearsal.local/solution-a.git", commit, tree)
+    assert (checkout / "Dockerfile").is_file() and not (checkout / ".git").exists()
+    provider.release(checkout)
+    assert not checkout.exists()
+    with pytest.raises(CheckoutRejectedError, match="does not match"):
+        provider.checkout_pinned("https://rehearsal.local/solution-a.git", "0" * 40, tree)
+    with pytest.raises(CheckoutError):
+        provider.checkout_pinned("https://rehearsal.local/missing.git", commit, tree)
+    for bad in ("http://rehearsal.local/solution-a.git", "https://rehearsal.local/a/b.git",
+                "https://rehearsal.local/..%2Fx.git"):
+        with pytest.raises((CheckoutRejectedError, CheckoutError)):
+            provider.checkout_pinned(bad, commit, tree)

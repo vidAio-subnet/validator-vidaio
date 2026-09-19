@@ -59,6 +59,13 @@ TRANSITIONS: dict[tuple[Phase, Phase], str] = {
     (Phase.VALIDATING, Phase.FAILED): "no_accepted_contender",
     (Phase.BUILDING, Phase.FAILED): "all_builds_failed",
     (Phase.ENROLLING, Phase.CANCELLED): "cancelled_during_enrollment",
+    # Audited operator abort: a competition that cannot make progress must never
+    # keep the single running slot. A FAILED competition produces no economic
+    # evidence (only COMPLETED ones do), so an abort can never move emissions.
+    (Phase.FINALIZING_SUBMISSIONS, Phase.FAILED): "operator_abort",
+    (Phase.EVALUATING, Phase.FAILED): "operator_abort",
+    (Phase.SCORING, Phase.FAILED): "operator_abort",
+    (Phase.AWAITING_END_TIME, Phase.FAILED): "operator_abort",
 }
 
 

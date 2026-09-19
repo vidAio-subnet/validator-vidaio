@@ -76,10 +76,12 @@ def test_reward_parameter_digest_binds_result_window_duration() -> None:
 
 
 def test_inference_floor_preserves_pre_v17_competition_policy_digest() -> None:
-    # These are the deployed policy bytes' digests before the new config field.
+    # These are the deployed policy bytes' digests before the new config field
+    # (re-pinned 2026-09-15 when minimum_payout_score moved from 0.10 to 0.05; the
+    # alpha-stake floor must still not move them).
     for enabled, digest in (
-        (False, "0447462af3091e51b0b46aaab6367aae25ff66e42c52b102135389ccec05f28c"),
-        (True, "65b4104e973e550d598f2a693b5660134f27e607f0780e8c88467f0cd1e3172e"),
+        (False, "a9e5711446ec8bc529e8f736d0b752d2ec92eb93a14489937ef5670b617042ac"),
+        (True, "df6aa2749c4ce74f99ab9148d9a55bcc14eec07be7d927b5bce0e72e7e196e5a"),
     ):
         for floor in (0.0, 50.0, 100.0):
             config = TokenomicsConfig(

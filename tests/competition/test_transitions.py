@@ -16,7 +16,7 @@ ILLEGAL_EDGES = [
 
 
 def test_transition_table_matches_spec_diagram() -> None:
-    assert len(TRANSITIONS) == 12
+    assert len(TRANSITIONS) == 16  # 12 spec edges + 4 audited operator-abort edges
     assert is_allowed(Phase.SCHEDULED, Phase.ENROLLING)
     assert is_allowed(Phase.SCHEDULED, Phase.FAILED)
     assert is_allowed(Phase.VALIDATING, Phase.FAILED)

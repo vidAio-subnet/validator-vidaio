@@ -560,6 +560,17 @@ digest drift, or proceed after a failed reprobe.
 
 ## Status & gaps
 
+- [DONE] Per-competition `result_rules` and `sandbox_resources` in the anchored manifest;
+  committed compression items (`evaluation_item_commitments`, mandatory in production);
+  public self-signed enrollment (`orchestrator/public_api.py`); operator abort; a
+  renewable sandbox runtime that exists only while a competition builds or evaluates
+  (`runners/renewable.py`); deferred (never epoch-holding) application of a result whose
+  evidence is incomplete (`evidence_guard.py`). Operator guide:
+  [docs/COMPETITIONS.md](../../docs/COMPETITIONS.md).
+- [KNOWN LIMIT] `scoring_factors`, `use_worst_decile` and `sealed_vmaf_variants` shape
+  only the non-earning operational ranking; emissions follow the plain packet mean and
+  every item is scored at the manifest's single `vmaf_threshold`.
+
 - [DONE] Manifest, state machine + guards, schema, packet-bound persistence,
   review chain + re-ranking, orchestrator (control API, anchor claim, fault
   classification, zero packets, resumability), DockerSandboxRunner, safeio,

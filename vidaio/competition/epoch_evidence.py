@@ -41,13 +41,14 @@ from vidaio.competition.orchestrator.persistence import (
 from vidaio.competition.orchestrator.results import competition_cycle, completed_at
 from vidaio.competition.states import Phase
 from vidaio.epoch.log import (
+    CompetitionRulesInput,
     CompetitionAuditItem,
     CompetitionAuditSubject,
     CompetitionInput,
     MinerCensusEntry,
 )
 from vidaio.scoring.result import ItemScore
-from vidaio.tokenomics.breakthrough import qualifies_for_crown
+from vidaio.tokenomics.breakthrough import qualifies_for_crown, winner
 from vidaio.tokenomics.state import CompetitionResult
 from vidaio.tokenomics.config import TokenomicsConfig
 
@@ -866,24 +867,34 @@ def build_competition_epoch_evidence(
         baseline_execution_image_digest=manifest.baseline.image_digest,
         baseline_provenance_digest=manifest.baseline.provenance_digest,
         baseline_provenance_bytes=manifest.baseline.provenance_bytes,
+        rules=(
+            None
+            if manifest.result_rules is None
+            else CompetitionRulesInput(**manifest.result_rules.model_dump())
+        ),
         items=audit_items,
         subjects=tuple(subjects),
     )
     result = derive_competition_result(competition_input, packet_scores)
+    best = winner(result)
+    if best is None:
+        # Nobody met the anchored podium conditions: there is no economic result to
+        # apply, the predecessor reward window simply continues.
+        return None
     if (
         tokenomics is not None
-        and result.contenders
         and qualifies_for_crown(
             tokenomics,
             result.baseline_score,
-            result.contenders[0].score,
+            best.score,
+            result.rules,
         )
     ):
         # CROWN is the disclosure boundary: the exact winning source archive must
         # become publicly readable before an epoch can commit the earning result.
         # Selection uses the same packet-derived result and inclusive Decimal gate
         # as the reward-window fold; no database ranking/review field participates.
-        winner_hotkey = result.contenders[0].hotkey
+        winner_hotkey = best.hotkey
         winner_record = next(
             (
                 record

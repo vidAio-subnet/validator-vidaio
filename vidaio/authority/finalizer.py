@@ -29,7 +29,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Callable, Iterable, Mapping, Protocol, Sequence
+from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -967,6 +967,18 @@ class EpochFinalizer:
             )
 
     # `_require_complete_window` remains removed with the retired retention multiplier.
+
+    def dry_run(self, *, public_store: "_PublicReleaseStore | None" = None, **kwargs: Any) -> EpochLog:
+        """Every check ``finalize`` performs BEFORE its first write, and no write.
+
+        Used to decide whether an optional competition result can be applied in this
+        epoch: a log that would be refused (or a CROWN whose winner archive is not yet
+        publicly readable) is discovered here, while the epoch can still be finalized
+        without that result.
+        """
+        log = self.build_log(**kwargs)
+        self._require_public_crown_winner(log, public_store)
+        return log
 
     def finalize(
         self,

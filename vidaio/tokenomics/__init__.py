@@ -7,6 +7,8 @@ from vidaio.tokenomics.breakthrough import (
     emission_shares,
     podium_hotkey_shares,
     qualifies_for_crown,
+    podium_contenders,
+    qualifies_for_podium,
     resolve_reward_window,
     window_active,
     winner,
@@ -22,6 +24,7 @@ from vidaio.tokenomics.rank_curve import (
 )
 from vidaio.tokenomics.state import (
     CompetitionResult,
+    CompetitionRules,
     ContenderResult,
     EmissionShares,
     EmissionState,
@@ -39,6 +42,7 @@ __all__ = [
     "MinerSnapshot",
     "ContenderResult",
     "CompetitionResult",
+    "CompetitionRules",
     "EmissionState",
     "EmissionShares",
     "RewardWindowState",
@@ -56,6 +60,8 @@ __all__ = [
     "PODIUM_SPLIT",
     "contender_margin",
     "qualifies_for_crown",
+    "podium_contenders",
+    "qualifies_for_podium",
     "winner",
     "resolve_reward_window",
     "window_active",

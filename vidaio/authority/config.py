@@ -15,6 +15,7 @@ service code as production — only the store/adapter implementations swap.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -77,6 +78,16 @@ class AuthorityConfig(BaseModel):
     #: hashes which no longer identify a pending submission.
     #: Env: VIDAIO__AUTHORITY__ANCHOR_SUBMISSION_ACK.
     anchor_submission_ack: str | None = Field(default=None, pattern=r"^0x[0-9a-f]{64}$")
+    # -- competition evidence safety ---------------------------------------------
+    #: What the finalizer does when a COMPLETED competition cannot produce complete,
+    #: auditable evidence at an epoch close. ``defer`` (default): the result is not
+    #: applied, the epoch finalizes on the predecessor reward window, the same result
+    #: is retried next epoch, and a CRITICAL log + counter fire. ``hold``: fail closed
+    #: and HOLD the whole epoch (no weight update for anyone) until it is repaired.
+    competition_evidence_failure_policy: Literal["defer", "hold"] = "defer"
+    #: Operator-declared competition ids whose results must never be applied.
+    #: Env: VIDAIO__AUTHORITY__COMPETITION_QUARANTINE='["<competition-id>"]'.
+    competition_quarantine: tuple[str, ...] = ()
 
     @field_validator("anchor_submission_ack", mode="before")
     @classmethod

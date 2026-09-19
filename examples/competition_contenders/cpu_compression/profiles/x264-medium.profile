@@ -1,0 +1,4 @@
+CODEC=x264
+CRF=27
+PRESET=medium
+MODE=fixed

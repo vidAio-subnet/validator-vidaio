@@ -1666,7 +1666,15 @@ class ModalSdkRuntime:
         app_name: str,
         run_label: str,
         confirmation: str,
+        create_environment: bool = False,
     ) -> ModalSdkRuntime:
+        """Create the fresh App (and, when asked, its fresh Environment) — create-only.
+
+        ``create_environment=True`` is how an in-process generation stays self-sufficient:
+        Modal does not create an Environment implicitly, and an operator cannot pre-create
+        names that are minted at runtime. Creation is create-only as well: a name that
+        already exists is a collision and refuses, it is never adopted.
+        """
         environment_name = _validate_resource_name(
             environment_name, what="fresh Modal Environment name"
         )
@@ -1683,6 +1691,21 @@ class ModalSdkRuntime:
                 f"confirmation {FRESH_CREATION_CONFIRMATION!r}"
             )
         modal = importlib.import_module("modal")
+        if create_environment:
+            try:
+                importlib.import_module("modal.environments").create_environment(
+                    environment_name
+                )
+            except Exception as exc:
+                raise RunnerUnavailableError(
+                    f"could not create fresh Modal Environment {environment_name!r}; "
+                    "mint new names, never adopt an existing Environment: "
+                    f"{_modal_error_text(exc)}"
+                ) from exc
+            logger.info(
+                "fresh Modal Environment created",
+                extra=log_fields(environment=environment_name, run_label=run_label),
+            )
         self = object.__new__(cls)
         self.run_label = run_label
         self._modal = modal

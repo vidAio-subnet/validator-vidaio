@@ -1051,3 +1051,69 @@ def test_modal_adapter_source_has_no_inventory_discovery_or_sandbox_restore():
     assert "secrets=[]" in source
     assert "volumes={}" in source
     assert "gpu=None" in source  # collector/build; contender GPU is configured
+
+
+def test_generation_runtime_creates_its_environment_create_only(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Names minted at runtime cannot be pre-created by an operator: the runtime creates
+    the Environment itself, and an existing name is a collision, never adopted."""
+    import vidaio.competition.runners.modal_runner as modal_runner_module
+
+    events: list[str] = []
+
+    class FakeContext:
+        def __enter__(self):
+            events.append("enter")
+
+        def __exit__(self, *_):
+            events.append("exit")
+
+    class FakeApp:
+        def __init__(self, name, *, tags):
+            events.append(f"app:{name}")
+
+        def run(self, **kwargs):
+            events.append(f"run:{kwargs['environment_name']}")
+            return FakeContext()
+
+    class FakeModal:
+        App = FakeApp
+
+    class FakeEnvironments:
+        existing: set[str] = set()
+
+        @classmethod
+        def create_environment(cls, name):
+            if name in cls.existing:
+                raise RuntimeError("Environment already exists")
+            cls.existing.add(name)
+            events.append(f"env:{name}")
+
+    real_import = modal_runner_module.importlib.import_module
+    fakes = {"modal": FakeModal, "modal.environments": FakeEnvironments}
+    monkeypatch.setattr(
+        modal_runner_module.importlib,
+        "import_module",
+        lambda name: fakes[name] if name in fakes else real_import(name),
+    )
+    names = dict(
+        environment_name="vidaio-next-env-g001-0919T000000",
+        app_name="vidaio-next-app-g001-0919T000000",
+        run_label="vidaio-next-run-g001-0919T000000",
+        confirmation=FRESH_CREATION_CONFIRMATION,
+    )
+    runtime = ModalSdkRuntime.start_fresh(create_environment=True, **names)
+    assert runtime.available()
+    assert events[0] == "env:vidaio-next-env-g001-0919T000000"  # before any App call
+    assert events[1:] == [
+        "app:vidaio-next-app-g001-0919T000000",
+        "run:vidaio-next-env-g001-0919T000000",
+        "enter",
+    ]
+    with pytest.raises(RunnerUnavailableError, match="never adopt an existing Environment"):
+        ModalSdkRuntime.start_fresh(create_environment=True, **names)
+
+    events.clear()
+    ModalSdkRuntime.start_fresh(**{**names, "environment_name": "vidaio-next-env-operator-made"})
+    assert not any(event.startswith("env:") for event in events)  # default: operator-created

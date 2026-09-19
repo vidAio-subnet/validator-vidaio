@@ -386,3 +386,14 @@ Notable tests:
   CPU pipeline; `StaticRecomputer` remains this module's deterministic test double.
 - `AuditConfig.retention_days` is stored config; no pruning job exists (0 =
   retain forever is the default and the intent).
+
+### Large downloads use parallel byte ranges
+
+`_RealS3Transport.get_file` fetches objects of 32 MiB or more as concurrent 16 MiB
+ranges (12 streams by default), each pinned to the HEAD's ETag with `If-Match`. A
+single TCP stream collapses to a few MB/s on a lossy path, which made reference
+release and release verification take 10+ minutes per clip; ranges restore the
+link's throughput. A reset range resumes from the bytes already written, a changed
+object is an `IntegrityError`, and callers still verify the content address.
+`VIDAIO_S3_PARALLEL_STREAMS=1` restores the single-stream read (operational switch,
+clamped to 1-32).

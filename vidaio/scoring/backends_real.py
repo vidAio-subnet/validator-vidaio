@@ -73,6 +73,11 @@ import threading
 from pathlib import Path
 from typing import Any, Callable, Iterator, Literal, Sequence
 
+from vidaio.scoring.media_inputs import (
+    TRUSTED_DEMUXERS as TRUSTED_DEMUXERS,
+    UNTRUSTED_INPUT_ARGS,
+    harden_media_inputs,
+)
 from vidaio.scoring.backends import MediaInfo, PerceptualCheckResult
 from vidaio.scoring.perceptual_cpu import (
     CPU_PERCEPTUAL_ALGORITHM_VERSION,
@@ -566,6 +571,7 @@ class FfprobeBackend:
             "json",
             "-show_format",
             "-show_streams",
+            *UNTRUSTED_INPUT_ARGS,
             path,
         ]
         completed = _run(argv, timeout=self._timeout)
@@ -625,6 +631,7 @@ class FfprobeBackend:
             "stream=nb_read_frames",
             "-print_format",
             "json",
+            *UNTRUSTED_INPUT_ARGS,
             path,
         ]
         completed = _run(argv, timeout=self._timeout)
@@ -759,8 +766,10 @@ class FfmpegVmafBackend:
             "-loglevel",
             "error",
             "-nostdin",
+            *UNTRUSTED_INPUT_ARGS,
             "-i",
             candidate,
+            *UNTRUSTED_INPUT_ARGS,
             "-i",
             reference,
             "-filter_complex",
@@ -864,7 +873,9 @@ class CanonicalizeExecutor:
     ) -> None:
         if not plan:
             raise CanonicalizationError("empty canonicalization plan", argv=plan)
-        argv = list(plan)
+        # The PLAN (and its committed digest) is unchanged; only the process that runs
+        # is pinned to self-contained containers and local files.
+        argv = harden_media_inputs(plan)
         if argv[0] == "ffmpeg":
             argv[0] = self._ffmpeg
         limit: tuple[str, int] | None = None

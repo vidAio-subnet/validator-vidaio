@@ -7,6 +7,8 @@ import math
 import subprocess
 from pathlib import Path
 
+from vidaio.scoring.media_inputs import UNTRUSTED_INPUT_ARGS
+
 CPU_VIDEO_PHASH_VERSION = "cpu-video-phash/1"
 # ffmpeg's global ``-max_alloc`` bounds any single heap allocation. 64 MiB is
 # ample for the canonical 32x32 output and normal source frames while refusing
@@ -71,6 +73,7 @@ class CpuVideoPhash:
             "1",
             "-filter_complex_threads",
             "1",
+            *UNTRUSTED_INPUT_ARGS,
             "-i",
             str(source),
             "-map",
@@ -137,6 +140,7 @@ class CpuVideoPhash:
             "stream=duration:format=duration",
             "-of",
             "json",
+            *UNTRUSTED_INPUT_ARGS,
             str(path),
         ]
         try:

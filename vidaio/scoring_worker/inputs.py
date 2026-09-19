@@ -95,6 +95,7 @@ from __future__ import annotations
 import errno
 import hashlib
 import math
+import contextlib
 import os
 import re
 import shutil
@@ -738,9 +739,13 @@ def snapshot_input(
     the reservation is taken before the first byte is written, and the copy loop
     stops the instant it would exceed that reservation.
     """
+    # One private directory PER input: a submission must never be able to name a
+    # sibling (the reference or the served input) by a relative path, whatever a media
+    # library decides to do with its bytes.
     dest_dir.mkdir(parents=True, exist_ok=True)
+    private_dir = dest_dir / field
     lease = lease if lease is not None else ScratchBudget().lease()
-    dest = dest_dir / f"{field}{_carried_suffix(path_text)}"
+    dest = private_dir / f"{field}{_carried_suffix(path_text)}"
     fd, size = _open_regular_file(field, path_text)
     try:
         lease.reserve(field=field, path_text=path_text, nbytes=size)
@@ -748,12 +753,18 @@ def snapshot_input(
         os.close(fd)  # refused before a single byte was copied
         raise
 
+    def _drop_private_dir() -> None:
+        with contextlib.suppress(OSError):
+            private_dir.rmdir()  # only ever removes the EMPTY directory we made
+
     try:
+        private_dir.mkdir(parents=True, exist_ok=True)
         actual, written = _hash_and_copy(fd, dest, cancelled, limit=size)
     except _CopyLimitExceeded:
         # The source GREW after its fstat: stop at the reserved ceiling rather
         # than let a writer we do not control keep extending our copy.
         _discard(dest)
+        _drop_private_dir()
         lease.refund(size)
         raise ScoreRejected(
             422,
@@ -769,6 +780,7 @@ def snapshot_input(
         raise
     except BaseException:  # cancellation, I/O error, disk full
         _discard(dest)
+        _drop_private_dir()
         lease.refund(size)
         raise
     finally:

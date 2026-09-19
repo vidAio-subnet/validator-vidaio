@@ -48,6 +48,16 @@ _CHUNK = 1 << 20
 _S3_CONNECT_TIMEOUT_SECONDS = 10
 _S3_READ_TIMEOUT_SECONDS = 30
 _S3_TOTAL_MAX_ATTEMPTS = 3
+# Large objects are fetched as concurrent byte ranges. One TCP stream collapses to
+# a few MB/s on a lossy path, which turned reference release and release
+# verification into 10+ minute steps; N ranges restore the link's throughput. The
+# bytes are still verified against their content address by every caller.
+_S3_PARALLEL_MIN_BYTES = 32 << 20
+_S3_PARALLEL_PART_BYTES = 16 << 20
+_S3_PARALLEL_STREAMS_DEFAULT = 12
+_S3_PARALLEL_STREAMS_MAX = 32
+_S3_PARALLEL_STREAMS_ENV = "VIDAIO_S3_PARALLEL_STREAMS"  # 1 = single stream
+_S3_PART_ATTEMPTS = 3
 
 
 class IntegrityError(Exception):
@@ -1403,6 +1413,17 @@ def _is_s3_precondition_failure(exc: BaseException) -> bool:
     return status == 412 or str(code) in {"412", "PreconditionFailed"}
 
 
+def _parallel_streams() -> int:
+    raw = os.environ.get(_S3_PARALLEL_STREAMS_ENV, "").strip()
+    if not raw:
+        return _S3_PARALLEL_STREAMS_DEFAULT
+    try:
+        value = int(raw)
+    except ValueError:
+        return _S3_PARALLEL_STREAMS_DEFAULT
+    return max(1, min(value, _S3_PARALLEL_STREAMS_MAX))
+
+
 class _RealS3Transport:
     """The real seam: one boto3 S3 client using atomic conditional creates.
 
@@ -1441,6 +1462,8 @@ class _RealS3Transport:
                 "mode": "standard",
                 "total_max_attempts": _S3_TOTAL_MAX_ATTEMPTS,
             },
+            # Ranged downloads hold one pooled connection per stream.
+            "max_pool_connections": _S3_PARALLEL_STREAMS_MAX + 8,
         }
         if anonymous:
             from botocore import UNSIGNED
@@ -1527,7 +1550,123 @@ class _RealS3Transport:
         finally:
             body.close()
 
-    def get_file(
+    def get_file(self, key: str, path: Path, *, max_bytes: int) -> None:
+        plan = self._ranged_plan(key, max_bytes=max_bytes)
+        if plan is not None:
+            size, etag, streams = plan
+            self._get_file_ranged(key, path, size=size, etag=etag, streams=streams)
+            return
+        self._get_file_single(key, path, max_bytes=max_bytes)
+
+    def _ranged_plan(self, key: str, *, max_bytes: int) -> tuple[int, str, int] | None:
+        """(size, etag, streams) when the object is worth fetching as ranges.
+
+        Any doubt (no HEAD, no ETag, small object, streams disabled) falls back to
+        the single-stream read, which also raises the canonical missing-object error.
+        """
+        streams = _parallel_streams()
+        if streams <= 1:
+            return None
+        try:
+            head = self._client.head_object(Bucket=self._bucket, Key=self._full(key))
+            size = int(head["ContentLength"])
+            etag = str(head.get("ETag") or "")
+        except Exception:  # noqa: BLE001 - the single-stream path reports the error
+            return None
+        if size > max_bytes:
+            raise ArtifactTooLargeError(
+                f"object {key} crossed the {max_bytes}-byte download maximum"
+            )
+        if size < _S3_PARALLEL_MIN_BYTES or not etag:
+            return None
+        return size, etag, streams
+
+    def _get_file_ranged(
+        self, key: str, path: Path, *, size: int, etag: str, streams: int
+    ) -> None:
+        from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
+
+        full = self._full(key)
+        stop = threading.Event()
+        parts = [
+            (start, min(start + _S3_PARALLEL_PART_BYTES, size) - 1)
+            for start in range(0, size, _S3_PARALLEL_PART_BYTES)
+        ]
+
+        def fetch(fd: int, start: int, end: int) -> None:
+            offset = start
+            last: BaseException | None = None
+            for _attempt in range(_S3_PART_ATTEMPTS):
+                if stop.is_set():
+                    return
+                try:
+                    # If-Match pins every range to the object the HEAD described.
+                    response = self._client.get_object(
+                        Bucket=self._bucket,
+                        Key=full,
+                        Range=f"bytes={offset}-{end}",
+                        IfMatch=etag,
+                    )
+                    body = response["Body"]
+                    try:
+                        for chunk in body.iter_chunks(chunk_size=_CHUNK):
+                            if stop.is_set():
+                                return
+                            if not chunk:
+                                continue
+                            if offset + len(chunk) > end + 1:
+                                raise IntegrityError(
+                                    f"object {key} range {start}-{end} returned too many bytes"
+                                )
+                            os.pwrite(fd, chunk, offset)
+                            offset += len(chunk)
+                    finally:
+                        body.close()
+                    if offset == end + 1:
+                        return
+                    last = IntegrityError(
+                        f"object {key} range {start}-{end} ended early at {offset}"
+                    )
+                except IntegrityError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - optional SDK error type
+                    if _is_s3_precondition_failure(exc):
+                        raise IntegrityError(
+                            f"object {key} changed while it was being downloaded"
+                        ) from exc
+                    last = exc  # resume this range from the bytes already written
+            assert last is not None
+            raise last
+
+        sink = path.open("xb")  # an existing destination is never touched
+        try:
+            with sink:
+                sink.truncate(size)
+                fd = sink.fileno()
+                with ThreadPoolExecutor(
+                    max_workers=min(streams, len(parts)),
+                    thread_name_prefix="s3-range",
+                ) as pool:
+                    futures = [pool.submit(fetch, fd, a, b) for a, b in parts]
+                    done, pending = wait(futures, return_when=FIRST_EXCEPTION)
+                    failed = next(
+                        (f for f in done if f.exception() is not None), None
+                    )
+                    if failed is not None:
+                        stop.set()
+                        for future in pending:
+                            future.cancel()
+                        wait(pending)
+                        raise failed.exception()  # type: ignore[misc]
+                sink.flush()
+                os.fsync(fd)
+        except BaseException:
+            stop.set()
+            with contextlib.suppress(FileNotFoundError, OSError):
+                path.unlink()
+            raise
+
+    def _get_file_single(
         self, key: str, path: Path, *, max_bytes: int
     ) -> None:  # pragma: no cover - needs boto3
         response = self._client.get_object(Bucket=self._bucket, Key=self._full(key))

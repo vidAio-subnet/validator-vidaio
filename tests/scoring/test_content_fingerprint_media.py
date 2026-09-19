@@ -85,9 +85,10 @@ def test_psnr_over_50_pixel_noise_survives_real_remux_and_matches(clips):
     noise_y4m.write_bytes(noisy)
     # Real raw-video encodings keep the same byte size without lying about the
     # measured encoded_size or depending on codec rate-control variation.
-    clean_nut, noisy_nut = root / "clean.nut", root / "noisy.nut"
+    # Matroska, not NUT: the scorer only opens self-contained containers miners use.
+    clean_nut, noisy_nut = root / "clean.mkv", root / "noisy.mkv"
     for path, output in ((canonical, clean_nut), (noise_y4m, noisy_nut)):
-        ffmpeg("-i", path, "-c:v", "rawvideo", "-threads", "1", output)
+        ffmpeg("-i", path, "-c:v", "rawvideo", "-allow_raw_vfw", "1", "-threads", "1", output)
     clean, _ = evidence(clean_nut)
     noisy_evidence, _ = evidence(noisy_nut)
     assert clean.canonical_content_digest != noisy_evidence.canonical_content_digest

@@ -252,7 +252,7 @@ async def test_identical_vectors_are_disambiguated_by_the_attempt_block(
     assert len(chain.anchored) == 1
 
 
-async def test_codex_probe_a_tolerance_near_later_vector_never_confirms_the_earlier_intent(
+async def test_review_probe_a_tolerance_near_later_vector_never_confirms_the_earlier_intent(
     make_setter, chain, ledger, conn, mk_miner, clock
 ):
     """Round-4 an internal review, the executable probe, verbatim.

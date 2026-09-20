@@ -311,7 +311,7 @@ def test_tampered_score_packet_fails_score_mismatch(store: LocalFsStore) -> None
     }
 
 
-def test_codex_probe_top_level_score_tampered_metrics_honest(
+def test_review_probe_top_level_score_tampered_metrics_honest(
     store: LocalFsStore,
 ) -> None:
     """review probe: metrics.final_score=0.5 (honest) but top-level score edited.
@@ -329,7 +329,7 @@ def test_codex_probe_top_level_score_tampered_metrics_honest(
     assert tampered and tampered[0].code == SCORE_MISMATCH
 
 
-def test_codex_probe_wrong_recomputer_version_fails(store: LocalFsStore) -> None:
+def test_review_probe_wrong_recomputer_version_fails(store: LocalFsStore) -> None:
     """review probe: a recomputer reporting the wrong scorer version must fail."""
     bundle = make_post_retirement_bundle(store)
     wrong_version = StaticRecomputer(HONEST_METRICS, "scoring-9.9.9")

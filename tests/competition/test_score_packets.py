@@ -66,7 +66,7 @@ def test_gate_failed_packet_persists_zero(driver: Driver) -> None:
     assert row["item_score"] == 0.0
 
 
-def test_codex_bypass_gate_failed_with_nonzero_score_is_impossible(driver: Driver) -> None:
+def test_review_bypass_gate_failed_with_nonzero_score_is_impossible(driver: Driver) -> None:
     # The integration "golden path" bypass: a gate-failed packet accompanied by a
     # freely chosen 0.35. There is no parameter to supply the score — and a packet
     # that itself violates gates-first (gate_passed=False, score=0.35) is rejected.

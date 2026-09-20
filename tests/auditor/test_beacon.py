@@ -134,7 +134,7 @@ def test_idempotent_reanchor_PAST_the_beacon_is_NOT_a_grind() -> None:
     assert _beacon(chain) == synthetic_block_hash(BEACON_BLOCK)
 
 
-def test_codex_earliest_le_beacon_is_not_a_grind_but_first_late_is_refused() -> None:
+def test_review_earliest_le_beacon_is_not_a_grind_but_first_late_is_refused() -> None:
     """an internal review reproduction (anchor blocks 19 & 22, beacon block 21).
 
     Read the inclusion block DIRECTLY off the adapter (no canonical-close gate): an idempotent

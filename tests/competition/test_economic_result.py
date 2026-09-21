@@ -200,6 +200,47 @@ def test_zero_baseline_is_preserved_for_retryable_window_failure() -> None:
     assert derivation.result.contenders[0].score == pytest.approx(0.8)
 
 
+def test_zero_baseline_result_is_payable_under_anchored_absolute_bars() -> None:
+    """The mainnet genesis baseline fails the quality gate on every hard clip. With the
+    manifest's absolute bars committed in the result, the evidence-derived result must
+    open a window (the bars decide); without them it stays the retryable no-op."""
+    from vidaio.epoch.log import CompetitionRulesInput
+    from vidaio.tokenomics import RewardWindowState, TokenomicsConfig, resolve_reward_window
+    from vidaio.tokenomics.breakthrough import winner
+    from vidaio.tokenomics.state import EmissionState
+
+    competition = _input(
+        _subject("baseline", "baseline", (70, 71)),
+        _subject("top", "contender", (72, 73), uid=4, hotkey="hk-top"),
+        _subject("low", "contender", (74, 75), uid=5, hotkey="hk-low"),
+    )
+    scores = _scores(competition, 0.0)
+    scores[_digest(72)] = scores[_digest(73)] = 0.87
+    scores[_digest(74)] = scores[_digest(75)] = 0.80
+    config = TokenomicsConfig()
+
+    plain = derive_competition_economics(competition, scores).result
+    assert resolve_reward_window(config, RewardWindowState(), plain) == RewardWindowState()
+
+    ruled = competition.model_copy(
+        update={
+            "rules": CompetitionRulesInput(
+                crown_margin=0.05,
+                crown_min_score=0.869,
+                podium_min_margin=0.0,
+                podium_min_score=0.86,
+            )
+        }
+    )
+    result = derive_competition_economics(ruled, scores).result
+    assert result.baseline_score == 0.0
+    assert winner(result).hotkey == "hk-top"
+    state = resolve_reward_window(config, RewardWindowState(), result)
+    assert state.kind is EmissionState.CROWN
+    assert state.podium_hotkeys == ("hk-top",)  # 0.80 misses the 0.86 podium bar
+    assert state.winner_margin == pytest.approx(0.87)
+
+
 def test_packet_score_coverage_must_be_exact() -> None:
     competition = _input(
         _subject("baseline", "baseline", (30, 31)),

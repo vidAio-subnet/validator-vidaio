@@ -28,7 +28,9 @@ def test_score_relative_margin_and_undefined_baseline() -> None:
     assert contender_margin(0.5, 0.525) == pytest.approx(0.05)
     assert contender_margin(0.5, 0.45) == pytest.approx(-0.10)
     assert contender_margin(None, 0.9) is None
-    assert contender_margin(0.0, 0.9) is None
+    # A baseline MEASURED at zero has no relative margin: the absolute score is recorded.
+    assert contender_margin(0.0, 0.9) == pytest.approx(0.9)
+    assert contender_margin(-0.1, 0.9) is None
 
 
 def test_crown_floor_is_inclusive_and_decimal_stable(cfg) -> None:
@@ -189,3 +191,79 @@ def test_emission_share_table_and_disabled_flag(live_cfg, mk_result) -> None:
 def test_podium_shares_leave_missing_ranks_unallocated(cfg, mk_result) -> None:
     one = resolve_reward_window(cfg, RewardWindowState(), mk_result(scores=(0.51,)))
     assert podium_hotkey_shares(one) == {"comp100": 0.70}
+
+
+# ---- baseline measured at zero: only anchored absolute bars can pay ------------------
+
+
+def _rules(**kwargs) -> "CompetitionRules":
+    from vidaio.tokenomics.state import CompetitionRules
+
+    return CompetitionRules(**{"crown_margin": 0.05, **kwargs})
+
+
+def test_zero_baseline_crown_requires_an_anchored_absolute_bar(cfg) -> None:
+    from vidaio.tokenomics.breakthrough import zero_baseline_payable
+
+    assert not qualifies_for_crown(cfg, 0.0, 0.99)
+    assert not qualifies_for_crown(cfg, 0.0, 0.99, _rules())
+    bar = _rules(crown_min_score=0.869)
+    assert not qualifies_for_crown(cfg, 0.0, 0.868999999, bar)
+    assert qualifies_for_crown(cfg, 0.0, 0.869, bar)
+    assert qualifies_for_crown(cfg, 0.0, 0.86918928, bar)
+    assert not qualifies_for_crown(cfg, -0.1, 0.99, bar)
+    assert not zero_baseline_payable(None)
+    assert not zero_baseline_payable(_rules(podium_min_margin=0.0))
+    assert zero_baseline_payable(bar)
+    assert zero_baseline_payable(_rules(podium_min_score=0.86))
+
+
+def test_positive_baseline_crown_still_needs_margin_and_bar(cfg) -> None:
+    bar = _rules(crown_min_score=0.869)
+    assert qualifies_for_crown(cfg, 0.5, 0.87, bar)
+    assert not qualifies_for_crown(cfg, 0.5, 0.86, bar)
+    assert not qualifies_for_crown(cfg, 0.85, 0.87, bar)  # bar met, 5 % margin not
+
+
+def test_zero_baseline_podium_requires_an_anchored_absolute_bar() -> None:
+    from vidaio.tokenomics.breakthrough import qualifies_for_podium
+
+    both = _rules(podium_min_margin=0.0, podium_min_score=0.86)
+    assert qualifies_for_podium(both, 0.0, 0.86)
+    assert not qualifies_for_podium(both, 0.0, 0.859999)
+    assert not qualifies_for_podium(_rules(podium_min_margin=0.0), 0.0, 0.99)
+    assert qualifies_for_podium(_rules(podium_min_score=0.86), 0.0, 0.87)
+    assert qualifies_for_podium(None, 0.0, 0.10)  # no conditions: unchanged
+    assert not qualifies_for_podium(both, -0.1, 0.99)
+
+
+def test_zero_baseline_result_applies_only_with_absolute_bars(cfg, mk_result) -> None:
+    import dataclasses
+
+    prior = RewardWindowState()
+    scores = (0.8725, 0.8650, 0.8590, 0.2000)
+    plain = mk_result(cycle=1, scores=scores, baseline_score=0.0)
+    assert resolve_reward_window(cfg, prior, plain) == prior  # historical no-op
+
+    podium_rules = _rules(
+        crown_min_score=0.90, podium_min_margin=0.0, podium_min_score=0.86
+    )
+    podium = dataclasses.replace(plain, rules=podium_rules)
+    state = resolve_reward_window(cfg, prior, podium)
+    assert state.kind is EmissionState.PODIUM
+    assert state.podium_hotkeys == ("comp100", "comp101")  # 0.859 and 0.2 miss the bar
+    assert state.baseline_score == 0.0
+    assert state.winner_margin == pytest.approx(0.8725)
+    assert state.last_applied_cycle == 1
+
+    crown = dataclasses.replace(
+        plain, rules=_rules(crown_min_score=0.869, podium_min_score=0.86)
+    )
+    crowned = resolve_reward_window(cfg, prior, crown)
+    assert crowned.kind is EmissionState.CROWN
+    assert crowned.winner_hotkey == "comp100"
+
+    nobody = dataclasses.replace(
+        plain, rules=_rules(crown_min_score=0.95, podium_min_score=0.95)
+    )
+    assert resolve_reward_window(cfg, prior, nobody) == prior

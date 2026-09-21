@@ -97,7 +97,9 @@ def cmd_enroll(args: argparse.Namespace) -> int:
     wallet_kwargs = {"name": args.wallet_name, "hotkey": args.wallet_hotkey}
     if args.wallet_path:
         wallet_kwargs["path"] = args.wallet_path
-    wallet = bittensor.wallet(**wallet_kwargs)
+    # bittensor >= 10 exposes ``Wallet``; older releases only the lowercase factory.
+    wallet_factory = getattr(bittensor, "Wallet", None) or getattr(bittensor, "wallet")
+    wallet = wallet_factory(**wallet_kwargs)
     signer = _WalletSigner(wallet.hotkey)
 
     path = f"/v1/competitions/{args.competition_id}/enroll"

@@ -24,6 +24,10 @@ def _window() -> RewardWindowState:
         starts_at=NOW - timedelta(hours=1),
         ends_at=NOW + timedelta(hours=167),
         podium_hotkeys=("hk7",),
+        # a v18 window carries its resolved policy (a policy-less one is a legacy
+        # window, which the first v18 fold must re-resolve from its source result)
+        competition_share=1.0,
+        place_shares=(1.0,),
         winner_hotkey="hk7",
         winner_uid=7,
         winner_score=0.51,

@@ -23,9 +23,31 @@ def legacy_bytes():
     obj["audit_manifest"].pop("round_commit_cursor")
     obj.pop("round_membership")
     obj.pop("payout_min_alpha_stake")
+    obj["reward_window_state"].pop("competition_share")
+    obj["reward_window_state"].pop("place_shares")
     for item in obj["miners"]+obj["miner_census"]:
         item.pop("alpha_stake")
     return canonical_json_bytes(obj)
+
+
+def v17_bytes():
+    """Pre-tokenomics-v3 bytes: schema 17, no window payout policy."""
+    obj=json.loads(current_log().to_json())
+    obj["schema_version"]=17
+    obj["reward_window_state"].pop("competition_share")
+    obj["reward_window_state"].pop("place_shares")
+    return canonical_json_bytes(obj)
+
+
+def test_v17_history_keeps_its_bytes_and_is_refused_as_current():
+    raw=v17_bytes()
+    old=EpochLog.from_history_json(raw,expected_digest=sha256_hex(raw),expected_epoch_id=42)
+    assert old.schema_version==17 and old.to_json()==raw
+    assert old.reward_window_state.place_shares==() and old.reward_window_state.competition_share is None
+    with pytest.raises(EpochLogInvalid,match="schema_version"):
+        EpochLog.from_json(raw)
+    current=json.loads(current_log().to_json())
+    assert current["schema_version"]==18 and "place_shares" in current["reward_window_state"]
 
 
 def test_history_preserves_schema_and_canonical_digest():
@@ -48,7 +70,7 @@ def test_history_refuses_unbound_or_rewritten_input(mutation):
     elif mutation=="wrong_epoch": epoch=41
     else:
         obj=json.loads(raw)
-        if mutation=="relabel": obj["schema_version"]=17
+        if mutation=="relabel": obj["schema_version"]=18
         elif mutation=="unknown_schema": obj["schema_version"]=15
         elif mutation=="legacy_new_fields": obj["miners"][0]["alpha_stake"]=10.0
         raw=json.dumps(obj).encode() if mutation=="noncanonical" else canonical_json_bytes(obj)
@@ -79,7 +101,7 @@ def test_current_census_snapshot_alpha_mismatch_rejected():
         EpochLog.from_json(canonical_json_bytes(obj))
 
 
-@pytest.mark.parametrize('schema',[17.0,'17',True])
+@pytest.mark.parametrize('schema',[18.0,'18',True])
 def test_current_schema_requires_integer_type(schema):
     obj=json.loads(current_log().to_json());obj['schema_version']=schema
     with pytest.raises(EpochLogInvalid,match='schema_version'):

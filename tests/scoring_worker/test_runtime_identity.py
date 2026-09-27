@@ -15,8 +15,14 @@ from vidaio.scoring_worker import (
     ScoringWorkerConfig,
     effective_scorer_version,
 )
+from vidaio.services.protocol import (
+    SCORER_REQUIRED_PAYOUT_BACKENDS,
+    canonical_scorer_runtime_problems,
+)
 from vidaio.scoring_worker.runtime_identity import (
+    _REQUIRED_PAYOUT_BACKENDS,
     CANONICAL_RUNTIME_MARKER_BYTES,
+    complete_payout_backend_versions,
     canonical_runtime_problems,
     require_canonical_release_runtime,
     runtime_backend_stamp,
@@ -75,6 +81,8 @@ def _attestation(*, os_name: str = "linux", arch: str = "amd64") -> dict:
             "piq": "piq/0.8.0",
             "opencv": "opencv/4.12.0.88",
             "numpy": "numpy/2.2.6",
+            "removal_metrics": "removal-metrics/1",
+            "lpips": "lpips/0.1.4",
             "python": "cpython/3.13.15",
         },
     }
@@ -169,6 +177,28 @@ def test_canonical_runtime_policy_accepts_only_complete_release() -> None:
         match="actual_torch_interop_threads.*actual_mkl_cbwr",
     ):
         require_canonical_release_runtime(adaptive_kernels)
+
+
+def test_worker_backend_map_is_exactly_the_wire_canonical_set() -> None:
+    """The keys a real worker attests must equal the set every earning client
+    (authority validator, competition scoring client) accepts. A backend added on
+    one side only makes the authority refuse the worker at startup."""
+
+    class _Named:
+        def __init__(self, name: str, version: str) -> None:
+            self.name, self.version = name, version
+
+    base = {"ffmpeg": "ffmpeg/9.0", "ffprobe": "ffprobe/9.0", "libvmaf": "libvmaf/3.0.0"}
+    versions = complete_payout_backend_versions(
+        base,
+        pieapp=_Named("pieapp-torch", "piq/0.8.0:pieapp"),
+        perceptual=_Named("cpu-perceptual-checks", "opencv/4.12.0:algorithm/2"),
+        device="cpu",
+    )
+    assert set(versions) == set(SCORER_REQUIRED_PAYOUT_BACKENDS)
+    assert set(versions) == set(_REQUIRED_PAYOUT_BACKENDS)
+    problems = canonical_scorer_runtime_problems(_attestation())
+    assert not [p for p in problems if "backend set" in p], problems
 
 
 def test_real_chain_worker_constructor_refuses_noncanonical_runtime(tmp_path) -> None:

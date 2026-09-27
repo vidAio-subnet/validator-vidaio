@@ -238,7 +238,10 @@ def test_completed_competition_drives_packet_derived_epoch_emissions(
     )
     assert log.competition_result == evidence.result
     assert log.weight_shares[10] > log.weight_shares[11] > 0.0
-    assert log.weight_shares[94] > 0.0
+    # tokenomics v3: both podium places are filled and inference earns nothing, so the
+    # whole emission is paid to the competition and nothing reaches the sink.
+    assert log.weight_shares.get(94, 0.0) == pytest.approx(0.0)
+    assert log.weight_shares[10] + log.weight_shares[11] == pytest.approx(1.0)
 
     # Both paid contenders have a zero inference EWMA. Their positive weights are
     # backed by the exact competition packets/result above, so the inference
@@ -309,14 +312,14 @@ def test_registered_but_non_economic_podium_rank_routes_to_sink(
         competition_packet_scores=evidence.packet_scores,
     )
 
-    competition_pool = 0.9 if partial.reward_window_state.kind.value == "CROWN" else 0.4
-    assert full.weight_shares[missing_rank.uid] == pytest.approx(
-        competition_pool * 0.20
+    # tokenomics v3: the pot is the whole emission; two places are filled, so the
+    # second place holds 0.04/0.94 of it under a crown and 0.24/0.74 under a podium.
+    second_place = (
+        0.04 / 0.94 if partial.reward_window_state.kind.value == "CROWN" else 0.24 / 0.74
     )
+    assert full.weight_shares[missing_rank.uid] == pytest.approx(second_place)
     assert missing_rank.uid not in partial.weight_shares
-    assert partial.weight_shares[94] - full.weight_shares[94] == pytest.approx(
-        competition_pool * 0.20
-    )
+    assert partial.weight_shares.get(94, 0.0) - full.weight_shares.get(94, 0.0) == pytest.approx(second_place)
 
     # Registration is still mandatory. Omitting the contender from the complete
     # census is a malformed/cherry-picked result, not another sink case.
@@ -358,7 +361,10 @@ def test_registered_but_non_economic_podium_rank_routes_to_sink(
     )
     assert carried.reward_window_state.winner_uid == winner.uid
     assert carried.reward_window_state.winner_hotkey == moved.hotkey
-    assert carried.weight_shares[moved.uid] == pytest.approx(competition_pool * 0.70)
+    first_place = (
+        0.90 / 0.94 if carried.reward_window_state.kind.value == "CROWN" else 0.50 / 0.74
+    )
+    assert carried.weight_shares[moved.uid] == pytest.approx(first_place)
 
 
 def test_authority_refuses_crown_until_winner_archive_is_publicly_readable(
@@ -819,3 +825,196 @@ def test_reward_window_carries_without_replaying_the_competition(
     assert reward_state == first.reward_window_state
     assert verdicts
     assert all(verdict.verdict is ItemVerdictKind.PASS for verdict in verdicts)
+
+
+def test_first_v18_fold_upgrades_a_legacy_window_and_the_auditor_agrees(
+    fresh_world: GoldenWorld,
+) -> None:
+    """A window applied by a schema-17 log is re-resolved once by the first v18 log,
+    from the result committed in that applying log, and the auditor derives the same."""
+    from vidaio.epoch.log import EpochLog
+    from vidaio.tokenomics import is_legacy_window
+
+    cfg = TokenomicsConfig(competition_emissions_enabled=True)
+    evidence = build_competition_epoch_evidence(
+        fresh_world.comp_conn,
+        census_by_hotkey=_competition_census("hk-a", "hk-b"),
+        store=fresh_world.store,
+        tokenomics=cfg,
+        through_time=COMPLETED_AT,
+    )
+    assert evidence is not None
+    manifest = build_audit_manifest(
+        evidence.scored_items,
+        store=fresh_world.store,
+        competition_input=evidence.competition_input,
+        commitment_source=_InferenceCommitmentMustNotHandleCompetition(),
+    )
+    applied = EpochFinalizer(cfg, scorer_version="scorer-v1").build_log(
+        epoch_id=3,
+        close_block=1_079,
+        snapshots=_competition_miners(),
+        burn_uid=94,
+        audit_manifest=manifest,
+        now=COMPLETED_AT,
+        competition_result=evidence.result,
+        competition_packet_scores=evidence.packet_scores,
+    )
+    # The same epoch as the pre-v3 code wrote it: schema 17, a window without policy.
+    from vidaio.epoch.log import _HistoryEpochLogV17
+
+    legacy_state = replace(
+        applied.reward_window_state, competition_share=None, place_shares=()
+    )
+    v17 = _HistoryEpochLogV17.model_validate(
+        {**dict(applied), "schema_version": 17, "reward_window_state": legacy_state}
+    )
+    first = EpochLog.from_history_json(
+        v17.to_json(), expected_digest=v17.log_digest(), expected_epoch_id=3
+    )
+    assert first.schema_version == 17
+    assert is_legacy_window(first.reward_window_state)
+
+    carry_manifest = build_audit_manifest(
+        (),
+        prior_fold_cursors=first.audit_manifest.fold_cursors,
+        current_census_uids=(10, 11),
+    )
+    v18 = EpochFinalizer(cfg, scorer_version="scorer-v1", schema_version=18)
+    carry_kwargs = dict(
+        epoch_id=4,
+        close_block=1_439,
+        snapshots=_competition_miners(),
+        miner_census=first.miner_census,
+        burn_uid=94,
+        audit_manifest=carry_manifest,
+        now=COMPLETED_AT + timedelta(hours=1),
+        prior_log_digest=first.log_digest(),
+        prior_earning={10: ("hk-a", 0.0), 11: ("hk-b", 0.0)},
+        prior_fold_cursors=first.audit_manifest.fold_cursors,
+        prior_reward_window_state=first.reward_window_state,
+    )
+    with pytest.raises(EpochLogInvalid):
+        v18.build_log(**carry_kwargs)  # the legacy window cannot be carried unresolved
+    carry = v18.build_log(**carry_kwargs, window_source_result=first.competition_result)
+    window = carry.reward_window_state
+    assert not is_legacy_window(window)
+    assert window.competition_share is not None and window.place_shares
+    assert window.starts_at == first.reward_window_state.starts_at
+    assert window.ends_at == first.reward_window_state.ends_at
+    assert window.winner_hotkey == first.reward_window_state.winner_hotkey
+
+    auditor = Auditor(
+        AuditorConfig(auditor_hotkey="auditor-test", tokenomics=cfg, burn_uid=94),
+        InMemoryBundleSource(),
+    )
+    derived, reward_state, verdicts = auditor._competition_verdicts(
+        carry, fresh_world.store, first, False
+    )
+    assert derived is None
+    assert reward_state == window
+    assert verdicts
+    assert all(verdict.verdict is ItemVerdictKind.PASS for verdict in verdicts)
+
+
+def test_auditor_walks_the_stored_chain_to_a_legacy_window_source(
+    fresh_world: GoldenWorld, tmp_path
+) -> None:
+    """The applying log is two epochs back: the auditor reads it from the store under
+    the digest its successor committed, and derives the producer's upgraded window."""
+    from vidaio.audit import ArtifactKind
+    from vidaio.authority.finalizer import EPOCH_LOG_MEMBER, epoch_prefix
+    from vidaio.epoch.log import EpochLog, _HistoryEpochLogV17
+    from vidaio.epoch.window_source import find_window_source_result
+
+    cfg = TokenomicsConfig(competition_emissions_enabled=True)
+    evidence = build_competition_epoch_evidence(
+        fresh_world.comp_conn,
+        census_by_hotkey=_competition_census("hk-a", "hk-b"),
+        store=fresh_world.store,
+        tokenomics=cfg,
+        through_time=COMPLETED_AT,
+    )
+    assert evidence is not None
+    manifest = build_audit_manifest(
+        evidence.scored_items,
+        store=fresh_world.store,
+        competition_input=evidence.competition_input,
+        commitment_source=_InferenceCommitmentMustNotHandleCompetition(),
+    )
+    producer = EpochFinalizer(cfg, scorer_version="scorer-v1")
+    applied = producer.build_log(
+        epoch_id=3, close_block=1_079, snapshots=_competition_miners(), burn_uid=94,
+        audit_manifest=manifest, now=COMPLETED_AT, competition_result=evidence.result,
+        competition_packet_scores=evidence.packet_scores,
+    )
+    legacy_state = replace(applied.reward_window_state, competition_share=None, place_shares=())
+
+    def as_v17(log):
+        v17 = _HistoryEpochLogV17.model_validate(
+            {**dict(log), "schema_version": 17, "reward_window_state": legacy_state}
+        )
+        data = v17.to_json()
+        return EpochLog.from_history_json(
+            data, expected_digest=v17.log_digest(), expected_epoch_id=v17.epoch_id
+        ), data
+
+    first, first_bytes = as_v17(applied)
+    fresh_world.store.put_set_member(
+        epoch_prefix(3), EPOCH_LOG_MEMBER, first_bytes, ArtifactKind.EPOCH_LOG
+    )
+    fresh_world.store.finalize_set(epoch_prefix(3))
+
+    carry4 = producer.build_log(
+        epoch_id=4, close_block=1_439, snapshots=_competition_miners(),
+        miner_census=first.miner_census, burn_uid=94,
+        audit_manifest=build_audit_manifest(
+            (), prior_fold_cursors=first.audit_manifest.fold_cursors, current_census_uids=(10, 11)
+        ),
+        now=COMPLETED_AT + timedelta(hours=1), prior_log_digest=first.log_digest(),
+        prior_earning={10: ("hk-a", 0.0), 11: ("hk-b", 0.0)},
+        prior_fold_cursors=first.audit_manifest.fold_cursors,
+        prior_reward_window_state=applied.reward_window_state,
+    )
+    second, _ = as_v17(carry4)
+    assert second.competition_result is None
+
+    def read(epoch_id: int, digest: str) -> EpochLog:
+        data = fresh_world.store.get_set_member(
+            epoch_prefix(epoch_id), EPOCH_LOG_MEMBER, expected_digest=digest
+        )
+        return EpochLog.from_history_json(data, expected_digest=digest, expected_epoch_id=epoch_id)
+
+    source = find_window_source_result(read, second, second.reward_window_state)
+    assert source == first.competition_result
+
+    carry5 = producer.build_log(
+        epoch_id=5, close_block=1_799, snapshots=_competition_miners(),
+        miner_census=second.miner_census, burn_uid=94,
+        audit_manifest=build_audit_manifest(
+            (), prior_fold_cursors=second.audit_manifest.fold_cursors, current_census_uids=(10, 11)
+        ),
+        now=COMPLETED_AT + timedelta(hours=2), prior_log_digest=second.log_digest(),
+        prior_earning={10: ("hk-a", 0.0), 11: ("hk-b", 0.0)},
+        prior_fold_cursors=second.audit_manifest.fold_cursors,
+        prior_reward_window_state=second.reward_window_state,
+        window_source_result=source,
+    )
+    assert carry5.reward_window_state.place_shares
+
+    auditor = Auditor(
+        AuditorConfig(auditor_hotkey="auditor-test", tokenomics=cfg, burn_uid=94),
+        InMemoryBundleSource(),
+    )
+    _, reward_state, verdicts = auditor._competition_verdicts(
+        carry5, fresh_world.store, second, False
+    )
+    assert reward_state == carry5.reward_window_state
+    assert verdicts and all(v.verdict is ItemVerdictKind.PASS for v in verdicts)
+    # a store that lost the applying log leaves the carry-in unverified, never "clean"
+    from vidaio.audit.store import LocalFsStore
+
+    _, _, missing = auditor._competition_verdicts(
+        carry5, LocalFsStore(tmp_path / "empty"), second, False
+    )
+    assert any(v.verdict is ItemVerdictKind.SKIP for v in missing)

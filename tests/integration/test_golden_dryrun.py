@@ -416,13 +416,10 @@ def test_publication_record_and_ledger(world: GoldenWorld) -> None:
 def test_idle_weight_vector_has_inference_and_canonical_sink(world: GoldenWorld) -> None:
     vector = world.weights
     assert sum(vector.values()) == pytest.approx(1.0)
-    # IDLE is 80% inference and 20% canonical sink. Inference remains split
-    # compression/upscaling 0.8/0.2 and uses the 5:4 rank curve here.
-    assert vector[0] == pytest.approx(0.20)
-    assert vector[10] == pytest.approx(0.80 * 0.8 * 5 / 9)
-    assert vector[11] == pytest.approx(0.80 * 0.8 * 4 / 9)
-    assert vector[12] == pytest.approx(0.80 * 0.2 * 5 / 9)
-    assert vector[13] == pytest.approx(0.80 * 0.2 * 4 / 9)
+    # Tokenomics v3: IDLE burns everything; inference earns nothing.
+    assert vector[0] == pytest.approx(1.0)
+    for uid in (10, 11, 12, 13):
+        assert vector[uid] == 0.0
 
 
 def test_baseline_has_no_identity_anywhere(world: GoldenWorld) -> None:

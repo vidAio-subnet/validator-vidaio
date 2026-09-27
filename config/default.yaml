@@ -68,7 +68,7 @@ chain:
   report_dir: ./data/chain-reports
   rpc_timeout_seconds: 30.0
   validator_hotkey: local-validator
-  version_key: 17
+  version_key: 18
   wallet_hotkey: ''
   wallet_name: ''
   wallet_path: ''
@@ -210,17 +210,31 @@ tokenomics:
   breakthrough_margin_floor: 0.05
   burn_proportion: 0.0
   competition_emissions_enabled: true
-  crown_competition_share: 0.9
-  crown_inference_share: 0.1
+  crown_competition_share: 1.0
+  crown_inference_share: 0.0
+  crown_split:
+  - 0.9
+  - 0.04
+  - 0.03
+  - 0.02
+  - 0.01
   emission_liquidation_weigh_factor: 5.0
   empty_pool_policy: withhold
   ewma_decay: 0.75
-  idle_burn_share: 0.2
-  idle_inference_share: 0.8
+  idle_burn_share: 1.0
+  idle_inference_share: 0.0
   minimum_payout_score: 0.05
+  no_qualifier_closes_window: true
   payout_min_alpha_stake: 0.0
-  podium_competition_share: 0.4
-  podium_inference_share: 0.6
+  podium_competition_share: 1.0
+  podium_inference_share: 0.0
+  podium_split:
+  - 0.5
+  - 0.24
+  - 0.13
+  - 0.08
+  - 0.05
+  redistribute_empty_places: true
   result_window_hours: 168
   retention_full_window_required: true
   top_n_per_track: 5
@@ -247,4 +261,4 @@ weightsetter:
   provider: shared
   validator_hotkey: ''
   verify_anchor: true
-  version_key: 17
+  version_key: 18

@@ -50,8 +50,12 @@ from vidaio.challenge.commitment import (
     verify_reveal_deep,
 )
 from vidaio.challenge.dag import UPSCALE_FACTORS, build_dag, dag_rng_from_seed
-from vidaio.competition.item_commitment import evaluation_item_commitment
+from vidaio.competition.item_commitment import (
+    evaluation_item_commitment,
+    removal_item_commitment,
+)
 from vidaio.scoring import (
+    TRACK_REMOVAL,
     TRACK_UPSCALING,
     InvalidDuplicateEvidence,
     ScoringConfig,
@@ -941,6 +945,30 @@ class RealScoreRecomputer:
                         }
                     )
                 return params
+            if packet_track == TRACK_REMOVAL:
+                binding = getattr(bundle, "competition_item", None)
+                if binding is None or binding.mask_stream_index is None:
+                    raise RuntimeError(
+                        "removal competition bundle has no committed item preimage"
+                    )
+                derived = removal_item_commitment(
+                    competition_id=str(manifest.get("competition_id", "")),
+                    item_index=binding.item_index,
+                    input_sha256=binding.input_sha256,
+                    reference_sha256=binding.reference_sha256,
+                    mask_stream_index=binding.mask_stream_index,
+                )
+                commitments = manifest.get("evaluation_item_commitments")
+                if (
+                    derived != binding.item_commitment
+                    or not isinstance(commitments, list)
+                    or binding.item_index >= len(commitments)
+                    or commitments[binding.item_index] != derived
+                ):
+                    raise RuntimeError(
+                        "removal reference/input do not match the committed manifest item"
+                    )
+                return {"mask_stream_index": binding.mask_stream_index}
             threshold = manifest.get("vmaf_threshold")
             if (
                 packet_track != TRACK_UPSCALING

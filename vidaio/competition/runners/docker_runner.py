@@ -628,7 +628,7 @@ class DockerSandboxRunner:
                 self._stage_input(item, in_dir)
             name = f"vidaio-sbx-{uuid.uuid4().hex[:12]}"
             argv = [
-                self._docker,
+                *self._cli(),
                 "run",
                 "--name",
                 name,
@@ -795,7 +795,7 @@ class DockerSandboxRunner:
         (script_dir / "probe.sh").write_text(_PROBE_SCRIPT)
         name = f"vidaio-probe-{uuid.uuid4().hex[:12]}"
         argv = [
-            self._docker,
+            *self._cli(),
             "run",
             "--name",
             name,
@@ -938,6 +938,14 @@ class DockerSandboxRunner:
             f"/tmp:rw,size={self._tmpfs_size}",
         ]
 
+    def _cli(self) -> list[str]:
+        """The docker CLI invocation prefix (a remote runner adds its daemon)."""
+        return [self._docker]
+
+    def _watched_bytes(self, watch_dir: Path, *, final: bool = False) -> int:
+        """Bytes the running solution has written to its output (watchdog input)."""
+        return safeio.tree_bytes(watch_dir)
+
     def _digest_tag(self, image_digest: str) -> str:
         return f"vidaio-sbx:{image_digest[:32]}"
 
@@ -1041,7 +1049,7 @@ class DockerSandboxRunner:
                 # round 2): breaking on poll() before measuring let a fast writer
                 # blow either cap and exit unobserved between two polls.
                 returncode = proc.poll()
-                used = safeio.tree_bytes(watch_dir)
+                used = self._watched_bytes(watch_dir)
                 logs = _file_size(stdout_path) + _file_size(stderr_path)
                 if used > byte_cap:
                     self._force_remove(name)
@@ -1068,7 +1076,7 @@ class DockerSandboxRunner:
         # that wrote everything and exited within a single poll interval is bounded
         # by exactly the same caps as one that lingered. Logs included — the
         # post-exit check used to cover /output only.
-        used = safeio.tree_bytes(watch_dir)
+        used = self._watched_bytes(watch_dir, final=True)
         if used > byte_cap:
             raise OversizeOutputError(
                 f"{what} left {used} bytes in /output, over the per-batch cap of {byte_cap}"
@@ -1157,7 +1165,7 @@ class DockerSandboxRunner:
         """Best-effort cleanup of a (possibly still running) container."""
         try:
             subprocess.run(
-                [self._docker, "rm", "-f", name],
+                [*self._cli(), "rm", "-f", name],
                 capture_output=True,
                 text=True,
                 timeout=30.0,
@@ -1182,7 +1190,7 @@ class DockerSandboxRunner:
         contender's Dockerfile is not to blame for our docker binary being gone
 . Defaults to err_cls.
         """
-        argv = [self._docker, *args]
+        argv = [*self._cli(), *args]
         try:
             proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
         except subprocess.TimeoutExpired as exc:

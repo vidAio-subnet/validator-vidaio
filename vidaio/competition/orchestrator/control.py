@@ -108,7 +108,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator
 
 from vidaio.audit import NotConfiguredError
 from vidaio.competition import CompetitionManifest
@@ -203,6 +203,27 @@ class ClearHaltRequest(BaseModel):
         if not value:
             raise ValueError("must contain non-whitespace text")
         return value
+
+
+class ClearHaltWithBudgetRequest(ClearHaltRequest):
+    #: Also give every batch its full infra requeue budget again.
+    reset_requeue_budget: bool = False
+
+
+class ScheduleAmendRequest(ClearHaltRequest):
+    """Move deadlines later (never earlier); omitted fields stay as they are."""
+
+    enrollment_deadline: AwareDatetime | None = None
+    finalization_time: AwareDatetime | None = None
+    end_time: AwareDatetime | None = None
+
+
+class ExecutionAmendRequest(ClearHaltRequest):
+    """Raise the sandbox envelope for every contender (never lower it)."""
+
+    cpu: float | None = Field(default=None, gt=0, le=64)
+    memory_mb: int | None = Field(default=None, ge=256, le=262144)
+    batch_timeout_seconds: int | None = Field(default=None, ge=60, le=21600)
 
 
 class ReviewRequest(BaseModel):
@@ -407,14 +428,10 @@ def create_control_app(
     async def anchor(competition_id: str, body: AnchorRequest, request: Request):
         authenticate(request)
         require_competition(competition_id)
-        # Preserve useful prerequisite errors: a deployment with no chain is 503,
-        # and a manifest with no baseline/tree digest is 422, even if its item matrix is
-        # also empty. Any request otherwise capable of touching the chain must pass
-        # the complete item-matrix gate first.
-        manifest = repo.get_manifest(orch.conn, competition_id)
-        can_reach_chain = orch.chain is not None and not (
-            body.baseline_tree_digest is None and manifest.baseline is None
-        )
+        # A deployment with no chain is 503. Any request capable of touching the
+        # chain must pass the complete item-matrix gate first (a baseline-free
+        # manifest anchors null baseline provenance, so it goes through the same gate).
+        can_reach_chain = orch.chain is not None
         if can_reach_chain:
             try:
                 items = repo.validate_evaluation_item_bindings(
@@ -521,7 +538,9 @@ def create_control_app(
         return {"competition_id": competition_id, "status": terminal.value}
 
     @app.post("/competitions/{competition_id}/halt/clear")
-    async def clear_halt(competition_id: str, body: ClearHaltRequest, request: Request):
+    async def clear_halt(
+        competition_id: str, body: ClearHaltWithBudgetRequest, request: Request
+    ):
         authenticate(request)
         require_competition(competition_id)
         cleared = orch.clear_halt(
@@ -529,8 +548,101 @@ def create_control_app(
             body.operator,
             orch.now(),
             reason=body.reason,
+            reset_requeue_budget=body.reset_requeue_budget,
         )
         return {"competition_id": competition_id, "cleared": cleared}
+
+    def _operator_action(competition_id: str, action: Any) -> Any:
+        try:
+            return action()
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=404, detail={"code": "not_found", "message": str(exc)}
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=409, detail={"code": "action_refused", "message": str(exc)}
+            ) from exc
+
+    @app.post("/competitions/{competition_id}/pause")
+    async def pause(competition_id: str, body: ClearHaltRequest, request: Request):
+        """Halt the pipeline on purpose (e.g. before a sandbox backend switch)."""
+        authenticate(request)
+        require_competition(competition_id)
+        paused = _operator_action(
+            competition_id,
+            lambda: orch.pause(competition_id, body.operator, orch.now(), reason=body.reason),
+        )
+        return {"competition_id": competition_id, "paused": paused}
+
+    @app.post("/competitions/{competition_id}/evaluation/rerun")
+    async def rerun_evaluation(
+        competition_id: str, body: ClearHaltRequest, request: Request
+    ):
+        """Discard every effective batch and rerun the whole matrix (EVALUATING)."""
+        authenticate(request)
+        require_competition(competition_id)
+        _operator_action(
+            competition_id,
+            lambda: orch.rerun_evaluation(
+                competition_id, body.operator, orch.now(), reason=body.reason
+            ),
+        )
+        return {"competition_id": competition_id, "rerun": True}
+
+    @app.post("/competitions/{competition_id}/schedule")
+    async def amend_schedule(
+        competition_id: str, body: ScheduleAmendRequest, request: Request
+    ):
+        authenticate(request)
+        require_competition(competition_id)
+        after = _operator_action(
+            competition_id,
+            lambda: orch.amend_schedule(
+                competition_id,
+                body.operator,
+                orch.now(),
+                reason=body.reason,
+                enrollment_deadline=body.enrollment_deadline,
+                finalization_time=body.finalization_time,
+                end_time=body.end_time,
+            ),
+        )
+        return {"competition_id": competition_id, "schedule": after}
+
+    @app.post("/competitions/{competition_id}/contenders/{contender_id}/reject")
+    async def reject_contender(
+        competition_id: str, contender_id: int, body: ClearHaltRequest, request: Request
+    ):
+        authenticate(request)
+        require_competition(competition_id)
+        _operator_action(
+            competition_id,
+            lambda: orch.reject_contender(
+                competition_id, contender_id, body.operator, orch.now(), reason=body.reason
+            ),
+        )
+        return {"competition_id": competition_id, "contender_id": contender_id, "status": "REJECTED"}
+
+    @app.post("/competitions/{competition_id}/execution")
+    async def amend_execution(
+        competition_id: str, body: ExecutionAmendRequest, request: Request
+    ):
+        authenticate(request)
+        require_competition(competition_id)
+        effective = _operator_action(
+            competition_id,
+            lambda: orch.amend_execution(
+                competition_id,
+                body.operator,
+                orch.now(),
+                reason=body.reason,
+                cpu=body.cpu,
+                memory_mb=body.memory_mb,
+                batch_timeout_seconds=body.batch_timeout_seconds,
+            ),
+        )
+        return {"competition_id": competition_id, "sandbox_resources": effective}
 
     @app.get("/competitions/{competition_id}")
     async def status(competition_id: str, request: Request):
@@ -561,6 +673,8 @@ def create_control_app(
                 else None
             ),
             "failure_reason": comp.failure_reason,
+            "sandbox_resources": orch.effective_sandbox_resources(competition_id),
+            "amendments": pers.operator_amendments(orch.conn, competition_id),
             "ranking_semantics": (
                 "operational_human_review_only_non_earning; /result is a packet-"
                 "economic preview and finalized epoch evidence is authoritative"

@@ -35,11 +35,10 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, Sequence
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from vidaio.audit.canonical import SHA256_HEX_PATTERN, canonical_json_bytes, sha256_hex
 from vidaio.core.db import apply_migrations, connect
-from vidaio.tokenomics.breakthrough import PODIUM_SPLIT
 from vidaio.tokenomics.config import TokenomicsConfig
 
 if TYPE_CHECKING:
@@ -80,18 +79,43 @@ def pin_git_sha(sha: str) -> str:
 
 
 class CompetitionCommitment(BaseModel):
-    """Pre-enrollment commitment: pins the whole competition before anyone enrolls."""
+    """Pre-enrollment commitment: pins the whole competition before anyone enrolls.
+
+    A competition without an executable baseline (its result is decided by the
+    anchored absolute score bars alone) commits all five ``baseline_*`` fields as
+    null.  The keys stay present, so every commitment with a baseline keeps its
+    exact bytes and root.
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     manifest_digest: str = _HexField
-    baseline_version: int = Field(ge=0)
-    baseline_artifact_digest: str = _HexField
-    baseline_provenance_digest: str = _HexField
-    baseline_tree_digest: str = _HexField
-    baseline_image_digest: str = _HexField
+    baseline_version: int | None = Field(ge=0)
+    baseline_artifact_digest: str | None = Field(pattern=SHA256_HEX_PATTERN)
+    baseline_provenance_digest: str | None = Field(pattern=SHA256_HEX_PATTERN)
+    baseline_tree_digest: str | None = Field(pattern=SHA256_HEX_PATTERN)
+    baseline_image_digest: str | None = Field(pattern=SHA256_HEX_PATTERN)
     dataset_selection_seed_commitment: str = _HexField
     reward_param_digest: str = _HexField
+
+    @model_validator(mode="after")
+    def _baseline_all_or_none(self) -> "CompetitionCommitment":
+        values = (
+            self.baseline_version,
+            self.baseline_artifact_digest,
+            self.baseline_provenance_digest,
+            self.baseline_tree_digest,
+            self.baseline_image_digest,
+        )
+        if any(v is None for v in values) and not all(v is None for v in values):
+            raise ValueError(
+                "a competition commitment names a complete baseline or none at all"
+            )
+        return self
+
+    @property
+    def has_baseline(self) -> bool:
+        return self.baseline_version is not None
 
 
 class PublicationRecord(BaseModel):
@@ -141,7 +165,8 @@ def reward_parameter_digest(config: TokenomicsConfig) -> str:
         # This new eligibility knob must not invalidate already-anchored
         # competition policies. Preserve every existing policy field verbatim.
         "tokenomics": config.model_dump(mode="json", exclude={"payout_min_alpha_stake"}),
-        "competition_podium_split": list(PODIUM_SPLIT),
+        "competition_podium_split": list(config.podium_split),
+        "competition_crown_split": list(config.crown_split),
     }
     return sha256_hex(canonical_json_bytes(policy))
 

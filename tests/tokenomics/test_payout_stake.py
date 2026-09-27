@@ -47,8 +47,10 @@ def test_below_floor_low_uid_cannot_shadow_eligible_miner(identity):
     assert dedup_excluded(candidates, payout_min_alpha_stake=5) == set()
     config = TokenomicsConfig(payout_min_alpha_stake=5)
     ensure_locked_levers(config)
+    # v3: inference earns nothing, so both miners are 0 and the sink takes all;
+    # the eligibility/dedup assertions above are the contract under test.
     assert build_weight_vector(config, candidates, burn_uid=99) == pytest.approx(
-        {1: 0, 2: 0.64, 99: 0.36}
+        {1: 0, 2: 0.0, 99: 1.0}
     )
 
 
@@ -73,4 +75,6 @@ def test_floor_leaves_competition_podium_unchanged(live_cfg, mk_result, mk_podiu
         now=datetime(2026, 8, 20, 12, tzinfo=UTC),
     )
     assert actual == expected
-    assert [actual[uid] for uid in (100, 101, 102)] == pytest.approx([0.28, 0.08, 0.04])
+    assert [actual[uid] for uid in (100, 101, 102)] == pytest.approx(
+        [0.50 / 0.87, 0.24 / 0.87, 0.13 / 0.87]
+    )

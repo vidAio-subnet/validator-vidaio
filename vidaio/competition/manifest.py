@@ -119,6 +119,20 @@ class ResultRules(BaseModel):
         default=None, ge=-1, le=10, allow_inf_nan=False
     )
     podium_min_score: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
+    # ---- payout policy (tokenomics v3): each field overrides the protocol default for
+    # THIS competition's reward window; absent = the validator's TokenomicsConfig.
+    #: Fraction of ALL miner emissions paid to the competition while its window is
+    #: active (the remainder is burned), per window kind.
+    crown_competition_share: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
+    podium_competition_share: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
+    #: Per-rank fractions of that pot, 1 to 5 places, summing to 1.
+    crown_split: tuple[float, ...] | None = None
+    podium_split: tuple[float, ...] | None = None
+    #: Shares of unfilled places go to the filled ones in proportion (else: sink).
+    redistribute_empty_places: bool | None = None
+    #: A result with no qualifying contender closes the running window (burn until
+    #: the next result) instead of leaving the previous window untouched.
+    no_qualifier_closes_window: bool | None = None
 
     @model_validator(mode="after")
     def _ordered(self) -> "ResultRules":
@@ -127,6 +141,10 @@ class ResultRules(BaseModel):
             and self.podium_min_margin > self.crown_margin
         ):
             raise ValueError("podium_min_margin cannot exceed crown_margin")
+        from vidaio.tokenomics.state import _validate_split
+
+        for name in ("crown_split", "podium_split"):
+            object.__setattr__(self, name, _validate_split(name, getattr(self, name)))
         return self
 
 
@@ -166,7 +184,7 @@ class CompetitionManifest(BaseModel):
 
     manifest_schema_version: Literal[2] = 2
     competition_id: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{2,63}$")
-    track: Literal["compression", "upscaling"] = "compression"
+    track: Literal["compression", "upscaling", "removal"] = "compression"
 
     # Lifecycle times (all timezone-aware; normalized to UTC on validation):
     #   start_time           SCHEDULED -> ENROLLING (gated on no other running)
@@ -284,6 +302,10 @@ class CompetitionManifest(BaseModel):
             raise ValueError(
                 "allowed_upscale_factors is valid only for the upscaling track"
             )
+        elif self.track == "removal" and not self.evaluation_item_commitments:
+            # The clean reference of a removal item is sealed until completion; only
+            # the precommitted input/reference pairs make the result auditable.
+            raise ValueError("removal manifest requires precommitted evaluation items")
         elif self.evaluation_item_commitments is not None and not (
             self.evaluation_item_commitments
         ):
@@ -349,7 +371,7 @@ def validate_against_config(manifest: CompetitionManifest, cfg: CompetitionConfi
         )
     if (
         cfg.require_item_commitments
-        and manifest.track == "compression"
+        and manifest.track in ("compression", "removal")
         and not manifest.evaluation_item_commitments
     ):
         raise ManifestBoundsError(

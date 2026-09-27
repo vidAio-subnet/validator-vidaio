@@ -52,16 +52,42 @@ def _latest_halt_reason(orch, competition_id: str) -> str:
     return str(json.loads(event["payload_json"])["reason"])
 
 
-def test_earning_create_requires_a_single_manifest_baseline(
+def test_earning_create_without_baseline_requires_both_absolute_bars(
     orchestrator_factory, fixture_repos
 ) -> None:
     orch = orchestrator_factory(repos=fixture_repos)
     _enable_emissions(orch)
     manifest = build_manifest("earning-needs-baseline")
 
-    with pytest.raises(EarningManifestError, match="requires exactly one"):
+    with pytest.raises(EarningManifestError, match="must anchor"):
         orch.create_competition(manifest, T0)
     assert repo.get_competition(orch.conn, manifest.competition_id) is None
+
+    only_crown = build_manifest(
+        "earning-crown-bar-only",
+        result_rules={"crown_margin": 0.05, "crown_min_score": 0.6},
+    )
+    with pytest.raises(EarningManifestError, match="must anchor"):
+        orch.create_competition(only_crown, T0)
+
+    relative = build_manifest(
+        "earning-relative-podium",
+        result_rules={
+            "crown_margin": 0.05,
+            "crown_min_score": 0.6,
+            "podium_min_score": 0.4,
+            "podium_min_margin": 0.01,
+        },
+    )
+    with pytest.raises(EarningManifestError, match="must anchor"):
+        orch.create_competition(relative, T0)
+
+    bars = build_manifest(
+        "earning-absolute-bars",
+        result_rules={"crown_margin": 0.05, "crown_min_score": 0.6, "podium_min_score": 0.4},
+    )
+    orch.create_competition(bars, T0)
+    assert repo.get_competition(orch.conn, bars.competition_id) is not None
 
 
 async def test_control_refuses_a_no_baseline_earning_manifest(

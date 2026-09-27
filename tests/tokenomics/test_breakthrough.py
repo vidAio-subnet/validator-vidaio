@@ -71,7 +71,9 @@ def test_exact_floor_creates_crown_with_full_provenance(cfg, mk_result) -> None:
         mk_result(scores=(0.525, 0.52, 0.51, 0.50), track="upscaling"),
     )
     assert state.kind is EmissionState.CROWN
-    assert state.podium_hotkeys == ("comp100", "comp101", "comp102")
+    assert state.podium_hotkeys == ("comp100", "comp101", "comp102", "comp103")
+    assert state.competition_share == 1.0
+    assert state.place_shares == pytest.approx((0.90 / 0.99, 0.04 / 0.99, 0.03 / 0.99, 0.02 / 0.99))
     assert state.winner_hotkey == "comp100"
     assert state.winner_uid == 100
     assert state.baseline_version == 0
@@ -153,11 +155,28 @@ def test_baseline_failure_preserves_window_and_same_cycle_can_retry(
     assert applied.last_applied_cycle == 2
 
 
-def test_no_eligible_winner_is_retryable_and_does_not_reset(cfg, mk_result) -> None:
+def test_no_eligible_winner_closes_the_window_under_v3(cfg, mk_result) -> None:
     prior = resolve_reward_window(
         cfg, RewardWindowState(), mk_result(cycle=1, scores=(0.51,))
     )
-    assert resolve_reward_window(cfg, prior, mk_result(cycle=2, contenders=())) == prior
+    closed = resolve_reward_window(cfg, prior, mk_result(cycle=2, contenders=()))
+    assert closed == RewardWindowState()  # burn until the next applied result
+
+
+def test_no_eligible_winner_keeps_the_prior_window_when_the_rules_say_so(
+    cfg, mk_result
+) -> None:
+    import dataclasses
+    from vidaio.tokenomics.state import CompetitionRules
+
+    prior = resolve_reward_window(
+        cfg, RewardWindowState(), mk_result(cycle=1, scores=(0.51,))
+    )
+    empty = dataclasses.replace(
+        mk_result(cycle=2, contenders=()),
+        rules=CompetitionRules(crown_margin=0.05, no_qualifier_closes_window=False),
+    )
+    assert resolve_reward_window(cfg, prior, empty) == prior
 
 
 def test_newer_cycle_cannot_backdate_application(cfg, mk_result) -> None:
@@ -178,19 +197,68 @@ def test_testnet_window_override_is_part_of_pure_fold(mk_result) -> None:
 
 def test_emission_share_table_and_disabled_flag(live_cfg, mk_result) -> None:
     idle = RewardWindowState()
-    assert emission_shares(live_cfg, idle, T0) == EmissionShares(0.8, 0.0, 0.2)
+    assert emission_shares(live_cfg, idle, T0) == EmissionShares(0.0, 0.0, 1.0)
     podium = resolve_reward_window(live_cfg, idle, mk_result(scores=(0.51,)))
-    assert emission_shares(live_cfg, podium, T0) == EmissionShares(0.6, 0.4, 0.0)
+    assert emission_shares(live_cfg, podium, T0) == EmissionShares(0.0, 1.0, 0.0)
     crown = resolve_reward_window(live_cfg, idle, mk_result(scores=(0.8,)))
-    assert emission_shares(live_cfg, crown, T0) == EmissionShares(0.1, 0.9, 0.0)
+    assert emission_shares(live_cfg, crown, T0) == EmissionShares(0.0, 1.0, 0.0)
     assert emission_shares(TokenomicsConfig(), crown, T0) == EmissionShares(
-        0.8, 0.0, 0.2
+        0.0, 0.0, 1.0
     )
 
 
-def test_podium_shares_leave_missing_ranks_unallocated(cfg, mk_result) -> None:
+def test_per_competition_pot_and_split_override_the_defaults(live_cfg, mk_result) -> None:
+    import dataclasses
+    from vidaio.tokenomics.state import CompetitionRules
+
+    rules = CompetitionRules(
+        crown_margin=0.05, podium_competition_share=0.6, podium_split=(0.7, 0.3),
+        redistribute_empty_places=False,
+    )
+    result = dataclasses.replace(mk_result(scores=(0.51, 0.50, 0.49)), rules=rules)
+    state = resolve_reward_window(live_cfg, RewardWindowState(), result)
+    assert state.kind is EmissionState.PODIUM
+    assert state.podium_hotkeys == ("comp100", "comp101")  # the split names 2 places
+    assert state.competition_share == 0.6
+    assert state.place_shares == (0.7, 0.3)
+    assert emission_shares(live_cfg, state, T0) == EmissionShares(0.0, 0.6, 0.4)
+    single = resolve_reward_window(
+        live_cfg, RewardWindowState(), dataclasses.replace(mk_result(scores=(0.51,)), rules=rules)
+    )
+    assert single.place_shares == (0.7,)  # no redistribution: 0.3 of the pot is withheld
+    assert podium_hotkey_shares(single) == {"comp100": 0.7}
+
+
+def test_podium_shares_redistribute_missing_ranks_under_v3(cfg, mk_result) -> None:
     one = resolve_reward_window(cfg, RewardWindowState(), mk_result(scores=(0.51,)))
-    assert podium_hotkey_shares(one) == {"comp100": 0.70}
+    assert podium_hotkey_shares(one) == {"comp100": 1.0}
+    three = resolve_reward_window(
+        cfg, RewardWindowState(), mk_result(scores=(0.51, 0.50, 0.49))
+    )
+    shares = podium_hotkey_shares(three)
+    assert list(shares) == ["comp100", "comp101", "comp102"]
+    assert sum(shares.values()) == pytest.approx(1.0)
+    assert shares["comp100"] == pytest.approx(0.50 / 0.87)
+
+
+def test_windows_without_a_policy_are_paid_with_the_live_defaults(cfg) -> None:
+    """A window folded before schema v18 carries no place_shares."""
+    from datetime import timedelta
+
+    legacy = RewardWindowState(
+        kind=EmissionState.CROWN, starts_at=T0, ends_at=T0 + timedelta(hours=168),
+        podium_hotkeys=("a", "b", "c"), winner_hotkey="a", winner_uid=1, winner_score=0.9,
+        winner_margin=0.5, baseline_score=0.6, baseline_version=0,
+        baseline_artifact_digest=BASELINE_DIGEST, source_competition_id="x",
+        source_track="compression", source_cycle=1, last_applied_cycle=1,
+    )
+    assert podium_hotkey_shares(legacy) == {"a": 0.70, "b": 0.20, "c": 0.10}
+    with_defaults = podium_hotkey_shares(legacy, cfg)
+    assert with_defaults["a"] == pytest.approx(0.90 / 0.97)
+    assert sum(with_defaults.values()) == pytest.approx(1.0)
+    assert emission_shares(
+        TokenomicsConfig(competition_emissions_enabled=True), legacy, T0
+    ) == EmissionShares(0.0, 1.0, 0.0)
 
 
 # ---- baseline measured at zero: only anchored absolute bars can pay ------------------

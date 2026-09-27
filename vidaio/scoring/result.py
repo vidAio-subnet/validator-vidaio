@@ -18,9 +18,10 @@ from vidaio.scoring.compression import CompressionBreakdown
 from vidaio.scoring.config import ScoringConfig
 from vidaio.scoring.gates import GateSkip, ValidityViolation
 from vidaio.scoring.upscaling import UpscalingBreakdown
+from vidaio.scoring.removal_formula import RemovalBreakdown
 
 Breakdown = Annotated[
-    Union[CompressionBreakdown, UpscalingBreakdown], Field(discriminator="kind")
+    Union[CompressionBreakdown, UpscalingBreakdown, RemovalBreakdown], Field(discriminator="kind")
 ]
 
 
@@ -118,7 +119,7 @@ def compose_item_score(
     track: str,
     gate_passed: bool,
     violations: list[ValidityViolation],
-    breakdown: CompressionBreakdown | UpscalingBreakdown | None,
+    breakdown: CompressionBreakdown | UpscalingBreakdown | RemovalBreakdown | None,
     config: ScoringConfig,
     skips: list[GateSkip] | None = None,
     miner_hotkey: str | None = None,

@@ -62,7 +62,9 @@ def _result_from_row(row: sqlite3.Row) -> CompetitionResult:
         baseline_score=(
             None if row["baseline_score"] is None else float(row["baseline_score"])
         ),
-        baseline_version=int(row["baseline_version"]),
+        baseline_version=(
+            None if row["baseline_version"] is None else int(row["baseline_version"])
+        ),
         baseline_artifact_digest=row["baseline_artifact_digest"],
     )
 
@@ -81,6 +83,10 @@ def load_reward_window(conn: sqlite3.Connection) -> RewardWindowState:
             None if row["ends_at"] is None else datetime.fromisoformat(row["ends_at"])
         ),
         podium_hotkeys=tuple(json.loads(row["podium_hotkeys_json"])),
+        competition_share=(
+            None if row["competition_share"] is None else float(row["competition_share"])
+        ),
+        place_shares=tuple(float(x) for x in json.loads(row["place_shares_json"] or "[]")),
         winner_hotkey=row["winner_hotkey"],
         winner_uid=row["winner_uid"],
         winner_score=row["winner_score"],
@@ -102,8 +108,8 @@ def save_reward_window(conn: sqlite3.Connection, state: RewardWindowState) -> No
         " (id, kind, starts_at, ends_at, podium_hotkeys_json, winner_hotkey,"
         "  winner_uid, winner_score, winner_margin, baseline_score, baseline_version,"
         "  baseline_artifact_digest, source_competition_id, source_track, source_cycle,"
-        "  last_applied_cycle)"
-        " VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        "  last_applied_cycle, competition_share, place_shares_json)"
+        " VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         " ON CONFLICT (id) DO UPDATE SET"
         "  kind = excluded.kind,"
         "  starts_at = excluded.starts_at,"
@@ -119,7 +125,9 @@ def save_reward_window(conn: sqlite3.Connection, state: RewardWindowState) -> No
         "  source_competition_id = excluded.source_competition_id,"
         "  source_track = excluded.source_track,"
         "  source_cycle = excluded.source_cycle,"
-        "  last_applied_cycle = excluded.last_applied_cycle",
+        "  last_applied_cycle = excluded.last_applied_cycle,"
+        "  competition_share = excluded.competition_share,"
+        "  place_shares_json = excluded.place_shares_json",
         (
             state.kind.value,
             state.starts_at.isoformat() if state.starts_at is not None else None,
@@ -136,6 +144,8 @@ def save_reward_window(conn: sqlite3.Connection, state: RewardWindowState) -> No
             state.source_track,
             state.source_cycle,
             state.last_applied_cycle,
+            state.competition_share,
+            json.dumps(list(state.place_shares), separators=(",", ":")),
         ),
     )
 

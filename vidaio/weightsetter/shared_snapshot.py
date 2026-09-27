@@ -513,7 +513,7 @@ _EPOCH_LOG_TOP_LEVEL_FIELDS = frozenset(
 
 def _top_level_fields(schema_version: int) -> frozenset[str]:
     """Exact top-level shape per authenticated schema (v17 archives the payout floor)."""
-    if schema_version == 17:
+    if schema_version >= 17:
         return _EPOCH_LOG_TOP_LEVEL_FIELDS | {"payout_min_alpha_stake", "round_membership"}
     return _EPOCH_LOG_TOP_LEVEL_FIELDS
 
@@ -543,7 +543,7 @@ def _raw_packet_commitment(
     if not isinstance(manifest, dict):
         return None, None
     expected_keys = {
-        *(("content_rounds", "round_commits", "round_commit_cursor") if schema_version == 17 else ()) ,
+        *(("content_rounds", "round_commits", "round_commit_cursor") if schema_version >= 17 else ()) ,
         "per_uid",
         "baseline_bundles",
         "score_packet_merkle_root",
@@ -605,8 +605,8 @@ def parse_authority_history_submission(
         schema = json.loads(data)["schema_version"]
     except Exception as exc:
         raise SnapshotDigestMismatch("historical submission schema is unreadable") from exc
-    if type(schema) is not int or schema not in (16, 17):
-        raise SnapshotDigestMismatch("only authenticated v16/v17 history is supported")
+    if type(schema) is not int or schema not in (16, 17, 18):
+        raise SnapshotDigestMismatch("only authenticated v16/v17/v18 history is supported")
     return _parse_authority_submission(data, pointer, expected_schema=schema)
 
 
@@ -743,7 +743,7 @@ def _parse_authority_submission(
             "hotkey",
             "coldkey",
             "ip",
-            *(("alpha_stake",) if expected_schema == 17 else ()),
+            *(("alpha_stake",) if expected_schema >= 17 else ()),
         }:
             raise SnapshotDigestMismatch(
                 f"epoch {epoch_id} miner_census[{position}] has an invalid shape"

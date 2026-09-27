@@ -24,7 +24,7 @@ import json
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
-from typing import Iterator, Sequence
+from typing import Any, Iterator, Sequence
 
 from vidaio.competition import repository as repo
 from vidaio.competition.interfaces import (
@@ -58,6 +58,25 @@ EVENT_MODAL_EVALUATION_RESET = "modal_evaluation_reset"
 #: append-only ownership bindings, never provider-discovery results; restart may
 #: rehydrate only a matching id/spec/digest recorded here.
 EVENT_MODAL_IMAGE_BOUND = "modal_image_bound"
+#: Operator recovery actions on a RUNNING competition (docs/COMPETITIONS.md, "Saving a
+#: running competition").  Each is an append-only, public amendment: nothing here can
+#: touch the anchored manifest, the hidden items, the scorer or the payout rules.
+EVENT_OPERATOR_EVALUATION_RESET = "operator_evaluation_reset"
+EVENT_REQUEUE_BUDGET_RESET = "requeue_budget_reset"
+EVENT_SCHEDULE_AMENDED = "schedule_amended"
+EVENT_EXECUTION_AMENDED = "execution_amended"
+EVENT_CONTENDER_REJECTED_BY_OPERATOR = "contender_rejected_by_operator"
+EVENT_OPERATOR_PAUSED = "operator_paused"
+OPERATOR_AMENDMENT_EVENTS = (
+    EVENT_OPERATOR_PAUSED,
+    EVENT_HALT_CLEARED,
+    EVENT_REQUEUE_BUDGET_RESET,
+    EVENT_OPERATOR_EVALUATION_RESET,
+    EVENT_SCHEDULE_AMENDED,
+    EVENT_EXECUTION_AMENDED,
+    EVENT_CONTENDER_REJECTED_BY_OPERATOR,
+    EVENT_MODAL_EVALUATION_RESET,
+)
 
 
 @contextmanager
@@ -155,10 +174,26 @@ def _effective_batch_event_floor(conn: sqlite3.Connection, competition_id: str) 
     """
     row = conn.execute(
         "SELECT COALESCE(MAX(event_id), 0) AS event_id FROM events"
-        " WHERE competition_id = ? AND event_type = ?",
-        (competition_id, EVENT_MODAL_EVALUATION_RESET),
+        " WHERE competition_id = ? AND event_type IN (?, ?)",
+        (competition_id, EVENT_MODAL_EVALUATION_RESET, EVENT_OPERATOR_EVALUATION_RESET),
     ).fetchone()
     return int(row["event_id"])
+
+
+def effective_batch_event_floor(conn: sqlite3.Connection, competition_id: str) -> int:
+    """Public view of the evaluation-reset fence (see _effective_batch_event_floor)."""
+    return _effective_batch_event_floor(conn, competition_id)
+
+
+def _requeue_budget_floor(conn: sqlite3.Connection, competition_id: str) -> int:
+    """Requeues counted toward the halt budget start after the latest evaluation
+    reset OR the latest operator budget reset (clear-halt with a fresh budget)."""
+    row = conn.execute(
+        "SELECT COALESCE(MAX(event_id), 0) AS event_id FROM events"
+        " WHERE competition_id = ? AND event_type = ?",
+        (competition_id, EVENT_REQUEUE_BUDGET_RESET),
+    ).fetchone()
+    return max(int(row["event_id"]), _effective_batch_event_floor(conn, competition_id))
 
 
 def set_batch_status(
@@ -289,7 +324,7 @@ def requeue_count(conn: sqlite3.Connection, competition_id: str, batch_id: int) 
     """How many times this batch has been requeued (derived from the event log —
     survives ordinary restarts; a full Modal runtime reset starts a new effective
     attempt window because every batch is rerun)."""
-    floor = _effective_batch_event_floor(conn, competition_id)
+    floor = _requeue_budget_floor(conn, competition_id)
     rows = conn.execute(
         "SELECT payload_json FROM events WHERE competition_id = ? AND event_type = ?"
         " AND event_id > ?",
@@ -637,7 +672,21 @@ def record_halt(
     return True
 
 
-def clear_halt(
+def _operator_text(operator: str, reason: str, *, what: str) -> tuple[str, str]:
+    operator = operator.strip()
+    reason = reason.strip()
+    if not operator:
+        raise ValueError(f"{what} operator must be non-empty")
+    if not reason:
+        raise ValueError(f"{what} reason must be non-empty")
+    if len(operator) > 256:
+        raise ValueError(f"{what} operator must be at most 256 characters")
+    if len(reason) > 1000:
+        raise ValueError(f"{what} reason must be at most 1000 characters")
+    return operator, reason
+
+
+def record_operator_pause(
     conn: sqlite3.Connection,
     competition_id: str,
     operator: str,
@@ -645,7 +694,130 @@ def clear_halt(
     *,
     reason: str,
 ) -> bool:
-    """Operator action: resume after a fixed blocker, with an auditable reason."""
+    """Operator action: halt the pipeline on purpose (no sandbox or scoring work runs
+    until the halt is cleared; phase clocks keep ticking).  Idempotent."""
+    operator, reason = _operator_text(operator, reason, what="pause")
+    if is_halted(conn, competition_id):
+        return False
+    with txn(conn):
+        repo.record_event(
+            conn,
+            competition_id,
+            EVENT_OPERATOR_PAUSED,
+            now,
+            payload={"operator": operator, "reason": reason},
+        )
+        repo.record_event(
+            conn,
+            competition_id,
+            EVENT_HALTED,
+            now,
+            payload={"reason": f"paused by operator {operator}: {reason}"[:1000]},
+        )
+    return True
+
+
+def reset_evaluation_by_operator(
+    conn: sqlite3.Connection,
+    competition_id: str,
+    operator: str,
+    now: datetime,
+    *,
+    reason: str,
+    cause: str = "operator_full_matrix_rerun",
+    in_txn: bool = False,
+) -> None:
+    """Operator action: rerun the WHOLE evaluation matrix (every contender, every
+    batch) from scratch.  Nothing is deleted: the reset event is the same read fence
+    a runtime replacement uses, so earlier outputs stay auditable but never count."""
+    operator, reason = _operator_text(operator, reason, what="evaluation reset")
+
+    def _apply() -> None:
+        repo.record_event(
+            conn,
+            competition_id,
+            EVENT_OPERATOR_EVALUATION_RESET,
+            now,
+            payload={
+                "operator": operator,
+                "reason": reason,
+                "policy": "discard_prior_effective_batches_and_rerun_full_matrix",
+                "cause": cause,
+            },
+        )
+        conn.execute(
+            """UPDATE batches
+               SET status = 'PENDING', failure_code = NULL,
+                   started_at = NULL, finished_at = NULL
+               WHERE competition_id = ?""",
+            (competition_id,),
+        )
+
+    if in_txn:
+        _apply()
+    else:
+        with txn(conn):
+            _apply()
+
+
+def latest_execution_amendment(
+    conn: sqlite3.Connection, competition_id: str
+) -> dict[str, Any] | None:
+    """The effective sandbox envelope set by the latest execution amendment."""
+    row = conn.execute(
+        "SELECT payload_json FROM events WHERE competition_id = ? AND event_type = ?"
+        " ORDER BY event_id DESC LIMIT 1",
+        (competition_id, EVENT_EXECUTION_AMENDED),
+    ).fetchone()
+    if row is None:
+        return None
+    payload = json.loads(row["payload_json"] or "{}")
+    effective = payload.get("effective")
+    return dict(effective) if isinstance(effective, dict) else None
+
+
+def operator_amendments(
+    conn: sqlite3.Connection, competition_id: str
+) -> list[dict[str, Any]]:
+    """Every recovery action taken on this competition, oldest first (public)."""
+    marks = ",".join("?" for _ in OPERATOR_AMENDMENT_EVENTS)
+    rows = conn.execute(
+        f"SELECT event_id, event_type, payload_json, created_at FROM events"
+        f" WHERE competition_id = ? AND event_type IN ({marks}) ORDER BY event_id",
+        (competition_id, *OPERATOR_AMENDMENT_EVENTS),
+    ).fetchall()
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        payload = json.loads(row["payload_json"] or "{}")
+        if row["event_type"] == EVENT_MODAL_EVALUATION_RESET:
+            payload = {
+                "reason": "sandbox runtime replaced; the whole matrix is rerun",
+                "runtime_label": payload.get("runtime_label"),
+            }
+        out.append(
+            {
+                "event_id": int(row["event_id"]),
+                "type": str(row["event_type"]),
+                "at": str(row["created_at"]),
+                "details": payload,
+            }
+        )
+    return out
+
+
+def clear_halt(
+    conn: sqlite3.Connection,
+    competition_id: str,
+    operator: str,
+    now: datetime,
+    *,
+    reason: str,
+    reset_requeue_budget: bool = False,
+) -> bool:
+    """Operator action: resume after a fixed blocker, with an auditable reason.
+
+    ``reset_requeue_budget`` also restarts every batch's infra requeue budget, so a
+    batch that exhausted it before the fix gets its full retries again."""
     operator = operator.strip()
     reason = reason.strip()
     if not operator:
@@ -658,13 +830,26 @@ def clear_halt(
         raise ValueError("clear-halt reason must be at most 1000 characters")
     if not is_halted(conn, competition_id):
         return False
-    repo.record_event(
-        conn,
-        competition_id,
-        EVENT_HALT_CLEARED,
-        now,
-        payload={"operator": operator, "reason": reason},
-    )
+    with txn(conn):
+        repo.record_event(
+            conn,
+            competition_id,
+            EVENT_HALT_CLEARED,
+            now,
+            payload={
+                "operator": operator,
+                "reason": reason,
+                **({"reset_requeue_budget": True} if reset_requeue_budget else {}),
+            },
+        )
+        if reset_requeue_budget:
+            repo.record_event(
+                conn,
+                competition_id,
+                EVENT_REQUEUE_BUDGET_RESET,
+                now,
+                payload={"operator": operator, "reason": reason},
+            )
     return True
 
 

@@ -38,8 +38,9 @@ RUN groupadd --system --gid 10001 vidaio \
 # --- native tools -------------------------------------------------------------------
 # HTTPS-only pinned repository checkouts need a real Git client and the system
 # trust store. They are installed in both the release and inherited test image.
+# The ssh client carries the remote_docker sandbox fallback's forwarded daemon socket.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates git \
+ && apt-get install -y --no-install-recommends ca-certificates git openssh-client \
  && rm -rf /var/lib/apt/lists/*
 
 # ffmpeg + ffprobe (static, libvmaf + models built in) and the docker CLI client.
@@ -91,6 +92,7 @@ RUN ffmpeg -hide_banner -filters | grep -qi vmaf \
  && ffprobe -version >/dev/null \
  && docker --version >/dev/null \
  && git --version >/dev/null \
+ && ssh -V 2>/dev/null \
  && python scripts/verify_release_dependencies.py --preload-media
 
 # Bind the complete CI/build source identity to the exact Python/config/runtime

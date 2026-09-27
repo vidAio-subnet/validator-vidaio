@@ -427,7 +427,7 @@ class BittensorAdapterConfig:
     hotkey_seed_env: str = "VIDAIO_HOTKEY_SEED"
     #: Explicit convergence fence. Keep synchronized with EPOCH_LOG_SCHEMA_VERSION;
     #: zero is reserved for dependency-free report/test overlays.
-    version_key: int = 17
+    version_key: int = 18
     connect_timeout_seconds: float = 30.0
     rpc_timeout_seconds: float = 30.0
     #: A successful non-CR SDK response is only the submitter's claim.  Observe

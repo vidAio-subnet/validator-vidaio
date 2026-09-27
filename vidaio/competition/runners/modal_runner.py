@@ -1268,12 +1268,14 @@ class ModalSandboxRunner:
         self, lease: ModalSandboxLease, root: str
     ) -> tuple[int, int]:
         root_path = PurePosixPath(root)
+        root_missing: FileNotFoundError | None = None
         for rescan in range(_REMOTE_TREE_RESCAN_LIMIT + 1):
             total = 0
             count = 0
             pending = [root_path]
             seen: set[str] = set()
             restart = False
+            root_missing = None
             while pending:
                 directory = pending.pop()
                 key = str(directory)
@@ -1284,12 +1286,16 @@ class ModalSandboxRunner:
                 seen.add(key)
                 try:
                     entries = lease.list_files(key)
-                except FileNotFoundError:
-                    if directory == root_path:
-                        raise
+                except FileNotFoundError as exc:
                     # Contenders publish atomically by renaming a temporary child.
                     # Restart from the root so the watchdog charges the final name;
                     # silently ignoring the vanished child could undercount bytes.
+                    # Listing the ROOT can also report NotFound when a child vanishes
+                    # mid-listing (a contender rewriting its outputs); that is the
+                    # same race, so it restarts too.  A root that stays missing on
+                    # every rescan is still our failure (re-raised below as INFRA).
+                    if directory == root_path:
+                        root_missing = exc
                     restart = True
                     break
                 for entry in entries:
@@ -1310,6 +1316,8 @@ class ModalSandboxRunner:
                 return total, count
             if rescan == _REMOTE_TREE_RESCAN_LIMIT:
                 break
+        if root_missing is not None:
+            raise root_missing
         raise OutputRejectedError(
             "remote output tree kept changing during bounded watchdog traversal"
         )

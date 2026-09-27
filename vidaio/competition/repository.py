@@ -24,6 +24,7 @@ from vidaio.competition.manifest import ArchivedBaseline, CompetitionManifest
 from vidaio.competition.item_commitment import (
     compression_item_commitment,
     evaluation_item_commitment,
+    removal_item_commitment,
 )
 from vidaio.competition.states import Phase, RUNNING_PHASES
 
@@ -483,6 +484,43 @@ def add_evaluation_item(
                 raise ValueError(
                     "caller-supplied item_commitment disagrees with the canonical preimage"
                 )
+    elif manifest.track == "removal":
+        if reference_sha256 is None or reference_bytes is None:
+            raise ValueError(
+                "removal evaluation item requires reference_sha256/reference_bytes"
+            )
+        if (
+            upscale_factor is not None
+            or target_width is not None
+            or target_height is not None
+        ):
+            raise ValueError(
+                "removal evaluation items cannot carry upscaling factor/geometry"
+            )
+        if reference_bytes <= 0 or input_bytes <= 0:
+            raise ValueError("removal reference/input artifacts must be non-empty")
+        commitments = manifest.evaluation_item_commitments or []
+        if item_index >= len(commitments):
+            raise ValueError(
+                f"item_index {item_index} has no precommitted manifest entry"
+            )
+        derived_commitment = removal_item_commitment(
+            competition_id=competition_id,
+            item_index=item_index,
+            input_sha256=input_sha256,
+            reference_sha256=reference_sha256,
+        )
+        if derived_commitment != commitments[item_index]:
+            raise ValueError(
+                "removal evaluation item input/reference do not match the "
+                "pre-enrollment manifest commitment"
+            )
+        if item_commitment is not None and item_commitment != derived_commitment:
+            raise ValueError(
+                "caller-supplied item_commitment disagrees with the canonical preimage"
+            )
+        normalized_reference = reference_sha256
+        normalized_reference_bytes = reference_bytes
     else:
         if reference_sha256 is None or reference_bytes is None:
             raise ValueError(
@@ -688,6 +726,58 @@ def validate_evaluation_item_bindings(
             if row["item_commitment"] != derived or committed != derived:
                 raise EvaluationItemBindingError(
                     f"upscaling item {item_index} does not match its manifest commitment"
+                )
+        return rows
+
+    if manifest.track == "removal":
+        commitments = manifest.evaluation_item_commitments or []
+        if len(rows) != len(commitments):
+            raise EvaluationItemBindingError(
+                f"removal item matrix has {len(rows)} row(s), but the manifest "
+                f"commits {len(commitments)}"
+            )
+        for expected_index, (row, committed) in enumerate(zip(rows, commitments)):
+            item_index = int(row["item_index"])
+            reference_sha256 = row["reference_sha256"]
+            input_sha256 = str(row["input_sha256"])
+            if item_index != expected_index:
+                raise EvaluationItemBindingError(
+                    f"removal item order skips/reorders index {expected_index}"
+                )
+            if not isinstance(reference_sha256, str):
+                raise EvaluationItemBindingError(
+                    f"removal item {item_index} has no clean reference digest"
+                )
+            if (
+                row["upscale_factor"] is not None
+                or row["target_width"] is not None
+                or row["target_height"] is not None
+            ):
+                raise EvaluationItemBindingError(
+                    f"removal item {item_index} carries upscaling factor/geometry"
+                )
+            if (
+                not isinstance(row["reference_bytes"], int)
+                or int(row["reference_bytes"]) <= 0
+                or int(row["input_bytes"]) <= 0
+            ):
+                raise EvaluationItemBindingError(
+                    f"removal item {item_index} has an invalid artifact size"
+                )
+            try:
+                derived = removal_item_commitment(
+                    competition_id=competition_id,
+                    item_index=item_index,
+                    input_sha256=input_sha256,
+                    reference_sha256=reference_sha256,
+                )
+            except ValueError as exc:
+                raise EvaluationItemBindingError(
+                    f"removal item {item_index} binding is invalid: {exc}"
+                ) from exc
+            if row["item_commitment"] != derived or committed != derived:
+                raise EvaluationItemBindingError(
+                    f"removal item {item_index} does not match its manifest commitment"
                 )
         return rows
 

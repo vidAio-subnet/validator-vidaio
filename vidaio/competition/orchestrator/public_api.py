@@ -25,6 +25,7 @@ between orchestrator ticks and hold no transaction across an await.
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from collections import defaultdict, deque
@@ -34,6 +35,7 @@ from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from vidaio.competition import repository as repo
+from vidaio.competition.orchestrator import persistence as pers
 from vidaio.competition.states import Phase
 
 if TYPE_CHECKING:
@@ -106,6 +108,7 @@ def _public_competition(orch: "Orchestrator", comp: repo.CompetitionRecord) -> d
         c for c in repo.list_contenders(orch.conn, comp.competition_id)
         if not c.is_calibration
     ]
+    reasons = _contender_reasons(orch, comp.competition_id)
     return {
         "competition_id": comp.competition_id,
         "track": comp.track,
@@ -118,8 +121,55 @@ def _public_competition(orch: "Orchestrator", comp: repo.CompetitionRecord) -> d
         "end_time": comp.end_time.isoformat(),
         "enrollment_open": comp.status is Phase.ENROLLING,
         "manifest": manifest.model_dump(mode="json", exclude_none=True),
-        "enrolled": [{"hotkey": c.hotkey, "status": c.status} for c in contenders],
+        "enrolled": [
+            {
+                "hotkey": c.hotkey,
+                "status": c.status,
+                **(
+                    {"reason": reasons[c.contender_id]}
+                    if c.contender_id in reasons
+                    else {}
+                ),
+            }
+            for c in contenders
+        ],
+        #: Every recovery action taken on this competition (paused, resumed,
+        #: deadlines moved later, sandbox envelope raised, matrix rerun, ...).
+        "amendments": [
+            {
+                "type": entry["type"],
+                "at": entry["at"],
+                "details": {
+                    k: v for k, v in entry["details"].items() if k != "operator"
+                },
+            }
+            for entry in pers.operator_amendments(orch.conn, comp.competition_id)
+        ],
+        "sandbox_resources": orch.effective_sandbox_resources(comp.competition_id),
     }
+
+
+def _contender_reasons(orch: "Orchestrator", competition_id: str) -> dict[int, str]:
+    """Why a contender stopped (REJECTED / BUILD_FAILED), latest event wins."""
+    reasons: dict[int, str] = {}
+    rows = orch.conn.execute(
+        "SELECT event_type, payload_json FROM events WHERE competition_id = ?"
+        " AND event_type IN ('contender_validated', 'contender_build_failed',"
+        " 'contender_rejected_by_operator') ORDER BY event_id",
+        (competition_id,),
+    ).fetchall()
+    for row in rows:
+        payload = json.loads(row["payload_json"] or "{}")
+        cid = payload.get("contender_id")
+        reason = payload.get("reason")
+        if isinstance(cid, int) and isinstance(reason, str) and reason:
+            if row["event_type"] == "contender_validated" and payload.get("status") != "REJECTED":
+                continue
+            # public: the first line only (a build log can quote the private tree);
+            # the full text stays in the operator's control API and event log
+            first = reason.strip().splitlines()[0] if reason.strip() else ""
+            reasons[cid] = first[:300]
+    return reasons
 
 
 def create_public_app(

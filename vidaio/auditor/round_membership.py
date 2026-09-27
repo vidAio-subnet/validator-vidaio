@@ -103,7 +103,7 @@ def audit_round_membership(service, log, store, prior_log=None, is_genesis=True)
     """Return conclusive membership faults, honest refusals, or report-only lateness."""
     if isinstance(log, _HistoryEpochLogV16):
         return ()
-    if log.schema_version != 17 or log.round_membership != "commit/1":
+    if log.schema_version < 17 or log.round_membership != "commit/1":
         return (_verdict(ItemVerdictKind.FAIL, "current epoch lacks mandatory commit/1 membership"),)
     manifest = log.audit_manifest
     try:

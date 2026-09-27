@@ -28,8 +28,11 @@ from vidaio.competition.manifest import (
 )
 from vidaio.competition.item_commitment import (
     EVALUATION_ITEM_COMMITMENT_DOMAIN,
+    REMOVAL_ITEM_COMMITMENT_DOMAIN,
+    REMOVAL_MASK_STREAM_INDEX,
     evaluation_item_commitment,
     evaluation_item_preimage,
+    removal_item_commitment,
 )
 from vidaio.competition.repository import (
     CompetitionRecord,
@@ -68,6 +71,9 @@ __all__ = [
     "EVALUATION_ITEM_COMMITMENT_DOMAIN",
     "evaluation_item_commitment",
     "evaluation_item_preimage",
+    "REMOVAL_ITEM_COMMITMENT_DOMAIN",
+    "REMOVAL_MASK_STREAM_INDEX",
+    "removal_item_commitment",
     "Phase",
     "RUNNING_PHASES",
     "TERMINAL_PHASES",

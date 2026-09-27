@@ -65,5 +65,7 @@ def test_competition_only_contenders_are_actually_paid() -> None:
         podium_hotkeys=window.podium_hotkeys, track=window.source_track,
     )
     paid = build_weight_vector(config, snapshots, burn_uid=0, reward_state=window, now=NOW)
-    assert abs(paid[5] - 0.40 * 0.70) < 1e-12 and abs(paid[7] - 0.40 * 0.20) < 1e-12
-    assert paid[1] > 0.0  # the inference miner keeps its own share
+    # A window without its own payout policy is paid with the live v3 defaults: the
+    # whole emission, podium split 50/24 redistributed over the two filled places.
+    assert abs(paid[5] - 0.50 / 0.74) < 1e-12 and abs(paid[7] - 0.24 / 0.74) < 1e-12
+    assert paid[1] == 0.0  # inference earns nothing under tokenomics v3

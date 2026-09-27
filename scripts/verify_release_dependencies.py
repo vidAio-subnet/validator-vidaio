@@ -319,6 +319,24 @@ def _verify_git_executable() -> str:
     return version
 
 
+def _preload_removal_metrics() -> dict[str, Any]:
+    """Cache the LPIPS-VGG weights (object-removal track) inside TORCH_HOME at image
+    build time, so the release never fetches weights at scoring time, and prove a
+    deterministic CPU distance on a fixed pair."""
+    import numpy as np
+
+    from vidaio.scoring.removal import LpipsVgg
+
+    net = LpipsVgg()
+    rng = np.random.default_rng(7)
+    a = rng.integers(0, 256, size=(96, 96, 3), dtype=np.uint8)
+    b = np.clip(a.astype(np.int16) + rng.integers(-20, 21, size=a.shape), 0, 255).astype(np.uint8)
+    d1, d2 = net.distance(a, b), net.distance(a, b)
+    if not (0.0 <= d1 <= 2.0) or d1 != d2:
+        raise RuntimeError(f"LPIPS-VGG is not deterministic or out of range: {d1!r} vs {d2!r}")
+    return {"lpips_vgg_probe_distance": d1}
+
+
 def _prove_cpu_pieapp_inference(pieapp: Any) -> float:
     """Decode real video frames and execute the packaged PieAPP model on CPU.
 
@@ -1054,6 +1072,7 @@ def verify(
     cpu_video_phash: dict[str, Any] | None = None
     if preload_media:
         pieapp.preload()
+        _preload_removal_metrics()
         pieapp_cpu_inference = _prove_cpu_pieapp_inference(pieapp)
         cpu_video_phash = _prove_cpu_video_phash()
         cpu_upscaling_score_audit = _prove_cpu_upscaling_score_audit(

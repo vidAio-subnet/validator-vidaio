@@ -60,7 +60,10 @@ from vidaio.audit.bundle import AuditBundle, LifecycleStage
 from vidaio.audit.commitments import verify_merkle_proof
 from vidaio.audit.canonical import canonical_json_bytes, sha256_hex
 from vidaio.audit.store import ArtifactKind, ArtifactRef, AuditStore, IntegrityError
-from vidaio.competition.item_commitment import evaluation_item_commitment
+from vidaio.competition.item_commitment import (
+    evaluation_item_commitment,
+    removal_item_commitment,
+)
 
 ArtifactPayload = bytes | Path
 
@@ -102,6 +105,21 @@ DEFAULT_TOLERANCES: Mapping[str, float] = MappingProxyType(
         "psnr_uv_reference": 1e-6,
         "psnr_uv_input": 1e-6,
         "chroma_residual": 1e-6,
+        # Object-removal region metrics: integer-exact sums with one log10 (PSNR),
+        # float64 Gaussian SSIM and DIS flow pinned to one OpenCV thread, LPIPS on the
+        # canonical CPU torch policy — last-decimal allowances only, never a
+        # decision-boundary budget (the boundary itself has hysteresis below).
+        "region_psnr_db": 1e-6,
+        "region_floor_psnr_db": 1e-6,
+        "region_psnr_margin_db": 1e-6,
+        "region_ssim": 1e-6,
+        "region_lpips_vgg": 1e-5,
+        "region_floor_lpips_vgg": 1e-5,
+        "region_warp_error": 1e-4,
+        "region_warp_error_reference": 1e-4,
+        "region_warp_cap": 1e-4,
+        "region_outside_change": 1e-6,
+        "mask_fraction": 1e-9,
         "final_score": 1e-5,
         "score": 1e-5,
     }
@@ -174,6 +192,65 @@ class CompetitionAuditContext:
     target_width: int | None = None
     target_height: int | None = None
     item_commitment: str | None = None
+    #: Object removal: the served input's mask stream (committed in the preimage).
+    mask_stream_index: int | None = None
+
+
+def _removal_binding_problems(
+    bundle: AuditBundle,
+    context: CompetitionAuditContext,
+    manifest: Mapping[str, Any] | None,
+) -> list[str]:
+    """Object-removal counterpart of the upscaling preimage checks: the bundle, the
+    epoch evidence and the anchored manifest must all name the same input/reference
+    pair and mask stream at the same committed index."""
+    problems: list[str] = []
+    binding = bundle.competition_item
+    context_binding = (
+        context.item_index,
+        context.input_sha256,
+        context.reference_sha256,
+        context.mask_stream_index,
+        context.item_commitment,
+    )
+    if binding is None or any(value is None for value in context_binding):
+        return ["removal competition item commitment preimage is incomplete"]
+    if (
+        binding.item_index,
+        binding.input_sha256,
+        binding.reference_sha256,
+        binding.mask_stream_index,
+        binding.item_commitment,
+    ) != context_binding:
+        problems.append("bundle removal item preimage differs from epoch evidence")
+    if (
+        bundle.challenge_input.digest != binding.input_sha256
+        or bundle.reference_original is None
+        or bundle.reference_original.digest != binding.reference_sha256
+    ):
+        problems.append("bundle media refs differ from the removal item preimage")
+    try:
+        derived = removal_item_commitment(
+            competition_id=context.competition_id,
+            item_index=binding.item_index,
+            input_sha256=binding.input_sha256,
+            reference_sha256=binding.reference_sha256,
+            mask_stream_index=int(binding.mask_stream_index or 0),
+        )
+    except ValueError as exc:
+        problems.append(f"removal item preimage is invalid: {exc}")
+        return problems
+    if derived != binding.item_commitment:
+        problems.append("removal item commitment does not hash its preimage")
+    if manifest is not None:
+        commitments = manifest.get("evaluation_item_commitments")
+        if (
+            not isinstance(commitments, list)
+            or binding.item_index >= len(commitments)
+            or commitments[binding.item_index] != derived
+        ):
+            problems.append("removal item is not at its committed manifest index")
+    return problems
 
 
 # Legacy authority-attributed zero packets are identified only so the verifier
@@ -714,6 +791,9 @@ _BOUNDARY_METRICS: dict[str, tuple[str, Literal["below", "above"]]] = {
     "TONE_MANIPULATION": ("tone_manipulation_measure", "above"),
     "COLOR_GRAYSCALE": ("color_grayscale_measure", "below"),
     "CHROMA_UV_MANIPULATION": ("chroma_uv_measure", "above"),
+    # object removal: formula eligibility boundaries (see score_removal)
+    "REGION_BASELINE_NOT_BEATEN": ("region_psnr_margin_db", "below"),
+    "WARP_ERROR_EXCEEDED": ("region_warp_error", "above"),
 }
 
 
@@ -736,7 +816,26 @@ def _formula_boundary(breakdown: Mapping[str, Any] | None) -> dict[str, Any] | N
     """
     if not isinstance(breakdown, Mapping):
         return None
-    if breakdown.get("kind") != "compression":
+    kind = breakdown.get("kind")
+    if kind == "removal":
+        reason = breakdown.get("zero_reason")
+        psnr, floor = breakdown.get("psnr_db"), breakdown.get("floor_psnr_db")
+        if reason == "REGION_BASELINE_NOT_BEATEN":
+            if not isinstance(psnr, numbers.Real) or not isinstance(floor, numbers.Real):
+                return None
+            return {
+                "code": "REGION_BASELINE_NOT_BEATEN",
+                "measured": float(psnr) - float(floor),
+                "limit": breakdown.get("psnr_margin_db"),
+            }
+        if reason == "WARP_ERROR_EXCEEDED":
+            return {
+                "code": "WARP_ERROR_EXCEEDED",
+                "measured": breakdown.get("warp_error"),
+                "limit": breakdown.get("warp_cap"),
+            }
+        return None
+    if kind != "compression":
         return None
     if breakdown.get("zero_reason") != "VMAF_BELOW_THRESHOLD":
         return None
@@ -941,7 +1040,7 @@ def verify_bundle(
             and bundle.stage is LifecycleStage.PRE_REVEAL
         )
         or (
-            competition_context.track == "upscaling"
+            competition_context.track in ("upscaling", "removal")
             and bundle.stage is LifecycleStage.COMPETITION_SEALED
         )
     )
@@ -1158,6 +1257,14 @@ def verify_bundle(
             if ArtifactKind.REFERENCE_ORIGINAL not in artifacts:
                 manifest_problems.append(
                     "upscaling pristine reference is unavailable or unreleased"
+                )
+        if competition_context.track == "removal":
+            manifest_problems.extend(
+                _removal_binding_problems(bundle, competition_context, competition_manifest)
+            )
+            if ArtifactKind.REFERENCE_ORIGINAL not in artifacts:
+                manifest_problems.append(
+                    "removal clean reference is unavailable or unreleased"
                 )
         if manifest_problems:
             checks.append(

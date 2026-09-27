@@ -41,7 +41,7 @@ from vidaio.epoch.log import (
     MinerCensusEntry,
     weight_vector_digest,
 )
-from vidaio.tokenomics import TokenomicsConfig, quantize_u16
+from vidaio.tokenomics import EMISSION_PROFILES, TokenomicsConfig, quantize_u16
 from vidaio.tokenomics.ewma import accumulate
 from vidaio.tokenomics.weights import build_weight_vector
 
@@ -59,7 +59,7 @@ from tests.auditor.fakes import (
 )
 
 DECAY = TokenomicsConfig().ewma_decay
-CFG = TokenomicsConfig()
+CFG = TokenomicsConfig(**EMISSION_PROFILES["v2"])  # these suites run on the v2 profile
 NO_SAMPLE = SamplePolicy(sample_rate=0.0, min_samples=0)  # earning-only, no media recompute
 
 

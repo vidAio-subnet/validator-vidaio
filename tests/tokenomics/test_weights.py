@@ -27,13 +27,13 @@ def _two_track_inference(mk_miner):
     ]
 
 
-def test_idle_is_80_inference_20_canonical_sink(cfg, mk_miner) -> None:
+def test_idle_burns_everything_under_v3(cfg, mk_miner) -> None:
     vector = build_weight_vector(cfg, _two_track_inference(mk_miner), burn_uid=BURN_UID)
-    assert vector == pytest.approx({1: 0.64, 2: 0.16, BURN_UID: 0.20})
+    assert vector == pytest.approx({1: 0.0, 2: 0.0, BURN_UID: 1.0})
     assert sum(vector.values()) == pytest.approx(1.0)
 
 
-def test_podium_is_60_inference_40_ranked_70_20_10(
+def test_podium_pays_the_whole_pot_50_24_13_redistributed(
     live_cfg, mk_miner, mk_result, mk_podium_miners
 ) -> None:
     state = resolve_reward_window(
@@ -43,11 +43,11 @@ def test_podium_is_60_inference_40_ranked_70_20_10(
     vector = build_weight_vector(
         live_cfg, miners, burn_uid=BURN_UID, reward_state=state, now=T0
     )
-    assert vector == pytest.approx({1: 0.48, 2: 0.12, 100: 0.28, 101: 0.08, 102: 0.04})
+    assert vector == pytest.approx({1: 0.0, 2: 0.0, 100: 0.50 / 0.87, 101: 0.24 / 0.87, 102: 0.13 / 0.87})
     assert BURN_UID not in vector
 
 
-def test_crown_is_10_inference_90_ranked_70_20_10(
+def test_crown_pays_the_whole_pot_90_4_3_redistributed(
     live_cfg, mk_miner, mk_result, mk_podium_miners
 ) -> None:
     state = resolve_reward_window(
@@ -57,15 +57,15 @@ def test_crown_is_10_inference_90_ranked_70_20_10(
     vector = build_weight_vector(
         live_cfg, miners, burn_uid=BURN_UID, reward_state=state, now=T0
     )
-    assert vector == pytest.approx({1: 0.08, 2: 0.02, 100: 0.63, 101: 0.18, 102: 0.09})
+    assert vector == pytest.approx({1: 0.0, 2: 0.0, 100: 0.90 / 0.97, 101: 0.04 / 0.97, 102: 0.03 / 0.97})
     assert BURN_UID not in vector
 
 
 @pytest.mark.parametrize(
     ("winner_score", "winner_share", "burn_share"),
-    [(0.51, 0.28, 0.12), (0.80, 0.63, 0.27)],
+    [(0.51, 1.0, 0.0), (0.80, 1.0, 0.0)],
 )
-def test_missing_podium_ranks_go_to_sink(
+def test_missing_podium_ranks_are_redistributed_to_the_filled_ones(
     live_cfg,
     mk_miner,
     mk_result,
@@ -82,7 +82,7 @@ def test_missing_podium_ranks_go_to_sink(
         live_cfg, miners, burn_uid=BURN_UID, reward_state=state, now=T0
     )
     assert vector[100] == pytest.approx(winner_share)
-    assert vector[BURN_UID] == pytest.approx(burn_share)
+    assert vector.get(BURN_UID, 0.0) == pytest.approx(burn_share)
     assert sum(vector.values()) == pytest.approx(1.0)
 
 
@@ -96,9 +96,9 @@ def test_deregistered_podium_rank_goes_to_sink(
     vector = build_weight_vector(
         live_cfg, miners, burn_uid=BURN_UID, reward_state=state, now=T0
     )
-    assert vector[100] == pytest.approx(0.28)
-    assert vector[102] == pytest.approx(0.04)
-    assert vector[BURN_UID] == pytest.approx(0.08)
+    assert vector[100] == pytest.approx(0.50 / 0.87)
+    assert vector[102] == pytest.approx(0.13 / 0.87)
+    assert vector[BURN_UID] == pytest.approx(0.24 / 0.87)  # deregistered place: sink, never re-split
 
 
 def test_exact_window_end_reverts_to_idle(live_cfg, mk_miner, mk_result) -> None:
@@ -112,7 +112,7 @@ def test_exact_window_end_reverts_to_idle(live_cfg, mk_miner, mk_result) -> None
         reward_state=state,
         now=T0 + timedelta(hours=168),
     )
-    assert vector == pytest.approx({1: 0.64, 2: 0.16, BURN_UID: 0.20})
+    assert vector == pytest.approx({1: 0.0, 2: 0.0, BURN_UID: 1.0})
 
 
 def test_disabled_competition_forces_idle_even_with_crown(
@@ -122,7 +122,7 @@ def test_disabled_competition_forces_idle_even_with_crown(
     vector = build_weight_vector(
         cfg, _two_track_inference(mk_miner), burn_uid=BURN_UID, reward_state=state
     )
-    assert vector == pytest.approx({1: 0.64, 2: 0.16, BURN_UID: 0.20})
+    assert vector == pytest.approx({1: 0.0, 2: 0.0, BURN_UID: 1.0})
 
 
 def test_no_eligible_miners_burns_everything(cfg, mk_miner) -> None:

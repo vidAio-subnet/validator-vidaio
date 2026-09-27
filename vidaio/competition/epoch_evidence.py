@@ -11,13 +11,15 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import io
 import json
 import math
 import re
 import sqlite3
+import tarfile
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Mapping
+from typing import Any, Mapping
 
 from vidaio.audit.commitments import (
     build_competition_commitment,
@@ -29,6 +31,10 @@ from vidaio.audit.bundle import AuditBundle
 from vidaio.audit.store import ArtifactKind, ArtifactRef, AuditStore, backend_key
 from vidaio.authority.finalizer import ScoredItem
 from vidaio.competition import repository as repo
+from vidaio.competition.item_commitment import (
+    REMOVAL_MASK_STREAM_INDEX,
+    SEALED_REFERENCE_TRACKS,
+)
 from vidaio.competition.economic_result import (
     CompetitionDedupCandidate,
     competition_dedup_losers,
@@ -48,7 +54,8 @@ from vidaio.epoch.log import (
     MinerCensusEntry,
 )
 from vidaio.scoring.result import ItemScore
-from vidaio.tokenomics.breakthrough import qualifies_for_crown, winner
+from vidaio.tokenomics.breakthrough import result_kind, winner
+from vidaio.tokenomics.state import EmissionState
 from vidaio.tokenomics.state import CompetitionResult
 from vidaio.tokenomics.config import TokenomicsConfig
 
@@ -113,6 +120,98 @@ def _archived_submissions(
             )
         archived[contender_id] = ref
     return archived
+
+
+#: A baseline source archive is small (a registry executable, tens of KiB); the
+#: content comparison below refuses anything larger than this outright.
+_MAX_BASELINE_ARCHIVE_BYTES = 64 << 20
+
+
+def _archive_tree(store: AuditStore, ref: ArtifactRef, *, what: str) -> tuple[tuple[str, str], ...]:
+    """The exact file tree of one tar archive: sorted (path, sha256 of the bytes).
+
+    Only regular files and directories are allowed; a link, device or any other
+    member type refuses the archive. Directory entries, member modes, owners,
+    timestamps and tar headers are container metadata and are not part of the tree.
+    """
+    if ref.byte_size > _MAX_BASELINE_ARCHIVE_BYTES:
+        raise CompetitionEvidenceError(f"{what} is too large to compare ({ref.byte_size} bytes)")
+    try:
+        with contextlib.closing(store.open_stream(ref)) as stream:
+            chunks: list[bytes] = []
+            total = 0
+            while chunk := stream.read(1 << 20):
+                total += len(chunk)
+                if total > ref.byte_size:
+                    break
+                chunks.append(chunk)
+            data = b"".join(chunks) if total <= ref.byte_size else b""
+            if total > ref.byte_size:
+                raise CompetitionEvidenceError(f"{what} exceeds its committed byte size")
+    except Exception as exc:
+        raise CompetitionEvidenceError(
+            f"{what} is absent or unreadable from the audit store: {type(exc).__name__}: {exc}"
+        ) from exc
+    if len(data) != ref.byte_size or hashlib.sha256(data).hexdigest() != ref.digest:
+        raise CompetitionEvidenceError(
+            f"{what} bytes do not match their content-addressed archive reference"
+        )
+    files: dict[str, str] = {}
+    try:
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as archive:
+            for member in archive.getmembers():
+                name = member.name
+                while name.startswith("./"):
+                    name = name[2:]
+                name = name.rstrip("/")
+                if member.isdir():
+                    continue
+                if (
+                    not member.isfile()
+                    or not name
+                    or name.startswith("/")
+                    or ".." in name.split("/")
+                ):
+                    raise CompetitionEvidenceError(
+                        f"{what} holds a non-regular or unsafe member {member.name!r}"
+                    )
+                body = archive.extractfile(member)
+                if body is None or name in files:
+                    raise CompetitionEvidenceError(f"{what} has an unreadable or duplicate member {name!r}")
+                files[name] = hashlib.sha256(body.read()).hexdigest()
+    except CompetitionEvidenceError:
+        raise
+    except (tarfile.TarError, OSError, ValueError) as exc:
+        raise CompetitionEvidenceError(f"{what} is not a readable tar archive: {exc}") from exc
+    return tuple(sorted(files.items()))
+
+
+def _absolute_bars(manifest: Any) -> bool:
+    """A baseline-free competition must anchor both absolute score bars."""
+    rules = getattr(manifest, "result_rules", None)
+    return (
+        rules is not None
+        and rules.crown_min_score is not None
+        and rules.podium_min_score is not None
+        and rules.podium_min_margin is None
+    )
+
+
+def _same_baseline_source(
+    store: AuditStore, sealed: ArtifactRef, registry: ArtifactRef
+) -> bool:
+    """True when the sealed baseline archive carries exactly the registry's source.
+
+    The registry artifact and the archive sealed at finalization can be produced by
+    different archivers (``git archive`` versus the orchestrator's canonical tar) for
+    the SAME pinned tree. Identical bytes are accepted as before; otherwise the two
+    must hold exactly the same files with exactly the same contents.
+    """
+    if sealed == registry:
+        return True
+    return _archive_tree(
+        store, sealed, what="competition baseline sealed source archive"
+    ) == _archive_tree(store, registry, what="active baseline registry artifact")
 
 
 def _verify_archived_ref(store: AuditStore, ref: ArtifactRef, *, what: str) -> None:
@@ -360,6 +459,34 @@ def _require_bundle(
             f"competition subject {subject_id!r} audit bundle {digest} identity is "
             f"{actual_identity!r}, expected {expected_identity!r}"
         )
+    if track == "removal":
+        binding = bundle.competition_item
+        expected_removal = (
+            int(row["item_index"]),
+            str(row["input_sha256"]),
+            str(row["reference_sha256"]),
+            REMOVAL_MASK_STREAM_INDEX,
+            str(row["item_commitment"]),
+        )
+        actual_removal = (
+            None
+            if binding is None
+            else (
+                binding.item_index,
+                binding.input_sha256,
+                binding.reference_sha256,
+                binding.mask_stream_index,
+                binding.item_commitment,
+            )
+        )
+        if (
+            bundle.stage.value != "competition_sealed"
+            or actual_removal != expected_removal
+        ):
+            raise CompetitionEvidenceError(
+                f"competition subject {subject_id!r} audit bundle {digest} has "
+                "no valid manifest-bound removal item preimage"
+            )
     if track == "upscaling":
         binding = bundle.competition_item
         expected_binding = (
@@ -392,6 +519,7 @@ def _require_bundle(
                 f"competition subject {subject_id!r} audit bundle {digest} has "
                 "no valid manifest-bound upscaling item preimage"
             )
+    if track in SEALED_REFERENCE_TRACKS:
         reference = bundle.reference_original
         if (
             reference is None
@@ -560,36 +688,50 @@ def build_competition_epoch_evidence(
         expected_payload=commitment_payload.payload,
         enrollment_start=manifest.start_time,
     )
-    if manifest.baseline is None:
-        raise CompetitionEvidenceError(
-            f"competition {selected!r} has no non-earning archived baseline"
+    # A competition anchored WITHOUT an executable baseline is decided by its anchored
+    # absolute score bars alone; it commits null baseline provenance and has no
+    # calibration subject (tokenomics.breakthrough.decision_baseline).
+    baseline_artifact: ArtifactRef | None = None
+    if manifest.baseline is not None:
+        baseline_artifact = ArtifactRef(
+            digest=manifest.baseline.artifact_digest,
+            kind=ArtifactKind.SUBMISSION_ARCHIVE,
+            byte_size=manifest.baseline.artifact_bytes,
+            backend_key=backend_key(
+                ArtifactKind.SUBMISSION_ARCHIVE, manifest.baseline.artifact_digest
+            ),
         )
-    baseline_artifact = ArtifactRef(
-        digest=manifest.baseline.artifact_digest,
-        kind=ArtifactKind.SUBMISSION_ARCHIVE,
-        byte_size=manifest.baseline.artifact_bytes,
-        backend_key=backend_key(
-            ArtifactKind.SUBMISSION_ARCHIVE, manifest.baseline.artifact_digest
-        ),
-    )
-    baseline_provenance = ArtifactRef(
-        digest=manifest.baseline.provenance_digest,
-        kind=ArtifactKind.MANIFEST,
-        byte_size=manifest.baseline.provenance_bytes,
-        backend_key=backend_key(
-            ArtifactKind.MANIFEST, manifest.baseline.provenance_digest
-        ),
-    )
-    _verify_archived_ref(store, baseline_artifact, what="active baseline executable")
-    _verify_archived_ref(store, baseline_provenance, what="active baseline provenance")
+        baseline_provenance = ArtifactRef(
+            digest=manifest.baseline.provenance_digest,
+            kind=ArtifactKind.MANIFEST,
+            byte_size=manifest.baseline.provenance_bytes,
+            backend_key=backend_key(
+                ArtifactKind.MANIFEST, manifest.baseline.provenance_digest
+            ),
+        )
+        _verify_archived_ref(store, baseline_artifact, what="active baseline executable")
+        _verify_archived_ref(store, baseline_provenance, what="active baseline provenance")
+    elif not _absolute_bars(manifest):
+        raise CompetitionEvidenceError(
+            f"competition {selected!r} has no baseline and no anchored absolute "
+            "crown_min_score/podium_min_score bars"
+        )
     expected_commitment = {
         "manifest_digest": competition.manifest_digest,
-        "baseline_version": manifest.baseline.version,
-        "baseline_artifact_digest": manifest.baseline.artifact_digest,
-        "baseline_provenance_digest": manifest.baseline.provenance_digest,
-        "baseline_tree_digest": pin_git_sha(manifest.baseline.tree_sha),
+        "baseline_version": None if manifest.baseline is None else manifest.baseline.version,
+        "baseline_artifact_digest": (
+            None if manifest.baseline is None else manifest.baseline.artifact_digest
+        ),
+        "baseline_provenance_digest": (
+            None if manifest.baseline is None else manifest.baseline.provenance_digest
+        ),
+        "baseline_tree_digest": (
+            None if manifest.baseline is None else pin_git_sha(manifest.baseline.tree_sha)
+        ),
         "dataset_selection_seed_commitment": manifest.scoring_seed_commitment,
     }
+    if manifest.baseline is None:
+        expected_commitment["baseline_image_digest"] = None
     if tokenomics is not None:
         expected_commitment["reward_param_digest"] = reward_parameter_digest(
             tokenomics
@@ -642,15 +784,20 @@ def build_competition_epoch_evidence(
                 if row["item_commitment"] is None
                 else str(row["item_commitment"])
             ),
+            mask_stream_index=(
+                REMOVAL_MASK_STREAM_INDEX if manifest.track == "removal" else None
+            ),
         )
         for row in item_rows
     )
 
     contenders = repo.list_contenders(conn, selected)
     baselines = [record for record in contenders if record.is_calibration]
-    if len(baselines) != 1:
+    expected_baselines = 0 if manifest.baseline is None else 1
+    if len(baselines) != expected_baselines:
         raise CompetitionEvidenceError(
-            f"competition {selected!r} needs exactly one archived baseline; found {len(baselines)}"
+            f"competition {selected!r} needs exactly {expected_baselines} archived "
+            f"baseline(s); found {len(baselines)}"
         )
     built_contenders = [
         record
@@ -670,14 +817,14 @@ def build_competition_epoch_evidence(
             f"competition {selected!r} has BUILT contender(s) absent from the "
             f"close-block census: {missing_census}"
         )
-    included = [baselines[0]]
+    included = list(baselines)
     included.extend(
         sorted(
             built_contenders,
             key=lambda record: (record.hotkey or "", record.contender_id),
         )
     )
-    if len(included) == 1:
+    if not built_contenders:
         # A completed competition with no currently registered, machine-accepted
         # contender has no payable result.
         return None
@@ -696,12 +843,14 @@ def build_competition_epoch_evidence(
             archived[record.contender_id],
             what=f"competition subject {record.contender_id} sealed source archive",
         )
-    baseline_archive = archived[baselines[0].contender_id]
-    if baseline_archive != baseline_artifact:
-        raise CompetitionEvidenceError(
-            "competition baseline source archive does not exactly match the active "
-            "registry artifact committed by the manifest"
-        )
+    if baselines:
+        assert baseline_artifact is not None
+        baseline_archive = archived[baselines[0].contender_id]
+        if not _same_baseline_source(store, baseline_archive, baseline_artifact):
+            raise CompetitionEvidenceError(
+                "competition baseline source archive does not carry exactly the source of "
+                "the active registry artifact committed by the manifest"
+            )
 
     subjects: list[CompetitionAuditSubject] = []
     scored_items: list[ScoredItem] = []
@@ -861,12 +1010,22 @@ def build_competition_epoch_evidence(
         anchor_block=int(anchor_receipt["anchor_block"]),
         anchor_block_hash=str(anchor_receipt["anchor_block_hash"]),
         anchor_finalized_block=int(anchor_receipt["finalized_block"]),
-        baseline_version=manifest.baseline.version,
-        baseline_artifact_digest=manifest.baseline.artifact_digest,
-        baseline_artifact_bytes=manifest.baseline.artifact_bytes,
-        baseline_execution_image_digest=manifest.baseline.image_digest,
-        baseline_provenance_digest=manifest.baseline.provenance_digest,
-        baseline_provenance_bytes=manifest.baseline.provenance_bytes,
+        baseline_version=None if manifest.baseline is None else manifest.baseline.version,
+        baseline_artifact_digest=(
+            None if manifest.baseline is None else manifest.baseline.artifact_digest
+        ),
+        baseline_artifact_bytes=(
+            None if manifest.baseline is None else manifest.baseline.artifact_bytes
+        ),
+        baseline_execution_image_digest=(
+            None if manifest.baseline is None else manifest.baseline.image_digest
+        ),
+        baseline_provenance_digest=(
+            None if manifest.baseline is None else manifest.baseline.provenance_digest
+        ),
+        baseline_provenance_bytes=(
+            None if manifest.baseline is None else manifest.baseline.provenance_bytes
+        ),
         rules=(
             None
             if manifest.result_rules is None
@@ -883,12 +1042,7 @@ def build_competition_epoch_evidence(
         return None
     if (
         tokenomics is not None
-        and qualifies_for_crown(
-            tokenomics,
-            result.baseline_score,
-            best.score,
-            result.rules,
-        )
+        and result_kind(tokenomics, result) is EmissionState.CROWN
     ):
         # CROWN is the disclosure boundary: the exact winning source archive must
         # become publicly readable before an epoch can commit the earning result.

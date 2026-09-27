@@ -39,7 +39,7 @@ class WeightSetterConfig(BaseModel):
 
     #: Fleet convergence fence, synchronized with EPOCH_LOG_SCHEMA_VERSION.
     #: Report/test overlays may explicitly use zero; live defaults never do.
-    version_key: int = Field(default=17, ge=0)
+    version_key: int = Field(default=18, ge=0)
 
     #: This validator's hotkey. Used ONLY to read our own weight vector back off
     #: the chain when a set_weights attempt was ambiguous (a timeout leaves us

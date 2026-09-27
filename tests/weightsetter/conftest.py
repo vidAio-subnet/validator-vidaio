@@ -156,3 +156,26 @@ def make_setter(raw_config, chain, conn, store, ledger, clock):
         )
 
     return _mk
+
+
+# ---- emission profile for these suites ---------------------------------------------
+# Tokenomics v3 (2026-09-23) makes inference earn nothing by default. The mechanisms
+# under test here (publication, rewritten-vector refusal, own audit, stake floors,
+# recompute proofs) use inference weights as their vehicle, so they run on the
+# supported v2 launch profile; v3 behaviour is covered by tests/tokenomics.
+import pytest as _pytest
+from vidaio.tokenomics import EMISSION_PROFILES as _PROFILES, TokenomicsConfig as _TC
+
+
+@_pytest.fixture(autouse=True)
+def _v2_emission_profile_defaults():
+    saved = {k: _TC.model_fields[k].default for k in _PROFILES["v2"]}
+    for k, v in _PROFILES["v2"].items():
+        _TC.model_fields[k].default = v
+    _TC.model_rebuild(force=True)
+    try:
+        yield
+    finally:
+        for k, v in saved.items():
+            _TC.model_fields[k].default = v
+        _TC.model_rebuild(force=True)

@@ -174,6 +174,7 @@ def test_authenticated_v16_history_keeps_exact_bytes_and_seeds_boundary(tmp_path
     prior17 = empty_log(close=120)
     obj = __import__("json").loads(prior17.to_json()); obj["schema_version"] = 16
     for key in ("payout_min_alpha_stake", "round_membership"): obj.pop(key)
+    for key in ("competition_share", "place_shares"): obj["reward_window_state"].pop(key)
     for key in ("content_rounds", "round_commits", "round_commit_cursor"): obj["audit_manifest"].pop(key)
     obj["audit_manifest"]["fold_cursors"] = {"7": prior_key}
     for value in obj["miners"] + obj["miner_census"]: value.pop("alpha_stake")

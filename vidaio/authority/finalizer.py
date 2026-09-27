@@ -57,7 +57,12 @@ from vidaio.epoch.log import (
     MinerCensusEntry,
     weight_vector_digest,
 )
-from vidaio.tokenomics.breakthrough import resolve_reward_window
+from vidaio.tokenomics.breakthrough import (
+    is_legacy_window,
+    resolve_reward_window,
+    upgrade_legacy_window,
+    window_active,
+)
 from vidaio.tokenomics.config import TokenomicsConfig
 from vidaio.tokenomics.ewma import EXCLUDED_SCORE as EXCLUSION_SENTINEL
 from vidaio.tokenomics.ewma import accumulate, is_excluded
@@ -649,6 +654,7 @@ class EpochFinalizer:
         competition_result: CompetitionResult | None = None,
         prior_reward_window_state: RewardWindowState | None = None,
         competition_packet_scores: Mapping[str, float] | None = None,
+        window_source_result: CompetitionResult | None = None,
     ) -> EpochLog:
         """Assemble (and validate) the `EpochLog` — the pure core of `finalize`.
 
@@ -686,7 +692,11 @@ class EpochFinalizer:
                     "competition result does not equal the deterministic committed-packet "
                     "score derivation"
                 )
-        prior_reward_state = prior_reward_window_state or RewardWindowState()
+        prior_reward_state = self._upgrade_carried_window(
+            prior_reward_window_state or RewardWindowState(),
+            window_source_result,
+            now,
+        )
         if (
             competition_result is not None
             and prior_reward_state.last_applied_cycle is not None
@@ -968,6 +978,46 @@ class EpochFinalizer:
 
     # `_require_complete_window` remains removed with the retired retention multiplier.
 
+    @property
+    def config(self) -> TokenomicsConfig:
+        """The tokenomics config every log of this finalizer is composed with."""
+        return self._config
+
+    @property
+    def upgrades_legacy_windows(self) -> bool:
+        """True when this finalizer writes schema >= 18 logs (payout policy carried)."""
+        schema = self._schema_version or EpochLog.model_fields["schema_version"].default
+        return schema >= 18
+
+    def _upgrade_carried_window(
+        self,
+        prior: RewardWindowState,
+        source: CompetitionResult | None,
+        now: datetime,
+    ) -> RewardWindowState:
+        """The carried window, re-resolved once under v3 when it is a legacy window.
+
+        A still-active window folded before schema v18 is upgraded from its source
+        result (see ``upgrade_legacy_window``); the caller supplies that result from the
+        log chain. A missing or mismatching source refuses the log, so the authority
+        HOLDs and retries instead of publishing a vector auditors would dispute.
+        """
+        if not (
+            self.upgrades_legacy_windows
+            and is_legacy_window(prior)
+            and window_active(prior, now)
+        ):
+            return prior
+        if source is None:
+            raise EpochLogInvalid(
+                "the carried reward window predates schema v18 and must be re-resolved "
+                "from its source competition result, which was not supplied"
+            )
+        try:
+            return upgrade_legacy_window(self._config, prior, source)
+        except ValueError as exc:
+            raise EpochLogInvalid(f"legacy reward window upgrade refused: {exc}") from exc
+
     def dry_run(self, *, public_store: "_PublicReleaseStore | None" = None, **kwargs: Any) -> EpochLog:
         """Every check ``finalize`` performs BEFORE its first write, and no write.
 
@@ -999,6 +1049,7 @@ class EpochFinalizer:
         competition_result: CompetitionResult | None = None,
         prior_reward_window_state: RewardWindowState | None = None,
         competition_packet_scores: Mapping[str, float] | None = None,
+        window_source_result: CompetitionResult | None = None,
     ) -> FinalizedEpoch:
         """Produce + publish the epoch log; return its pointer (key + digests).
 
@@ -1049,6 +1100,7 @@ class EpochFinalizer:
             competition_result=competition_result,
             prior_reward_window_state=prior_reward_window_state,
             competition_packet_scores=competition_packet_scores,
+            window_source_result=window_source_result,
         )
         # A CROWN starts real earnings in this very log.  Its exact winning source
         # archive must therefore already be readable through the same keyless view

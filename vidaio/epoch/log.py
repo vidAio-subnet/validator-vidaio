@@ -63,6 +63,11 @@ from vidaio.tokenomics.state import (
 #: still agrees. The log-validation boundary refuses any out-of-set track here (the
 #: auditor adds a defense-in-depth DISPUTED verdict for bytes that bypass the finalizer).
 PROTOCOL_TRACKS: frozenset[str] = frozenset(TRACK_RULES)
+#: Tracks a COMPETITION may run: every inference track plus the competition-only
+#: object-removal track.  Competition payouts follow the committed competition result,
+#: never the inference track pools, so a competition ref's committed track is checked
+#: against this set (and against its competition's own track) instead.
+COMPETITION_TRACKS: frozenset[str] = PROTOCOL_TRACKS | frozenset({"removal"})
 GIT_SHA1_HEX_PATTERN = r"^[0-9a-f]{40}$"
 
 #: Bump on ANY change to the EpochLog canonical-JSON shape (it changes every
@@ -165,7 +170,7 @@ GIT_SHA1_HEX_PATTERN = r"^[0-9a-f]{40}$"
 #: semantic consensus change receives a lockstep fleet fence despite no JSON field
 #: being added.
 # v17: canonical content-component evidence and exact close-block alpha stake.
-EPOCH_LOG_SCHEMA_VERSION = 17
+EPOCH_LOG_SCHEMA_VERSION = 18
 
 
 class EpochLogInvalid(Exception):
@@ -479,9 +484,12 @@ class CompetitionAuditItem(BaseModel):
     target_width: int | None = Field(default=None, gt=0)
     target_height: int | None = Field(default=None, gt=0)
     item_commitment: str | None = Field(default=None, pattern=SHA256_HEX_PATTERN)
+    #: Object removal: the served input's mask stream (bound by the item commitment).
+    #: Omitted from canonical bytes when absent, so earlier logs keep their bytes.
+    mask_stream_index: Literal[1] | None = None
 
     def _canonical_obj(self) -> dict[str, Any]:
-        return {
+        obj: dict[str, Any] = {
             "challenge_id": self.challenge_id,
             "item_id": self.item_id,
             "threshold_commitment": self.threshold_commitment,
@@ -493,6 +501,9 @@ class CompetitionAuditItem(BaseModel):
             "target_height": self.target_height,
             "item_commitment": self.item_commitment,
         }
+        if self.mask_stream_index is not None:
+            obj["mask_stream_index"] = self.mask_stream_index
+        return obj
 
 
 class CompetitionAuditSubject(BaseModel):
@@ -617,6 +628,14 @@ class CompetitionRulesInput(BaseModel):
         default=None, ge=-1, le=10, allow_inf_nan=False
     )
     podium_min_score: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
+    # Tokenomics v3 payout policy (schema v18). Omitted from canonical bytes when
+    # absent so every earlier log keeps its bytes.
+    crown_competition_share: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
+    podium_competition_share: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
+    crown_split: tuple[float, ...] | None = None
+    podium_split: tuple[float, ...] | None = None
+    redistribute_empty_places: bool | None = None
+    no_qualifier_closes_window: bool | None = None
 
     @model_validator(mode="after")
     def _ordered(self) -> "CompetitionRulesInput":
@@ -625,15 +644,36 @@ class CompetitionRulesInput(BaseModel):
             and self.podium_min_margin > self.crown_margin
         ):
             raise EpochLogInvalid("podium_min_margin cannot exceed crown_margin")
+        from vidaio.tokenomics.state import _validate_split
+
+        for name in ("crown_split", "podium_split"):
+            try:
+                object.__setattr__(self, name, _validate_split(name, getattr(self, name)))
+            except ValueError as exc:
+                raise EpochLogInvalid(str(exc)) from exc
         return self
 
+    _POLICY_FIELDS = (
+        "crown_competition_share",
+        "podium_competition_share",
+        "crown_split",
+        "podium_split",
+        "redistribute_empty_places",
+        "no_qualifier_closes_window",
+    )
+
     def _canonical_obj(self) -> dict[str, Any]:
-        return {
+        obj: dict[str, Any] = {
             "crown_margin": self.crown_margin,
             "crown_min_score": self.crown_min_score,
             "podium_min_margin": self.podium_min_margin,
             "podium_min_score": self.podium_min_score,
         }
+        for name in self._POLICY_FIELDS:
+            value = getattr(self, name)
+            if value is not None:
+                obj[name] = list(value) if isinstance(value, tuple) else value
+        return obj
 
 
 class CompetitionInput(BaseModel):
@@ -648,7 +688,7 @@ class CompetitionInput(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     competition_id: str = Field(min_length=1)
-    track: Literal["compression", "upscaling"]
+    track: Literal["compression", "upscaling", "removal"]
     cycle: int = Field(ge=1)
     completed_at: datetime
     applied_at: datetime
@@ -666,17 +706,20 @@ class CompetitionInput(BaseModel):
     anchor_block: int = Field(ge=0)
     anchor_block_hash: str = Field(pattern=SHA256_HEX_PATTERN)
     anchor_finalized_block: int = Field(ge=0)
-    baseline_version: int = Field(ge=0)
-    baseline_artifact_digest: str = Field(pattern=SHA256_HEX_PATTERN)
-    baseline_artifact_bytes: int = Field(gt=0)
-    baseline_execution_image_digest: str = Field(pattern=SHA256_HEX_PATTERN)
-    baseline_provenance_digest: str = Field(pattern=SHA256_HEX_PATTERN)
-    baseline_provenance_bytes: int = Field(gt=0)
+    #: The archived executable baseline.  A competition anchored without one (its
+    #: result decided by the anchored absolute score bars alone) carries null in all
+    #: six fields and has no baseline subject; the keys stay in the canonical bytes.
+    baseline_version: int | None = Field(ge=0)
+    baseline_artifact_digest: str | None = Field(pattern=SHA256_HEX_PATTERN)
+    baseline_artifact_bytes: int | None = Field(gt=0)
+    baseline_execution_image_digest: str | None = Field(pattern=SHA256_HEX_PATTERN)
+    baseline_provenance_digest: str | None = Field(pattern=SHA256_HEX_PATTERN)
+    baseline_provenance_bytes: int | None = Field(gt=0)
     aggregation_version: Literal["mean_item_score.v2"] = "mean_item_score.v2"
     #: Per-competition result rules copied from the anchored manifest (None = defaults).
     rules: CompetitionRulesInput | None = None
     items: tuple[CompetitionAuditItem, ...] = Field(min_length=1)
-    subjects: tuple[CompetitionAuditSubject, ...] = Field(min_length=2)
+    subjects: tuple[CompetitionAuditSubject, ...] = Field(min_length=1)
 
     @model_validator(mode="after")
     def _complete_subject_set(self) -> "CompetitionInput":
@@ -724,9 +767,26 @@ class CompetitionInput(BaseModel):
             raise EpochLogInvalid(
                 "an earning competition requires at least one contender"
             )
-        if len(baselines) != 1:
+        baseline_fields = (
+            self.baseline_version,
+            self.baseline_artifact_digest,
+            self.baseline_artifact_bytes,
+            self.baseline_execution_image_digest,
+            self.baseline_provenance_digest,
+            self.baseline_provenance_bytes,
+        )
+        if any(v is None for v in baseline_fields) and not all(
+            v is None for v in baseline_fields
+        ):
+            raise EpochLogInvalid(
+                "competition baseline provenance must be complete or entirely absent"
+            )
+        expected_baselines = 0 if self.baseline_version is None else 1
+        if len(baselines) != expected_baselines:
             raise EpochLogInvalid(
                 "an earning competition requires exactly one non-earning baseline"
+                if expected_baselines
+                else "a competition committed without a baseline has no baseline subject"
             )
         if (
             len(baselines) == 1
@@ -788,6 +848,43 @@ class CompetitionInput(BaseModel):
                         f"upscaling competition item {expected_index} has incomplete "
                         "target geometry"
                     )
+                if item.mask_stream_index is not None:
+                    raise EpochLogInvalid(
+                        f"upscaling competition item {expected_index} carries a mask stream"
+                    )
+        elif self.track == "removal":
+            for expected_index, item in enumerate(self.items):
+                if item.item_index != expected_index:
+                    raise EpochLogInvalid(
+                        "removal competition audit items must cover ordered indices "
+                        f"0..N-1; expected {expected_index}, got {item.item_index}"
+                    )
+                if (
+                    item.input_sha256 is None
+                    or item.reference_sha256 is None
+                    or item.mask_stream_index is None
+                    or item.item_commitment is None
+                ):
+                    raise EpochLogInvalid(
+                        f"removal competition item {expected_index} lacks its "
+                        "reference/input/mask commitment preimage"
+                    )
+                if item.input_sha256 == item.reference_sha256:
+                    raise EpochLogInvalid(
+                        f"removal competition item {expected_index} aliases "
+                        "reference and miner input"
+                    )
+                if (
+                    item.upscale_factor is not None
+                    or item.target_width is not None
+                    or item.target_height is not None
+                ):
+                    raise EpochLogInvalid(
+                        f"removal competition item {expected_index} carries upscaling "
+                        "factor/geometry"
+                    )
+        elif any(item.mask_stream_index is not None for item in self.items):
+            raise EpochLogInvalid("only removal competition items carry a mask stream")
         return self
 
     def _canonical_obj(self) -> dict[str, Any]:
@@ -1231,6 +1328,31 @@ def _contender_obj(contender: ContenderResult) -> dict[str, Any]:
     }
 
 
+_RULES_POLICY_FIELDS = (
+    "crown_competition_share",
+    "podium_competition_share",
+    "crown_split",
+    "podium_split",
+    "redistribute_empty_places",
+    "no_qualifier_closes_window",
+)
+
+
+def _rules_obj(rules: CompetitionRules) -> dict[str, Any]:
+    obj: dict[str, Any] = {
+        "crown_margin": rules.crown_margin,
+        "crown_min_score": rules.crown_min_score,
+        "podium_min_margin": rules.podium_min_margin,
+        "podium_min_score": rules.podium_min_score,
+    }
+    # Tokenomics v3 payout policy: omitted when absent so older logs keep their bytes.
+    for name in _RULES_POLICY_FIELDS:
+        value = getattr(rules, name)
+        if value is not None:
+            obj[name] = list(value) if isinstance(value, tuple) else value
+    return obj
+
+
 def _competition_obj(result: CompetitionResult | None) -> dict[str, Any] | None:
     if result is None:
         return None
@@ -1248,12 +1370,7 @@ def _competition_obj(result: CompetitionResult | None) -> dict[str, Any] | None:
             {}
             if result.rules is None
             else {
-                "rules": {
-                    "crown_margin": result.rules.crown_margin,
-                    "crown_min_score": result.rules.crown_min_score,
-                    "podium_min_margin": result.rules.podium_min_margin,
-                    "podium_min_score": result.rules.podium_min_score,
-                }
+                "rules": _rules_obj(result.rules)
             }
         ),
     }
@@ -1280,7 +1397,7 @@ def _competition_from_obj(value: dict[str, Any] | None) -> CompetitionResult | N
             if value.get("baseline_score") is None
             else float(value["baseline_score"])
         ),
-        baseline_version=int(value["baseline_version"]),
+        baseline_version=_optional_int(value["baseline_version"]),
         baseline_artifact_digest=value["baseline_artifact_digest"],
         rules=(
             None
@@ -1292,6 +1409,24 @@ def _competition_from_obj(value: dict[str, Any] | None) -> CompetitionResult | N
                     value["rules"].get("podium_min_margin")
                 ),
                 podium_min_score=_optional_float(value["rules"].get("podium_min_score")),
+                crown_competition_share=_optional_float(
+                    value["rules"].get("crown_competition_share")
+                ),
+                podium_competition_share=_optional_float(
+                    value["rules"].get("podium_competition_share")
+                ),
+                crown_split=(
+                    None
+                    if value["rules"].get("crown_split") is None
+                    else tuple(float(x) for x in value["rules"]["crown_split"])
+                ),
+                podium_split=(
+                    None
+                    if value["rules"].get("podium_split") is None
+                    else tuple(float(x) for x in value["rules"]["podium_split"])
+                ),
+                redistribute_empty_places=value["rules"].get("redistribute_empty_places"),
+                no_qualifier_closes_window=value["rules"].get("no_qualifier_closes_window"),
             )
         ),
     )
@@ -1301,8 +1436,14 @@ def _optional_float(value: Any) -> float | None:
     return None if value is None else float(value)
 
 
-def _reward_window_obj(state: RewardWindowState) -> dict[str, Any]:
-    return {
+def _optional_int(value: Any) -> int | None:
+    return None if value is None else int(value)
+
+
+def _reward_window_obj(
+    state: RewardWindowState, *, schema_version: int = EPOCH_LOG_SCHEMA_VERSION
+) -> dict[str, Any]:
+    obj = {
         "kind": state.kind.value,
         "starts_at": state.starts_at.isoformat() if state.starts_at is not None else None,
         "ends_at": state.ends_at.isoformat() if state.ends_at is not None else None,
@@ -1319,6 +1460,12 @@ def _reward_window_obj(state: RewardWindowState) -> dict[str, Any]:
         "source_cycle": state.source_cycle,
         "last_applied_cycle": state.last_applied_cycle,
     }
+    if schema_version >= 18:
+        # Tokenomics v3: the window carries its own payout policy so later epochs
+        # (and every validator) pay it without consulting mutable configuration.
+        obj["competition_share"] = state.competition_share
+        obj["place_shares"] = list(state.place_shares)
+    return obj
 
 
 def _reward_window_from_obj(value: dict[str, Any]) -> RewardWindowState:
@@ -1335,6 +1482,8 @@ def _reward_window_from_obj(value: dict[str, Any]) -> RewardWindowState:
             else datetime.fromisoformat(value["ends_at"])
         ),
         podium_hotkeys=tuple(value.get("podium_hotkeys", [])),
+        competition_share=_optional_float(value.get("competition_share")),
+        place_shares=tuple(float(x) for x in value.get("place_shares", [])),
         winner_hotkey=value.get("winner_hotkey"),
         winner_uid=(
             None if value.get("winner_uid") is None else int(value["winner_uid"])
@@ -1684,17 +1833,23 @@ class EpochLog(BaseModel):
         all_refs = list(self.audit_manifest.baseline_bundles)
         for refs in self.audit_manifest.per_uid.values():
             all_refs.extend(refs)
-        for refs in self.audit_manifest.competition_bundles.values():
-            all_refs.extend(refs)
-        for ref in all_refs:
+        competition_refs = [
+            ref
+            for refs in self.audit_manifest.competition_bundles.values()
+            for ref in refs
+        ]
+        for ref, allowed in [
+            *((ref, PROTOCOL_TRACKS) for ref in all_refs),
+            *((ref, COMPETITION_TRACKS) for ref in competition_refs),
+        ]:
             if (
                 ref.committed_track is not None
-                and ref.committed_track not in PROTOCOL_TRACKS
+                and ref.committed_track not in allowed
             ):
                 raise EpochLogInvalid(
                     f"audit ref for item {ref.item_id!r} carries committed_track "
                     f"{ref.committed_track!r}, which is NOT a protocol track "
-                    f"{sorted(PROTOCOL_TRACKS)} — an out-of-protocol committed track "
+                    f"{sorted(allowed)} — an out-of-protocol committed track "
                     "substitutes a canonical burn while every declaration self-agrees "
                     ""
                 )
@@ -1880,7 +2035,9 @@ class EpochLog(BaseModel):
             "burn_uid": self.burn_uid,
             "payout_min_alpha_stake": self.payout_min_alpha_stake,
             "competition_result": _competition_obj(self.competition_result),
-            "reward_window_state": _reward_window_obj(self.reward_window_state),
+            "reward_window_state": _reward_window_obj(
+                self.reward_window_state, schema_version=self.schema_version
+            ),
             "miner_census": [
                 _census_obj(entry)
                 for entry in sorted(self.miner_census, key=lambda entry: entry.uid)
@@ -1919,9 +2076,9 @@ class EpochLog(BaseModel):
             raise EpochLogInvalid("historical log does not match the authenticated digest")
         obj = json.loads(raw)
         schema = obj.get("schema_version")
-        if type(schema) is not int or schema not in (16, 17):
-            raise EpochLogInvalid("only authenticated schema-v16/v17 history is supported")
-        reader = _HistoryEpochLogV16 if schema == 16 else EpochLog
+        if type(schema) is not int or schema not in (16, 17, 18):
+            raise EpochLogInvalid("only authenticated schema-v16/v17/v18 history is supported")
+        reader = {16: _HistoryEpochLogV16, 17: _HistoryEpochLogV17}.get(schema, EpochLog)
         log = reader.from_json(raw)
         if log.epoch_id != expected_epoch_id or log.to_json() != raw:
             raise EpochLogInvalid("historical log epoch/canonical bytes do not match")
@@ -1947,7 +2104,7 @@ class EpochLog(BaseModel):
             )
         manifest_obj = obj["audit_manifest"]
         canonical_top_fields = {
-            *( ("payout_min_alpha_stake", "round_membership") if schema_version == 17 else () ),
+            *( ("payout_min_alpha_stake", "round_membership") if schema_version >= 17 else () ),
             "schema_version",
             "epoch_id",
             "close_block",
@@ -1966,7 +2123,7 @@ class EpochLog(BaseModel):
             "audit_manifest",
         }
         canonical_manifest_fields = {
-            *( ("content_rounds", "round_commits", "round_commit_cursor") if schema_version == 17 else () ),
+            *( ("content_rounds", "round_commits", "round_commit_cursor") if schema_version >= 17 else () ),
             "per_uid",
             "baseline_bundles",
             "score_packet_merkle_root",
@@ -2115,7 +2272,7 @@ class EpochLog(BaseModel):
                 f"schema-v{EPOCH_LOG_SCHEMA_VERSION} epoch log is missing required "
                 "canonical field(s): " + ", ".join(missing_current)
             )
-        if schema_version == 17:
+        if schema_version >= 17:
             if obj.get("round_membership") != "commit/1":
                 raise EpochLogInvalid("schema-v17 requires round_membership=commit/1")
             if not {"round_commits", "round_commit_cursor"}.issubset(manifest_obj):
@@ -2155,11 +2312,11 @@ class EpochLog(BaseModel):
                 anchor_finalized_block=int(
                     competition_input_obj["anchor_finalized_block"]
                 ),
-                baseline_version=int(competition_input_obj["baseline_version"]),
+                baseline_version=_optional_int(competition_input_obj["baseline_version"]),
                 baseline_artifact_digest=competition_input_obj[
                     "baseline_artifact_digest"
                 ],
-                baseline_artifact_bytes=int(
+                baseline_artifact_bytes=_optional_int(
                     competition_input_obj["baseline_artifact_bytes"]
                 ),
                 baseline_execution_image_digest=competition_input_obj[
@@ -2168,7 +2325,7 @@ class EpochLog(BaseModel):
                 baseline_provenance_digest=competition_input_obj[
                     "baseline_provenance_digest"
                 ],
-                baseline_provenance_bytes=int(
+                baseline_provenance_bytes=_optional_int(
                     competition_input_obj["baseline_provenance_bytes"]
                 ),
                 aggregation_version=competition_input_obj["aggregation_version"],
@@ -2193,6 +2350,7 @@ class EpochLog(BaseModel):
                         target_width=item.get("target_width"),
                         target_height=item.get("target_height"),
                         item_commitment=item.get("item_commitment"),
+                        mask_stream_index=item.get("mask_stream_index"),
                     )
                     for item in competition_input_obj.get("items", [])
                 ),
@@ -2318,6 +2476,13 @@ class _HistoryEpochLogV16(EpochLog):
         for entry in (*obj["miner_census"], *obj["miners"]):
             entry.pop("alpha_stake")
         return obj
+
+
+class _HistoryEpochLogV17(EpochLog):
+    """Authenticated v17 history: the pre-tokenomics-v3 bytes (no window payout policy)."""
+
+    _accepted_schema: ClassVar[int] = 17
+    schema_version: Literal[17] = 17
 
 
 @dataclass(frozen=True, slots=True)

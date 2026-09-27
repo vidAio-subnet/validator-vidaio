@@ -178,6 +178,10 @@ from vidaio.competition import (
     migrate,
 )
 from vidaio.competition import repository as repo
+from vidaio.competition.item_commitment import (
+    REMOVAL_MASK_STREAM_INDEX,
+    SEALED_REFERENCE_TRACKS,
+)
 from vidaio.competition.interfaces import (
     BUILD_IDENTITY_SCHEME,
     BatchOutput,
@@ -261,7 +265,7 @@ class AnchorResult:
     tx_id: str | None
     payload: bytes
     canonical_json: bytes
-    baseline_image_digest: str
+    baseline_image_digest: str | None
     anchor_block: int
     anchor_block_hash: str
     finalized_block: int
@@ -322,9 +326,8 @@ class Orchestrator(BaseService):
         cfg = section(raw_config, "orchestrator", OrchestratorConfig)
         super().__init__(raw_config, metrics_port=cfg.metrics_port)
         self.cfg = cfg
-        self.engine = LifecycleEngine(
-            section(raw_config, "competition", CompetitionConfig)
-        )
+        self.competition_cfg = section(raw_config, "competition", CompetitionConfig)
+        self.engine = LifecycleEngine(self.competition_cfg)
         # Zero records are protocol outputs too: bind their identity/config digest
         # to the exact scoring policy used by the trusted worker and CPU auditors.
         self.scoring_config = section(raw_config, "scoring", ScoringConfig)
@@ -757,7 +760,7 @@ class Orchestrator(BaseService):
             if now < deadline:
                 continue
             manifest = repo.get_manifest(self.conn, comp.competition_id)
-            if manifest.track != "upscaling":
+            if manifest.track not in SEALED_REFERENCE_TRACKS:
                 continue
             if pers.is_halted(self.conn, comp.competition_id):
                 return False
@@ -789,7 +792,7 @@ class Orchestrator(BaseService):
             except Exception as exc:
                 self._halt(
                     comp.competition_id,
-                    "upscaling completion blocked: pristine reference release/"
+                    f"{manifest.track} completion blocked: pristine reference release/"
                     f"binding verification failed: {type(exc).__name__}: {exc}",
                     now,
                 )
@@ -1362,8 +1365,7 @@ class Orchestrator(BaseService):
         if callable(acquire):
             configure = getattr(self.runner, "configure", None)
             if callable(configure):
-                resources = repo.get_manifest(self.conn, competition_id).sandbox_resources
-                configure(None if resources is None else resources.model_dump())
+                configure(self.effective_sandbox_resources(competition_id))
             try:
                 await asyncio.to_thread(acquire)
             except Exception as exc:
@@ -1414,10 +1416,11 @@ class Orchestrator(BaseService):
                 built_baselines = [
                     contender for contender in built if contender.is_calibration
                 ]
-                if phase is Phase.EVALUATING and len(built_baselines) != 1:
+                expected_baselines = 0 if manifest.baseline is None else 1
+                if phase is Phase.EVALUATING and len(built_baselines) != expected_baselines:
                     raise ValueError(
-                        "expected exactly one BUILT baseline before evaluation, found "
-                        f"{len(built_baselines)}"
+                        f"expected {expected_baselines} BUILT baseline(s) before "
+                        f"evaluation, found {len(built_baselines)}"
                     )
                 if any(
                     contender.image_digest != commitment.baseline_image_digest
@@ -1664,8 +1667,11 @@ class Orchestrator(BaseService):
                 )
             )
         for contender in contenders:
-            if contender.status != "ACCEPTED":
-                continue  # BUILT/BUILD_FAILED rows are done — idempotent re-entry
+            current = repo.get_contender(self.conn, contender.contender_id)
+            if current is None or current.status != "ACCEPTED":
+                continue  # BUILT/BUILD_FAILED/REJECTED rows are done — idempotent re-entry
+            if pers.is_halted(self.conn, competition_id):
+                return  # paused (or halted) while earlier builds ran
             spec = ContenderSpec(
                 contender_id=contender.contender_id,
                 repo_url=contender.repo_url,
@@ -1713,10 +1719,13 @@ class Orchestrator(BaseService):
                         now,
                     )
                     return
+                from vidaio.competition.orchestrator.failures import unwrap
+
                 self._mark_build_failed(
                     competition_id,
                     contender.contender_id,
-                    f"build failed ({fault_code(exc)}): {exc}",
+                    # the builder's own message, not the retry wrapper's summary
+                    f"build failed ({fault_code(exc)}): {unwrap(exc)}",
                     now,
                 )
                 self.m_builds.labels(result="failed").inc()
@@ -1844,6 +1853,10 @@ class Orchestrator(BaseService):
                 )
                 self.m_builds.labels(result="probe_dq").inc()
                 continue
+            latest = repo.get_contender(self.conn, contender.contender_id)
+            if latest is None or latest.status != "ACCEPTED":
+                # rejected by the operator while its build ran: never mark it BUILT
+                continue
             with pers.txn(self.conn):
                 self._record_modal_image_binding(
                     competition_id,
@@ -1885,6 +1898,9 @@ class Orchestrator(BaseService):
     def _mark_build_failed(
         self, competition_id: str, contender_id: int, reason: str, now: datetime
     ) -> None:
+        latest = repo.get_contender(self.conn, contender_id)
+        if latest is None or latest.status != "ACCEPTED":
+            return  # rejected by the operator meanwhile: that verdict stands
         with pers.txn(self.conn):
             repo.set_contender_status(self.conn, contender_id, "BUILD_FAILED", now)
             repo.record_event(
@@ -1892,7 +1908,7 @@ class Orchestrator(BaseService):
                 competition_id,
                 "contender_build_failed",
                 now,
-                payload={"contender_id": contender_id, "reason": reason[:500]},
+                payload={"contender_id": contender_id, "reason": reason[:4000]},
             )
         self.log.warning(
             "contender build failed",
@@ -1946,11 +1962,27 @@ class Orchestrator(BaseService):
                     now=now,
                 )
         by_id = {c.contender_id: c for c in built}
-        for batch in pers.runnable_batches(self.conn, competition_id):
-            contender = by_id.get(batch["contender_id"])
-            if contender is None or contender.image_digest is None:
-                continue  # defensive: batch for a contender no longer BUILT
+
+        def fenced(started_floor: int, batch: Any) -> bool:
+            """True when an evaluation reset (operator rerun, envelope raise, runtime
+            replacement) happened while this batch ran: its result belongs to the
+            discarded run and must not be recorded; the reset already made it PENDING."""
+            if pers.effective_batch_event_floor(self.conn, competition_id) == started_floor:
+                return False
+            self.log.warning(
+                "batch result discarded: the evaluation was reset while it ran",
+                extra=log_fields(
+                    competition_id=competition_id,
+                    batch_id=batch["batch_id"],
+                    contender_id=batch["contender_id"],
+                ),
+            )
+            return True
+
+        async def run_one(batch: Any, contender: Any) -> bool:
+            """One batch end to end; False when it halted the competition."""
             batch_items = pers.batch_items_for(items, batch["batch_index"], batch_size)
+            started_floor = pers.effective_batch_event_floor(self.conn, competition_id)
             pers.set_batch_status(
                 self.conn, batch["batch_id"], "RUNNING", now, started=True
             )
@@ -1970,6 +2002,8 @@ class Orchestrator(BaseService):
                     )
                 )
             except (RetriesExhausted, Exception) as exc:
+                if fenced(started_floor, batch):
+                    return True
                 if classify_failure(exc) is Fault.CONTENDER:
                     # The SUBMISSION failed (exit != 0, timeout, unsafe/oversize
                     # output): fail THIS batch terminally and keep going. One
@@ -1996,7 +2030,7 @@ class Orchestrator(BaseService):
                             reason=str(exc)[:500],
                         ),
                     )
-                    continue
+                    return True
                 requeues = pers.requeue_count(
                     self.conn, competition_id, batch["batch_id"]
                 )
@@ -2016,12 +2050,14 @@ class Orchestrator(BaseService):
                         f"attempt(s): {exc}",
                         now,
                     )
-                    return
+                    return False
                 pers.requeue_batch(
                     self.conn, competition_id, batch["batch_id"], str(exc), now
                 )
                 self.m_batches.labels(result="requeued").inc()
-                continue
+                return True
+            if fenced(started_floor, batch):
+                return True
             pers.complete_batch(
                 self.conn,
                 competition_id,
@@ -2031,6 +2067,44 @@ class Orchestrator(BaseService):
                 now,
             )
             self.m_batches.labels(result="ok").inc()
+            return True
+
+        runnable = []
+        for batch in pers.runnable_batches(self.conn, competition_id):
+            contender = by_id.get(batch["contender_id"])
+            if contender is None or contender.image_digest is None:
+                continue  # defensive: batch for a contender no longer BUILT
+            runnable.append((batch, contender))
+        # Batches are independent sandboxes; managed GPU backends run several at once
+        # (each sandbox has its own GPU). A self-hosted GPU host keeps this at 1 so
+        # contenders never share a device. Batches of the SAME contender never overlap:
+        # a runner retires an image's previous sandboxes before its next batch
+        # (ModalSandboxRunner.rollover). DB writes stay on this event loop.
+        parallel = max(1, int(self.cfg.evaluation_parallel_batches))
+        gate = asyncio.Semaphore(parallel)
+        # Keyed by execution image: two subjects enrolled with the same pinned source
+        # share one image, and its batches must not overlap either.
+        per_image = {c.image_digest: asyncio.Lock() for c in built}
+        tick_floor = pers.effective_batch_event_floor(self.conn, competition_id)
+
+        async def gated(batch: Any, contender: Any) -> bool:
+            async with per_image[contender.image_digest]:
+                async with gate:
+                    if pers.is_halted(self.conn, competition_id):
+                        return False
+                    if pers.effective_batch_event_floor(self.conn, competition_id) != tick_floor:
+                        return True  # reset since this tick listed it: next tick reruns
+                    return await run_one(batch, contender)
+
+        outcomes = await asyncio.gather(
+            *(gated(b, c) for b, c in runnable), return_exceptions=True
+        )
+        errors = [o for o in outcomes if isinstance(o, BaseException)]
+        if errors:
+            # every sibling has finished; surface the first unexpected failure
+            raise errors[0]
+        if not all(outcomes) or pers.is_halted(self.conn, competition_id):
+            return
         expected = len(built) * pers.batch_count(len(items), batch_size)
         total = self.conn.execute(
             "SELECT COUNT(*) AS n FROM batches WHERE competition_id = ?",
@@ -2077,6 +2151,8 @@ class Orchestrator(BaseService):
                 self.conn, competition_id, contender.contender_id
             )
             for item_row in items:
+                if pers.is_halted(self.conn, competition_id):
+                    return  # paused or halted while an earlier item was being scored
                 item_id = item_row["item_id"]
                 if pers.has_score_row(self.conn, contender.contender_id, item_id):
                     continue  # idempotent re-entry: already recorded
@@ -2395,6 +2471,17 @@ class Orchestrator(BaseService):
                 item_commitment=str(item_row["item_commitment"]),
             )
             stage = LifecycleStage.COMPETITION_SEALED
+        elif manifest.track == "removal":
+            repo.validate_evaluation_item_bindings(self.conn, competition_id)
+            reference_ref = self._reference_original_ref(item_row)
+            competition_item = CompetitionItemBinding(
+                item_index=int(item_row["item_index"]),
+                input_sha256=str(item_row["input_sha256"]),
+                reference_sha256=str(item_row["reference_sha256"]),
+                mask_stream_index=REMOVAL_MASK_STREAM_INDEX,
+                item_commitment=str(item_row["item_commitment"]),
+            )
+            stage = LifecycleStage.COMPETITION_SEALED
         bundle = build_bundle(
             challenge_id=item_row["challenge_id"],
             item_id=item_row["scoring_item_id"],
@@ -2514,6 +2601,294 @@ class Orchestrator(BaseService):
                 extra=log_fields(competition_id=competition_id, reason=reason),
             )
 
+    # ---- operator recovery actions (docs/COMPETITIONS.md "Saving a running
+    # competition").  Every action is an append-only public amendment; none of them
+    # can change the anchored manifest, the hidden items, the scorer or the rules.
+
+    def effective_sandbox_resources(self, competition_id: str) -> dict[str, Any] | None:
+        """The anchored envelope, raised by the latest execution amendment if any."""
+        amended = pers.latest_execution_amendment(self.conn, competition_id)
+        if amended is not None:
+            return amended
+        resources = repo.get_manifest(self.conn, competition_id).sandbox_resources
+        return None if resources is None else resources.model_dump()
+
+    def _require_phase(self, competition_id: str, allowed: set[Phase], what: str) -> Any:
+        comp = repo.get_competition(self.conn, competition_id)
+        if comp is None:
+            raise KeyError(f"unknown competition {competition_id}")
+        if comp.status not in allowed:
+            raise ValueError(
+                f"{what} is allowed only in {sorted(p.value for p in allowed)}; "
+                f"{competition_id} is {comp.status.value}"
+            )
+        return comp
+
+    def pause(self, competition_id: str, operator: str, now: datetime, *, reason: str) -> bool:
+        """Halt on purpose (e.g. before switching the sandbox backend)."""
+        self._require_phase(
+            competition_id,
+            {
+                Phase.SCHEDULED,
+                Phase.ENROLLING,
+                Phase.FINALIZING_SUBMISSIONS,
+                Phase.VALIDATING,
+                Phase.BUILDING,
+                Phase.EVALUATING,
+                Phase.SCORING,
+                Phase.AWAITING_END_TIME,
+            },
+            "pause",
+        )
+        paused = pers.record_operator_pause(self.conn, competition_id, operator, now, reason=reason)
+        if paused:
+            self.log.warning(
+                "competition paused by operator",
+                extra=log_fields(competition_id=competition_id, operator=operator, reason=reason),
+            )
+        return paused
+
+    def rerun_evaluation(
+        self, competition_id: str, operator: str, now: datetime, *, reason: str
+    ) -> None:
+        """Rerun the whole evaluation matrix (every contender, every batch)."""
+        self._require_phase(competition_id, {Phase.EVALUATING}, "an evaluation rerun")
+        pers.reset_evaluation_by_operator(self.conn, competition_id, operator, now, reason=reason)
+        self.log.warning(
+            "evaluation matrix reset by operator; every batch reruns",
+            extra=log_fields(competition_id=competition_id, operator=operator, reason=reason),
+        )
+
+    def amend_schedule(
+        self,
+        competition_id: str,
+        operator: str,
+        now: datetime,
+        *,
+        reason: str,
+        enrollment_deadline: datetime | None = None,
+        finalization_time: datetime | None = None,
+        end_time: datetime | None = None,
+    ) -> dict[str, str]:
+        """Move deadlines LATER only (never earlier: nobody loses time they were promised)."""
+        comp = repo.get_competition(self.conn, competition_id)
+        if comp is None:
+            raise KeyError(f"unknown competition {competition_id}")
+        if enrollment_deadline is None and finalization_time is None and end_time is None:
+            raise ValueError("nothing to amend")
+        pre_final = {Phase.SCHEDULED, Phase.ENROLLING}
+        live = pre_final | {
+            Phase.FINALIZING_SUBMISSIONS,
+            Phase.VALIDATING,
+            Phase.BUILDING,
+            Phase.EVALUATING,
+            Phase.SCORING,
+            Phase.AWAITING_END_TIME,
+        }
+        before = {
+            "enrollment_deadline": comp.enrollment_deadline,
+            "finalization_time": comp.finalization_time,
+            "end_time": comp.end_time,
+        }
+        after = dict(before)
+        for field, value, phases in (
+            ("enrollment_deadline", enrollment_deadline, pre_final),
+            ("finalization_time", finalization_time, pre_final),
+            ("end_time", end_time, live),
+        ):
+            if value is None:
+                continue
+            if value.tzinfo is None:
+                raise ValueError(f"{field} must be timezone-aware")
+            value = value.astimezone(timezone.utc)
+            if comp.status not in phases:
+                raise ValueError(
+                    f"{field} can no longer change: {competition_id} is {comp.status.value}"
+                )
+            if value < before[field]:
+                raise ValueError(f"{field} can only move later ({before[field].isoformat()})")
+            if value <= now:
+                raise ValueError(f"{field} must be in the future")
+            after[field] = value
+        if not (after["enrollment_deadline"] <= after["finalization_time"] < after["end_time"]):
+            raise ValueError(
+                "amended schedule must keep enrollment_deadline <= finalization_time < end_time"
+            )
+        with pers.txn(self.conn):
+            self.conn.execute(
+                "UPDATE competitions SET enrollment_deadline = ?, finalization_time = ?,"
+                " end_time = ?, updated_at = ? WHERE competition_id = ?",
+                (
+                    repo.iso(after["enrollment_deadline"]),
+                    repo.iso(after["finalization_time"]),
+                    repo.iso(after["end_time"]),
+                    repo.iso(now),
+                    competition_id,
+                ),
+            )
+            repo.record_event(
+                self.conn,
+                competition_id,
+                pers.EVENT_SCHEDULE_AMENDED,
+                now,
+                payload={
+                    "operator": operator.strip(),
+                    "reason": reason.strip(),
+                    "before": {k: v.isoformat() for k, v in before.items()},
+                    "after": {k: v.isoformat() for k, v in after.items()},
+                },
+            )
+        return {k: v.isoformat() for k, v in after.items()}
+
+    def reject_contender(
+        self,
+        competition_id: str,
+        contender_id: int,
+        operator: str,
+        now: datetime,
+        *,
+        reason: str,
+    ) -> None:
+        """Take a not-yet-built contender out (e.g. its repository became unreadable
+        and blocks finalization for everyone).  Public, with the reason."""
+        operator, reason = pers._operator_text(operator, reason, what="reject")
+        self._require_phase(
+            competition_id,
+            {
+                Phase.ENROLLING,
+                Phase.FINALIZING_SUBMISSIONS,
+                Phase.VALIDATING,
+                Phase.BUILDING,
+            },
+            "rejecting a contender",
+        )
+        comp = repo.get_competition(self.conn, competition_id)
+        if comp is not None and comp.status is Phase.BUILDING and not pers.is_halted(
+            self.conn, competition_id
+        ):
+            # Builds are in flight during BUILDING: pause first so no build of this
+            # contender can complete (and mark it BUILT) after the rejection.
+            raise ValueError("pause the competition before rejecting a contender during BUILDING")
+        contender = repo.get_contender(self.conn, contender_id)
+        if contender is None or contender.competition_id != competition_id:
+            raise KeyError(f"contender {contender_id} is not part of {competition_id}")
+        if contender.is_calibration:
+            raise ValueError("the calibration baseline cannot be rejected")
+        if contender.status not in ("ENROLLED", "ACCEPTED"):
+            raise ValueError(
+                f"contender {contender_id} is {contender.status}; only ENROLLED or "
+                "ACCEPTED contenders can be rejected"
+            )
+        with pers.txn(self.conn):
+            repo.set_contender_status(self.conn, contender_id, "REJECTED", now)
+            repo.record_event(
+                self.conn,
+                competition_id,
+                pers.EVENT_CONTENDER_REJECTED_BY_OPERATOR,
+                now,
+                payload={
+                    "contender_id": contender_id,
+                    "hotkey": contender.hotkey,
+                    "previous_status": contender.status,
+                    "operator": operator,
+                    "reason": reason,
+                },
+            )
+        self.log.warning(
+            "contender rejected by operator",
+            extra=log_fields(
+                competition_id=competition_id, contender_id=contender_id, reason=reason
+            ),
+        )
+
+    def amend_execution(
+        self,
+        competition_id: str,
+        operator: str,
+        now: datetime,
+        *,
+        reason: str,
+        cpu: float | None = None,
+        memory_mb: int | None = None,
+        batch_timeout_seconds: int | None = None,
+    ) -> dict[str, Any]:
+        """RAISE the sandbox envelope for everyone (never lower it).  During
+        EVALUATING the whole matrix is rerun so every contender runs under the same
+        envelope."""
+        operator, reason = pers._operator_text(operator, reason, what="execution amendment")
+        comp = self._require_phase(
+            competition_id,
+            {
+                Phase.ENROLLING,
+                Phase.FINALIZING_SUBMISSIONS,
+                Phase.VALIDATING,
+                Phase.BUILDING,
+                Phase.EVALUATING,
+            },
+            "an execution amendment",
+        )
+        current = self.effective_sandbox_resources(competition_id)
+        if current is None:
+            raise ValueError(
+                "this manifest pins no sandbox envelope; the process-wide limits apply"
+            )
+        changes = {
+            "cpu": None if cpu is None else float(cpu),
+            "memory_mb": None if memory_mb is None else int(memory_mb),
+            "batch_timeout_seconds": (
+                None if batch_timeout_seconds is None else int(batch_timeout_seconds)
+            ),
+        }
+        if all(v is None for v in changes.values()):
+            raise ValueError("nothing to amend")
+        effective = dict(current)
+        for field, value in changes.items():
+            if value is None:
+                continue
+            if value < current[field]:
+                raise ValueError(f"{field} can only be raised (currently {current[field]})")
+            effective[field] = value
+        limits = self.cfg_competition_limits()
+        for field, cap in limits.items():
+            if cap is not None and effective[field] > cap:
+                raise ValueError(f"{field} {effective[field]} exceeds the operator cap {cap}")
+        rerun = comp.status is Phase.EVALUATING
+        with pers.txn(self.conn):
+            repo.record_event(
+                self.conn,
+                competition_id,
+                pers.EVENT_EXECUTION_AMENDED,
+                now,
+                payload={
+                    "operator": operator,
+                    "reason": reason,
+                    "before": current,
+                    "effective": effective,
+                    "evaluation_rerun": rerun,
+                },
+            )
+            if rerun:
+                pers.reset_evaluation_by_operator(
+                    self.conn,
+                    competition_id,
+                    operator,
+                    now,
+                    reason=reason,
+                    cause="execution_amended",
+                    in_txn=True,
+                )
+        return effective
+
+    def cfg_competition_limits(self) -> dict[str, Any]:
+        cfg = getattr(self, "competition_cfg", None)
+        if cfg is None:
+            return {"cpu": None, "memory_mb": None, "batch_timeout_seconds": None}
+        return {
+            "cpu": cfg.sandbox_cpu_max,
+            "memory_mb": cfg.sandbox_memory_mb_max,
+            "batch_timeout_seconds": cfg.sandbox_batch_timeout_seconds_max,
+        }
+
     def clear_halt(
         self,
         competition_id: str,
@@ -2521,9 +2896,15 @@ class Orchestrator(BaseService):
         now: datetime,
         *,
         reason: str,
+        reset_requeue_budget: bool = False,
     ) -> bool:
         cleared = pers.clear_halt(
-            self.conn, competition_id, operator, now, reason=reason
+            self.conn,
+            competition_id,
+            operator,
+            now,
+            reason=reason,
+            reset_requeue_budget=reset_requeue_budget,
         )
         if cleared:
             self.log.info(
@@ -2546,6 +2927,27 @@ class Orchestrator(BaseService):
         the runner's actual request value. Both must agree and the resulting exact
         GPU string must be committed in ``manifest.allowed_gpus``.
         """
+        if self.cfg.sandbox_backend == "remote_docker":
+            from vidaio.competition.runners.remote_docker_runner import (
+                normalize_gpu_name,
+            )
+
+            configured = normalize_gpu_name(self.cfg.remote_docker_expected_gpu)
+            actual_value = getattr(self.runner, "gpu", None)
+            actual = (
+                normalize_gpu_name(actual_value) if isinstance(actual_value, str) else ""
+            )
+            if not configured or actual != configured:
+                return (
+                    f"remote GPU sandbox reports {actual_value!r}, configured "
+                    f"{self.cfg.remote_docker_expected_gpu!r}"
+                )
+            if actual not in {normalize_gpu_name(g) for g in manifest.allowed_gpus}:
+                return (
+                    f"remote GPU {actual!r} is not committed in manifest."
+                    f"allowed_gpus={manifest.allowed_gpus!r}"
+                )
+            return None
         if self.cfg.sandbox_backend != "modal":
             return None
         configured = self.cfg.modal_gpu.strip()
@@ -2591,12 +2993,22 @@ class Orchestrator(BaseService):
         # the exact GPU this live runner will request from Modal.
         self._assert_manifest_gpu(manifest)
         if self.tokenomics.competition_emissions_enabled and manifest.baseline is None:
-            raise EarningManifestError(
-                "competition emissions are enabled, so the manifest requires "
-                "exactly one non-earning archived baseline with pinned repo, commit, "
-                "and tree identities"
-            )
-        if self.tokenomics.competition_emissions_enabled and (
+            # No executable baseline: the result is decided by the anchored absolute
+            # bars alone (tokenomics.breakthrough.decision_baseline), so both must be
+            # anchored and no relative margin may gate a paid rank.
+            rules = manifest.result_rules
+            if (
+                rules is None
+                or rules.crown_min_score is None
+                or rules.podium_min_score is None
+                or rules.podium_min_margin is not None
+            ):
+                raise EarningManifestError(
+                    "a competition without an archived baseline must anchor "
+                    "result_rules.crown_min_score and result_rules.podium_min_score "
+                    "(and no podium_min_margin): those absolute bars decide the result"
+                )
+        elif self.tokenomics.competition_emissions_enabled and (
             self._chain_mode == "bittensor"
             or self.cfg.baseline_registry_db_path is not None
         ):
@@ -2685,20 +3097,21 @@ class Orchestrator(BaseService):
         competition = repo.get_competition(self.conn, competition_id)
         if competition is None or competition.commitment_root is None:
             raise ValueError("competition has no anchored commitment root")
-        if manifest.baseline is None:
-            raise EarningManifestError("earning manifest has no archived baseline")
         commitment = load_competition_commitment(
             self.store, competition.commitment_root
         )
+        base = manifest.baseline
         expected = {
             "manifest_digest": manifest.manifest_digest(),
-            "baseline_version": manifest.baseline.version,
-            "baseline_artifact_digest": manifest.baseline.artifact_digest,
-            "baseline_provenance_digest": manifest.baseline.provenance_digest,
-            "baseline_tree_digest": pin_git_sha(manifest.baseline.tree_sha),
+            "baseline_version": None if base is None else base.version,
+            "baseline_artifact_digest": None if base is None else base.artifact_digest,
+            "baseline_provenance_digest": None if base is None else base.provenance_digest,
+            "baseline_tree_digest": None if base is None else pin_git_sha(base.tree_sha),
             "dataset_selection_seed_commitment": manifest.scoring_seed_commitment,
             "reward_param_digest": reward_parameter_digest(self.tokenomics),
         }
+        if base is None:
+            expected["baseline_image_digest"] = None
         for field, value in expected.items():
             observed = getattr(commitment, field)
             if observed != value:
@@ -2768,22 +3181,20 @@ class Orchestrator(BaseService):
             )
         manifest = repo.get_manifest(self.conn, competition_id)
         if manifest.baseline is None:
-            raise EarningManifestError(
-                "schema-v14 anchoring requires the persisted manifest's exact "
-                "archived executable baseline and provenance"
-            )
+            # A baseline-free competition commits null baseline provenance; its
+            # result is decided by the anchored absolute bars (checked at creation).
+            if baseline_image_digest is not None or baseline_tree_digest is not None:
+                raise ValueError(
+                    "the manifest declares no baseline: baseline_image_digest and "
+                    "baseline_tree_digest must be omitted"
+                )
         expected_reward_digest = reward_parameter_digest(self.tokenomics)
         if reward_param_digest != expected_reward_digest:
             raise ValueError(
                 "reward_param_digest does not match the active canonical "
                 f"TokenomicsConfig: expected {expected_reward_digest}"
             )
-        if baseline_tree_digest is None:
-            if manifest.baseline is None:
-                raise ValueError(
-                    "baseline_tree_digest is required: the manifest declares no baseline "
-                    "baseline to derive it from"
-                )
+        if baseline_tree_digest is None and manifest.baseline is not None:
             baseline_tree_digest = pin_git_sha(manifest.baseline.tree_sha)
         elif manifest.baseline is not None:
             expected_baseline_tree = pin_git_sha(manifest.baseline.tree_sha)
@@ -2877,18 +3288,13 @@ class Orchestrator(BaseService):
                     is_calibration=True,
                     now=at,
                 )
-        elif baseline_image_digest is None:
-            raise ValueError(
-                "baseline_image_digest is required when the manifest declares no "
-                "buildable archived baseline"
-            )
-        assert baseline_image_digest is not None
+        base = manifest.baseline
         payload = build_competition_commitment(
             CompetitionCommitment(
                 manifest_digest=manifest.manifest_digest(),
-                baseline_version=manifest.baseline.version,
-                baseline_artifact_digest=manifest.baseline.artifact_digest,
-                baseline_provenance_digest=manifest.baseline.provenance_digest,
+                baseline_version=None if base is None else base.version,
+                baseline_artifact_digest=None if base is None else base.artifact_digest,
+                baseline_provenance_digest=None if base is None else base.provenance_digest,
                 baseline_tree_digest=baseline_tree_digest,
                 baseline_image_digest=baseline_image_digest,
                 dataset_selection_seed_commitment=manifest.scoring_seed_commitment,
@@ -3291,7 +3697,8 @@ class Orchestrator(BaseService):
         """Seed a manifest-bound evaluation item.
 
         The miner-visible ``input_path`` is staged as ``CHALLENGE_INPUT``.  An
-        upscaling item additionally requires a distinct pristine ``reference_path``;
+        upscaling or removal item additionally requires a distinct pristine
+        ``reference_path`` (removal: the clean clip under the object);
         it is stored as sealed ``REFERENCE_ORIGINAL`` and staged only in the trusted
         scorer pool.  Sandbox batches are constructed solely from the low-resolution
         input digest, so contender code never receives the pristine bytes.
@@ -3307,10 +3714,10 @@ class Orchestrator(BaseService):
 
         reference_digest: str | None = None
         reference_bytes: int | None = None
-        if manifest.track == "upscaling":
+        if manifest.track in SEALED_REFERENCE_TRACKS:
             if reference_path is None:
                 raise ValueError(
-                    "upscaling evaluation item requires a pristine reference_path"
+                    f"{manifest.track} evaluation item requires a pristine reference_path"
                 )
             reference_src = Path(reference_path)
             reference_ref = self.store.put_file(
@@ -3320,7 +3727,7 @@ class Orchestrator(BaseService):
             reference_bytes = reference_ref.byte_size
             if reference_digest == digest:
                 raise ValueError(
-                    "upscaling pristine reference and miner input must be distinct"
+                    f"{manifest.track} pristine reference and miner input must be distinct"
                 )
             reference_pooled = self.inputs_dir / reference_digest
             if not reference_pooled.exists():
@@ -3341,7 +3748,7 @@ class Orchestrator(BaseService):
         ):
             raise ValueError(
                 "reference_path/upscale_factor/target geometry are valid only for "
-                "upscaling competitions"
+                "upscaling and removal competitions"
             )
         with pers.txn(self.conn):
             return repo.add_evaluation_item(

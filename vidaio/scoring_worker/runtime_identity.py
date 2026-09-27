@@ -81,6 +81,8 @@ _REQUIRED_PAYOUT_BACKENDS = frozenset(
         "piq",
         "opencv",
         "numpy",
+        "removal_metrics",
+        "lpips",
         "python",
     }
 )
@@ -99,6 +101,9 @@ def _distribution_version(*names: str) -> str:
         except importlib.metadata.PackageNotFoundError:
             continue
     return "not-configured"
+
+
+REMOVAL_METRICS_VERSION = "removal-metrics/1"
 
 
 def complete_payout_backend_versions(
@@ -129,6 +134,10 @@ def complete_payout_backend_versions(
                 + _distribution_version("opencv-python-headless", "opencv-python")
             ),
             "numpy": f"numpy/{_distribution_version('numpy')}",
+            # object-removal track: region metrics implementation + the LPIPS package
+            # (its VGG16 backbone + v0.1 linear heads are pinned by the package version)
+            "removal_metrics": REMOVAL_METRICS_VERSION,
+            "lpips": f"lpips/{_distribution_version('lpips')}",
             "python": (
                 f"{platform.python_implementation().lower()}/"
                 f"{platform.python_version()}"
@@ -350,6 +359,21 @@ def initialize_canonical_torch_cpu_runtime() -> dict[str, Any]:
     except (ImportError, OSError) as exc:
         raise RuntimeError(f"canonical CPU PyTorch is unavailable: {exc}") from exc
 
+    # OpenCV runs its own thread pool (parallel_for_) under the removal track's DIS
+    # flow, Gaussian SSIM and resizes; stripe count changes float summation order, so
+    # it is pinned to one thread exactly like torch. Absent OpenCV is fine here (the
+    # removal backend imports it and fails on its own).
+    try:
+        import cv2  # type: ignore[import-not-found]
+    except Exception:  # noqa: BLE001
+        cv2 = None
+    if cv2 is not None:
+        cv2.setNumThreads(1)
+        try:
+            cv2.ocl.setUseOpenCL(False)
+        except Exception:  # noqa: BLE001
+            pass
+
     with _TORCH_POLICY_LOCK:
         torch.set_num_threads(1)
         if torch.get_num_interop_threads() != 1:
@@ -364,6 +388,9 @@ def initialize_canonical_torch_cpu_runtime() -> dict[str, Any]:
         isolated = _isolated_torch_policy_probe()
         effective["actual_mkl_cbwr"] = isolated["actual_mkl_cbwr"]
         effective["actual_mkl_dynamic"] = isolated["actual_mkl_dynamic"]
+        if cv2 is not None:
+            effective["opencv_threads"] = int(cv2.getNumThreads())
+            effective["opencv_version"] = str(cv2.__version__)
     problems = _torch_policy_problems(effective)
     if problems:
         raise RuntimeError("canonical CPU kernel policy unavailable: " + "; ".join(problems))

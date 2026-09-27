@@ -427,9 +427,11 @@ async def test_anchor_without_a_chain_adapter_is_503_and_records_nothing(
     assert phase(orch, cid) is Phase.SCHEDULED
 
 
-async def test_schema_v14_anchor_refuses_a_manifest_without_a_baseline(
+async def test_baseline_free_anchor_refuses_baseline_digests(
     orchestrator_factory, fixture_repos, tmp_path
 ):
+    """A manifest without a baseline commits null baseline provenance: a caller can
+    never smuggle a baseline image or tree into its commitment."""
     clock = Clock()
     chain = RecordingChain()
     orch = orchestrator_factory(
@@ -445,19 +447,16 @@ async def test_schema_v14_anchor_refuses_a_manifest_without_a_baseline(
             headers=AUTH,
             json={"manifest": manifest.model_dump(mode="json")},
         )
-        missing = await client.post(
+        empty = await client.post(
             f"/competitions/{cid}/anchor",
             headers=AUTH,
-            json={
-                "baseline_image_digest": BASELINE_IMAGE_DIGEST,
-                "reward_param_digest": REWARD_PARAM_DIGEST,
-            },
+            json={"reward_param_digest": REWARD_PARAM_DIGEST},
         )
-        assert missing.status_code == 422
+        assert empty.status_code == 409  # the item matrix gate comes first
+        assert empty.json()["detail"]["code"] == "items_not_ready"
         assert chain.anchor_calls == []
 
         seed_items(orch, cid, tmp_path / "item-src")
-
         supplied = await client.post(
             f"/competitions/{cid}/anchor",
             headers=AUTH,
@@ -468,7 +467,7 @@ async def test_schema_v14_anchor_refuses_a_manifest_without_a_baseline(
             },
         )
         assert supplied.status_code == 422
-        assert "schema-v14 anchoring requires" in supplied.text
+        assert "declares no baseline" in supplied.text
         assert chain.anchor_calls == []
 
 
@@ -583,20 +582,29 @@ async def test_build_competition_result_values(control, tmp_path):
         )
 
 
-async def test_cycle_without_executable_baseline_cannot_be_anchored(control, tmp_path):
-    """A cycle without its exact baseline can never reach earning evidence."""
+async def test_cycle_without_executable_baseline_anchors_null_provenance(control, tmp_path):
+    """A baseline-free cycle anchors a commitment whose baseline fields are null."""
+    from vidaio.audit.commitments import load_competition_commitment
+
     orch, _chain, _clock, _client = control
     manifest = build_manifest()  # no baseline
     cid = manifest.competition_id
     orch.create_competition(manifest, T0)
-    with pytest.raises(ValueError, match="schema-v14 anchoring requires"):
+    seed_items(orch, cid, tmp_path / "item-src")
+    with pytest.raises(ValueError, match="declares no baseline"):
         await orch.anchor_competition(
             cid,
             baseline_image_digest=BASELINE_IMAGE_DIGEST,
             reward_param_digest=REWARD_PARAM_DIGEST,
-            baseline_tree_digest=hashlib.sha256(b"none").hexdigest(),
             now=T0,
         )
+    result = await orch.anchor_competition(
+        cid, reward_param_digest=REWARD_PARAM_DIGEST, now=T0
+    )
+    assert result.baseline_image_digest is None
+    commitment = load_competition_commitment(orch.store, result.root)
+    assert not commitment.has_baseline
+    assert commitment.manifest_digest == manifest.manifest_digest()
 
 
 def test_result_uids_come_from_the_chain_snapshot(orchestrator_factory, fixture_repos):

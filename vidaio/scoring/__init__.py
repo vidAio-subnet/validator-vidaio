@@ -44,6 +44,7 @@ from vidaio.scoring.compression import (
 )
 from vidaio.scoring.config import (
     TRACK_COMPRESSION,
+    TRACK_REMOVAL,
     TRACK_UPSCALING,
     AggregateWeights,
     CompressionWeights,
@@ -104,6 +105,11 @@ from vidaio.scoring.phash_cpu import (
     PerceptualHashUnavailable,
 )
 from vidaio.scoring.result import ItemScore, compose_item_score, config_digest
+from vidaio.scoring.removal_formula import (
+    RegionMetrics,
+    RemovalBreakdown,
+    score_removal,
+)
 from vidaio.scoring.upscaling import (
     UpscalingBreakdown,
     final_from_pre,
@@ -118,6 +124,7 @@ __all__ = [
     "CompressionWeights",
     "AggregateWeights",
     "TRACK_COMPRESSION",
+    "TRACK_REMOVAL",
     "TRACK_UPSCALING",
     # backends
     "MediaInfo",
@@ -171,10 +178,13 @@ __all__ = [
     "compression_rate",
     "compression_score_from_rate",
     "score_compression",
+    "RegionMetrics",
+    "RemovalBreakdown",
     "UpscalingBreakdown",
     "quality_from_pieapp",
     "length_score",
     "final_from_pre",
+    "score_removal",
     "score_upscaling",
     # aggregation
     "worst_decile_score",

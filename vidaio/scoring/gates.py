@@ -32,7 +32,7 @@ from vidaio.scoring.backends import (
     PerceptualCheckBackend,
     PerceptualCheckResult,
 )
-from vidaio.scoring.config import TRACK_COMPRESSION, TRACK_UPSCALING, ScoringConfig
+from vidaio.scoring.config import TRACK_COMPRESSION, TRACK_REMOVAL, TRACK_UPSCALING, ScoringConfig
 
 
 class ReasonCode(StrEnum):
@@ -66,6 +66,11 @@ class ReasonCode(StrEnum):
     METRIC_MISSING = "METRIC_MISSING"
     METRIC_NON_FINITE = "METRIC_NON_FINITE"
     UNSUPPORTED_SCALE_FACTOR = "UNSUPPORTED_SCALE_FACTOR"
+    # object-removal track
+    MASK_MISSING = "MASK_MISSING"
+    OUTSIDE_REGION_MODIFIED = "OUTSIDE_REGION_MODIFIED"
+    REGION_BASELINE_NOT_BEATEN = "REGION_BASELINE_NOT_BEATEN"
+    WARP_ERROR_EXCEEDED = "WARP_ERROR_EXCEEDED"
 
 
 class ValidityViolation(BaseModel):
@@ -282,6 +287,8 @@ class VmafFloorGate:
     name = "vmaf_floor"
 
     def check(self, ctx: GateContext) -> list[ValidityViolation]:
+        if ctx.track == TRACK_REMOVAL:
+            return []  # region metrics, no VMAF term (vidaio/scoring/removal.py)
         if ctx.vmaf_primary is None:
             return [
                 ValidityViolation(
@@ -323,6 +330,8 @@ class VmafModelDeltaGate:
     name = "vmaf_model_delta"
 
     def check(self, ctx: GateContext) -> list[ValidityViolation]:
+        if ctx.track == TRACK_REMOVAL:
+            return []  # no VMAF runs on the removal track
         violations: list[ValidityViolation] = []
         delta_pair_supplied = (
             ctx.vmaf_delta_primary is not None or ctx.vmaf_delta_secondary is not None
@@ -397,6 +406,18 @@ class _PerceptualGate:
         raise NotImplementedError
 
     def check(self, ctx: GateContext) -> list[ValidityViolation]:
+        if ctx.track == TRACK_REMOVAL:
+            # Whole-frame tone/colour comparisons against the served input cannot hold
+            # for removal: the masked region is meant to change. Outside the mask the
+            # output must equal the input (OUTSIDE_REGION_MODIFIED), which already rules
+            # out every manipulation these gates look for.
+            ctx.skips.append(
+                GateSkip(
+                    gate=self.name,
+                    detail="removal track: the outside-mask identity check applies instead",
+                )
+            )
+            return []
         result = self._run(ctx)
         ctx.perceptual_results[self.name] = result
         if not result.passed:

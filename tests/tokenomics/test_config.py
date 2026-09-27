@@ -6,11 +6,14 @@ from pydantic import ValidationError
 from vidaio.tokenomics import TokenomicsConfig
 
 
-def test_v2_defaults_are_exact_protocol_allocations() -> None:
+def test_v3_defaults_are_exact_protocol_allocations() -> None:
     cfg = TokenomicsConfig()
-    assert (cfg.idle_inference_share, cfg.idle_burn_share) == (0.80, 0.20)
-    assert (cfg.podium_inference_share, cfg.podium_competition_share) == (0.60, 0.40)
-    assert (cfg.crown_inference_share, cfg.crown_competition_share) == (0.10, 0.90)
+    assert (cfg.idle_inference_share, cfg.idle_burn_share) == (0.0, 1.0)
+    assert (cfg.podium_inference_share, cfg.podium_competition_share) == (0.0, 1.0)
+    assert (cfg.crown_inference_share, cfg.crown_competition_share) == (0.0, 1.0)
+    assert cfg.crown_split == (0.90, 0.04, 0.03, 0.02, 0.01)
+    assert cfg.podium_split == (0.50, 0.24, 0.13, 0.08, 0.05)
+    assert cfg.redistribute_empty_places and cfg.no_qualifier_closes_window
     assert cfg.result_window_hours == 168
     assert cfg.breakthrough_margin_floor == 0.05
     assert cfg.track_weights == {"compression": 0.8, "upscaling": 0.2}
@@ -28,6 +31,10 @@ def test_v2_defaults_are_exact_protocol_allocations() -> None:
         {"podium_competition_share": float("inf")},
         {"crown_inference_share": -0.1, "crown_competition_share": 1.1},
         {"breakthrough_margin_floor": 0.0},
+        {"crown_split": (0.9, 0.2)},
+        {"podium_split": ()},
+        {"podium_split": (0.5, 0.2, 0.1, 0.1, 0.05, 0.05)},
+        {"crown_inference_share": 0.5, "crown_competition_share": 0.5, "podium_inference_share": 0.2, "podium_competition_share": 0.8},
         {"breakthrough_margin_floor": 1.0},
         {"breakthrough_margin_floor": float("nan")},
         {"result_window_hours": 0.0},

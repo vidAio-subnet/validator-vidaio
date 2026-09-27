@@ -127,6 +127,8 @@ def _committed_epoch(store: LocalFsStore, clips, item, *, packet_bytes: bytes, c
     legacy = json.loads(log.to_json())
     legacy["schema_version"] = 16
     legacy.pop("payout_min_alpha_stake")  # v17-only archived floor (D-025); v16 implies 0
+    legacy["reward_window_state"].pop("competition_share")  # v18-only window payout policy
+    legacy["reward_window_state"].pop("place_shares")
     legacy.pop("round_membership")
     legacy["audit_manifest"].pop("content_rounds")
     legacy["audit_manifest"].pop("round_commits")

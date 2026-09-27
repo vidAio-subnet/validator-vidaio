@@ -54,12 +54,13 @@ def test_competition_payload_deterministic_and_small() -> None:
     assert build_competition_commitment(other).root != a.root
 
 
-def test_reward_parameter_digest_binds_hard_coded_podium_split() -> None:
+def test_reward_parameter_digest_binds_both_splits() -> None:
     config = TokenomicsConfig()
     expected_policy = {
         "domain": REWARD_POLICY_DOMAIN,
         "tokenomics": config.model_dump(mode="json", exclude={"payout_min_alpha_stake"}),
-        "competition_podium_split": [0.70, 0.20, 0.10],
+        "competition_podium_split": [0.50, 0.24, 0.13, 0.08, 0.05],
+        "competition_crown_split": [0.90, 0.04, 0.03, 0.02, 0.01],
     }
     assert reward_parameter_digest(config) == sha256_hex(
         canonical_json_bytes(expected_policy)
@@ -75,19 +76,27 @@ def test_reward_parameter_digest_binds_result_window_duration() -> None:
     )
 
 
-def test_inference_floor_preserves_pre_v17_competition_policy_digest() -> None:
-    # These are the deployed policy bytes' digests before the new config field
-    # (re-pinned 2026-09-15 when minimum_payout_score moved from 0.10 to 0.05; the
-    # alpha-stake floor must still not move them).
-    for enabled, digest in (
-        (False, "a9e5711446ec8bc529e8f736d0b752d2ec92eb93a14489937ef5670b617042ac"),
-        (True, "df6aa2749c4ce74f99ab9148d9a55bcc14eec07be7d927b5bce0e72e7e196e5a"),
-    ):
-        for floor in (0.0, 50.0, 100.0):
-            config = TokenomicsConfig(
-                competition_emissions_enabled=enabled, payout_min_alpha_stake=floor,
+def test_inference_floor_does_not_move_the_competition_policy_digest() -> None:
+    # The alpha-stake floor is an inference-only knob: it must never change the
+    # policy digest that competitions anchor. (Tokenomics v3, 2026-09-23, replaced
+    # the pre-v3 pins a9e57114…/df6aa274…; those digests are what competition
+    # sn85-compression-001c anchored and are verified by the pre-v3 release only.)
+    for enabled in (False, True):
+        digests = {
+            reward_parameter_digest(
+                TokenomicsConfig(competition_emissions_enabled=enabled, payout_min_alpha_stake=floor)
             )
-            assert reward_parameter_digest(config) == digest
+            for floor in (0.0, 50.0, 100.0)
+        }
+        assert len(digests) == 1
+        assert digests != {"a9e5711446ec8bc529e8f736d0b752d2ec92eb93a14489937ef5670b617042ac", "df6aa2749c4ce74f99ab9148d9a55bcc14eec07be7d927b5bce0e72e7e196e5a"}
+
+
+def test_split_changes_move_the_policy_digest() -> None:
+    base = TokenomicsConfig()
+    assert reward_parameter_digest(base) != reward_parameter_digest(
+        base.model_copy(update={"podium_split": (0.6, 0.2, 0.1, 0.06, 0.04)})
+    )
 
 
 def test_publication_payload() -> None:

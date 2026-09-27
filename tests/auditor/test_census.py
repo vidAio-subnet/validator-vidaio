@@ -35,7 +35,7 @@ from vidaio.auditor import (
 from vidaio.authority import build_audit_manifest
 from tests.auditor.fakes import FakeChronologyAuditor as Auditor, FakeEpochFinalizer as EpochFinalizer
 from vidaio.epoch.log import AuditManifest, EpochLog, MinerCensusEntry, weight_vector_digest
-from vidaio.tokenomics import TokenomicsConfig, quantize_u16
+from vidaio.tokenomics import EMISSION_PROFILES, TokenomicsConfig, quantize_u16
 
 from tests.auditor.fakes import (
     BURN_UID,
@@ -52,7 +52,7 @@ from tests.auditor.fakes import (
     scored_item,
 )
 
-CFG = TokenomicsConfig()
+CFG = TokenomicsConfig(**EMISSION_PROFILES["v2"])  # these suites run on the v2 profile
 NO_SAMPLE = SamplePolicy(sample_rate=0.0, min_samples=0)  # earning/census-only, no media
 
 

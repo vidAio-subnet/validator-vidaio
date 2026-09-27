@@ -248,6 +248,9 @@ SCORER_REQUIRED_PAYOUT_BACKENDS = frozenset(
         "piq",
         "opencv",
         "numpy",
+        # object-removal scoring (competition track): region metrics + LPIPS package
+        "removal_metrics",
+        "lpips",
         "python",
     }
 )

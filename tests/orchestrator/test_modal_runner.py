@@ -1117,3 +1117,28 @@ def test_generation_runtime_creates_its_environment_create_only(
     events.clear()
     ModalSdkRuntime.start_fresh(**{**names, "environment_name": "vidaio-next-env-operator-made"})
     assert not any(event.startswith("env:") for event in events)  # default: operator-created
+
+
+def test_output_watchdog_rescans_when_the_root_listing_races_a_vanishing_child(
+    tmp_path: Path,
+) -> None:
+    """A contender rewriting its outputs can make the ROOT listing report NotFound
+    once; that is the same rename race as a vanished child, not an outage."""
+
+    class RacingRootLease:
+        def __init__(self) -> None:
+            self.root_scans = 0
+
+        def list_files(self, path: str) -> Sequence[RemoteFile]:
+            if path == "/output":
+                self.root_scans += 1
+                if self.root_scans == 1:
+                    raise FileNotFoundError("/output/partial.tmp")
+                return [RemoteFile("/output/final.mkv", "file", 77)]
+            raise AssertionError(f"unexpected path: {path}")
+
+    runner, _spec = _make_runner(tmp_path, _Runtime())
+    lease = RacingRootLease()
+
+    assert runner._remote_tree_usage(lease, "/output") == (77, 1)  # noqa: SLF001
+    assert lease.root_scans == 2

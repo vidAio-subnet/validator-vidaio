@@ -65,7 +65,10 @@ from vidaio.audit.store import (
     AuditStore,
     IntegrityError,
 )
+from vidaio.epoch.window_source import find_window_source_result
 from vidaio.epoch.log import (
+    COMPETITION_TRACKS,
+    PROTOCOL_TRACKS,
     AuditFileKind,
     AuditFileRef,
     AvailabilityInput,
@@ -77,7 +80,12 @@ from vidaio.tokenomics.ewma import accumulate, is_excluded
 from vidaio.tokenomics.quantize import quantize_u16
 from vidaio.tokenomics.rank_curve import dedup_excluded
 from vidaio.tokenomics.weights import build_weight_vector
-from vidaio.tokenomics.breakthrough import resolve_reward_window
+from vidaio.tokenomics.breakthrough import (
+    is_legacy_window,
+    resolve_reward_window,
+    upgrade_legacy_window,
+    window_active,
+)
 from vidaio.tokenomics.state import CompetitionResult, EmissionState, RewardWindowState
 from vidaio.validator.availability import (
     AvailabilityObservation,
@@ -97,6 +105,7 @@ from vidaio.competition.anchor_evidence import (
 from vidaio.competition.item_commitment import (
     compression_item_commitment,
     evaluation_item_commitment,
+    removal_item_commitment,
 )
 from vidaio.competition.manifest import CompetitionManifest
 
@@ -640,6 +649,9 @@ class Auditor:
                         item_commitment=competition_items[
                             (item.challenge_id, item.item_id)
                         ].item_commitment,
+                        mask_stream_index=competition_items[
+                            (item.challenge_id, item.item_id)
+                        ].mask_stream_index,
                     )
                     if item.source == "competition"
                     and competition_input is not None
@@ -1247,9 +1259,16 @@ class Auditor:
                     competition_start_time=manifest.start_time,
                     epoch_close_block=log.close_block,
                 )
-                if manifest.baseline is None:
+                base = manifest.baseline
+                if base is None and not (
+                    manifest.result_rules is not None
+                    and manifest.result_rules.crown_min_score is not None
+                    and manifest.result_rules.podium_min_score is not None
+                    and manifest.result_rules.podium_min_margin is None
+                ):
                     raise ValueError(
-                        "earning competition manifest has no archived executable baseline"
+                        "an earning competition without an archived baseline must "
+                        "anchor both absolute bars (crown_min_score, podium_min_score)"
                     )
                 manifest_rules = (
                     None
@@ -1265,11 +1284,17 @@ class Auditor:
                     )
                 expected_commitment = {
                     "manifest_digest": comp_input.manifest_digest,
-                    "baseline_version": manifest.baseline.version,
-                    "baseline_artifact_digest": manifest.baseline.artifact_digest,
-                    "baseline_provenance_digest": manifest.baseline.provenance_digest,
-                    "baseline_tree_digest": pin_git_sha(manifest.baseline.tree_sha),
-                    "baseline_image_digest": manifest.baseline.image_digest,
+                    "baseline_version": None if base is None else base.version,
+                    "baseline_artifact_digest": (
+                        None if base is None else base.artifact_digest
+                    ),
+                    "baseline_provenance_digest": (
+                        None if base is None else base.provenance_digest
+                    ),
+                    "baseline_tree_digest": (
+                        None if base is None else pin_git_sha(base.tree_sha)
+                    ),
+                    "baseline_image_digest": None if base is None else base.image_digest,
                     "dataset_selection_seed_commitment": (
                         manifest.scoring_seed_commitment
                     ),
@@ -1284,19 +1309,27 @@ class Auditor:
                             f"competition commitment {field} {observed} differs from "
                             f"the executed epoch policy {expected}"
                         )
-                if (
-                    comp_input.baseline_version != manifest.baseline.version
-                    or comp_input.baseline_artifact_digest
-                    != manifest.baseline.artifact_digest
-                    or comp_input.baseline_artifact_bytes
-                    != manifest.baseline.artifact_bytes
-                    or comp_input.baseline_execution_image_digest
-                    != manifest.baseline.image_digest
-                    or comp_input.baseline_provenance_digest
-                    != manifest.baseline.provenance_digest
-                    or comp_input.baseline_provenance_bytes
-                    != manifest.baseline.provenance_bytes
-                ):
+                observed_baseline = (
+                    comp_input.baseline_version,
+                    comp_input.baseline_artifact_digest,
+                    comp_input.baseline_artifact_bytes,
+                    comp_input.baseline_execution_image_digest,
+                    comp_input.baseline_provenance_digest,
+                    comp_input.baseline_provenance_bytes,
+                )
+                anchored_baseline = (
+                    (None,) * 6
+                    if base is None
+                    else (
+                        base.version,
+                        base.artifact_digest,
+                        base.artifact_bytes,
+                        base.image_digest,
+                        base.provenance_digest,
+                        base.provenance_bytes,
+                    )
+                )
+                if observed_baseline != anchored_baseline:
                     raise ValueError(
                         "competition input baseline provenance differs from the "
                         "pre-enrollment manifest/commitment"
@@ -1350,6 +1383,44 @@ class Auditor:
                         ):
                             raise ValueError(
                                 f"upscaling evaluation item {expected_index} does not "
+                                "open its anchored manifest commitment"
+                            )
+
+                if manifest.track == "removal":
+                    commitments = manifest.evaluation_item_commitments or []
+                    if len(comp_input.items) != len(commitments):
+                        raise ValueError(
+                            f"removal competition input has {len(comp_input.items)} "
+                            f"item(s), but the anchored manifest commits "
+                            f"{len(commitments)}"
+                        )
+                    for expected_index, (item, committed) in enumerate(
+                        zip(comp_input.items, commitments, strict=True)
+                    ):
+                        if (
+                            item.item_index != expected_index
+                            or item.input_sha256 is None
+                            or item.reference_sha256 is None
+                            or item.mask_stream_index is None
+                            or item.item_commitment is None
+                        ):
+                            raise ValueError(
+                                f"removal evaluation item {expected_index} has an "
+                                "incomplete or reordered commitment preimage"
+                            )
+                        derived_item_commitment = removal_item_commitment(
+                            competition_id=comp_input.competition_id,
+                            item_index=item.item_index,
+                            input_sha256=item.input_sha256,
+                            reference_sha256=item.reference_sha256,
+                            mask_stream_index=item.mask_stream_index,
+                        )
+                        if (
+                            item.item_commitment != derived_item_commitment
+                            or committed != derived_item_commitment
+                        ):
+                            raise ValueError(
+                                f"removal evaluation item {expected_index} does not "
                                 "open its anchored manifest commitment"
                             )
 
@@ -1507,6 +1578,34 @@ class Auditor:
                             ):
                                 raise ValueError(
                                     "upscaling competition bundle does not bind the "
+                                    "committed evaluation-item preimage"
+                                )
+                        if comp_input.track == "removal":
+                            binding = bundle.competition_item
+                            actual_binding = (
+                                None
+                                if binding is None
+                                else (
+                                    binding.item_index,
+                                    binding.input_sha256,
+                                    binding.reference_sha256,
+                                    binding.mask_stream_index,
+                                    binding.item_commitment,
+                                )
+                            )
+                            if (
+                                bundle.stage.value != "competition_sealed"
+                                or actual_binding
+                                != (
+                                    item.item_index,
+                                    item.input_sha256,
+                                    item.reference_sha256,
+                                    item.mask_stream_index,
+                                    item.item_commitment,
+                                )
+                            ):
+                                raise ValueError(
+                                    "removal competition bundle does not bind the "
                                     "committed evaluation-item preimage"
                                 )
                         if bundle.execution_image_digest is None:
@@ -1688,6 +1787,47 @@ class Auditor:
             )
         else:
             prior_reward_window = RewardWindowState()
+        if (
+            log.schema_version >= 18
+            and prior_log is not None
+            and is_legacy_window(prior_reward_window)
+            and window_active(prior_reward_window, log.created_at)
+        ):
+            # The producer re-resolves a still-active pre-v18 window once, from the
+            # result committed in the log that applied it (same hash-chain walk).
+            try:
+                source = find_window_source_result(
+                    lambda epoch_id, digest: _read_chained_log(store, epoch_id, digest),
+                    prior_log,
+                    prior_reward_window,
+                )
+            except Exception as exc:  # noqa: BLE001 - unreadable chain = unverified
+                return (
+                    derived_result,
+                    log.reward_window_state,
+                    result_verdicts
+                    + (
+                        verdict(
+                            ItemVerdictKind.SKIP,
+                            COMPETITION_UNVERIFIED,
+                            "the carried pre-v18 reward window's source result is "
+                            f"unreachable through the log chain: {exc}",
+                            item_id="reward-window-state",
+                        ),
+                    ),
+                )
+            try:
+                prior_reward_window = upgrade_legacy_window(
+                    self._config.tokenomics, prior_reward_window, source
+                )
+            except ValueError as exc:
+                failed = verdict(
+                    ItemVerdictKind.FAIL,
+                    REWARD_WINDOW_MISMATCH,
+                    f"legacy reward window upgrade refused: {exc}",
+                    item_id="reward-window-state",
+                )
+                return None, RewardWindowState(), result_verdicts + (failed,)
         try:
             derived_reward_window = resolve_reward_window(
                 self._config.tokenomics,
@@ -3186,11 +3326,20 @@ class Auditor:
         all_refs = list(log.audit_manifest.baseline_bundles)
         for refs in log.audit_manifest.per_uid.values():
             all_refs.extend(refs)
-        for refs in log.audit_manifest.competition_bundles.values():
-            all_refs.extend(refs)
-        for ref in all_refs:
+        competition_refs = [
+            ref
+            for refs in log.audit_manifest.competition_bundles.values()
+            for ref in refs
+        ]
+        # A competition pays through its committed result, not the inference pools, so
+        # its refs may also carry a competition-only track (object removal).
+        competition_protocol = protocol | (COMPETITION_TRACKS - PROTOCOL_TRACKS)
+        for ref, allowed in [
+            *((ref, protocol) for ref in all_refs),
+            *((ref, competition_protocol) for ref in competition_refs),
+        ]:
             track = ref.committed_track
-            if track is None or track in protocol:
+            if track is None or track in allowed:
                 continue
             item_id = f"track-ref:{ref.item_id}:{track}"
             if item_id in seen:
@@ -4444,3 +4593,15 @@ class Auditor:
             "item_id": payload.get("item_id"),
             "miner_hotkey": payload.get("miner_hotkey"),
         }
+
+
+def _read_chained_log(store: AuditStore, epoch_id: int, digest: str) -> EpochLog:
+    """One finalized epoch log, read under the digest its successor committed."""
+    from vidaio.authority.finalizer import EPOCH_LOG_MEMBER, epoch_prefix
+
+    data = store.get_set_member(
+        epoch_prefix(epoch_id), EPOCH_LOG_MEMBER, expected_digest=digest
+    )
+    return EpochLog.from_history_json(
+        data, expected_digest=digest, expected_epoch_id=epoch_id
+    )

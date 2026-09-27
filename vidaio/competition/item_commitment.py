@@ -147,3 +147,62 @@ def compression_item_commitment(
         ensure_ascii=True,
     ).encode("utf-8")
     return hashlib.sha256(preimage).hexdigest()
+
+
+REMOVAL_ITEM_COMMITMENT_DOMAIN = "vidaio.competition.removal-item.v1"
+#: Tracks whose scorer reference differs from the miner input: the pristine
+#: reference is sealed during the competition and released at completion so a
+#: keyless auditor can recompute every packet.
+SEALED_REFERENCE_TRACKS = frozenset({"upscaling", "removal"})
+#: The served removal input carries the per-frame mask as this video stream
+#: (stream 0 = the frames to repair, stream 1 = the mask).  The index is part of the
+#: committed preimage so a scorer can never be pointed at another stream.
+REMOVAL_MASK_STREAM_INDEX = 1
+
+
+def removal_item_commitment(
+    *,
+    competition_id: str,
+    item_index: int,
+    input_sha256: str,
+    reference_sha256: str,
+    mask_stream_index: int = REMOVAL_MASK_STREAM_INDEX,
+) -> str:
+    """Commitment to one hidden OBJECT-REMOVAL item.
+
+    The preimage binds the exact two-stream input contenders receive (frames with the
+    object + the mask), the sealed clean reference the masked region is scored
+    against, and the mask stream index.  The reference is released only after the
+    competition, so the ordered list anchored in the manifest proves that no item or
+    reference was swapped in between.
+    """
+    if not competition_id:
+        raise ValueError("competition_id must be non-empty")
+    if type(item_index) is not int or item_index < 0:
+        raise ValueError("item_index must be a non-negative integer")
+    for field, digest in (
+        ("input_sha256", input_sha256),
+        ("reference_sha256", reference_sha256),
+    ):
+        if _SHA256_HEX.fullmatch(digest) is None:
+            raise ValueError(f"{field} must be lowercase sha256 hex")
+    if input_sha256 == reference_sha256:
+        raise ValueError("removal reference and miner input must be distinct")
+    if mask_stream_index != REMOVAL_MASK_STREAM_INDEX:
+        raise ValueError(
+            f"removal mask stream index must be {REMOVAL_MASK_STREAM_INDEX}"
+        )
+    preimage = json.dumps(
+        {
+            "competition_id": competition_id,
+            "domain": REMOVAL_ITEM_COMMITMENT_DOMAIN,
+            "input_sha256": input_sha256,
+            "item_index": item_index,
+            "mask_stream_index": mask_stream_index,
+            "reference_sha256": reference_sha256,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return hashlib.sha256(preimage).hexdigest()

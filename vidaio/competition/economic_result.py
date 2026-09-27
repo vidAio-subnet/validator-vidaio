@@ -41,7 +41,8 @@ class CompetitionEconomicDerivation:
 
     result: CompetitionResult
     subject_aggregates: tuple[SubjectAggregate, ...]
-    baseline_score: float
+    #: None for a competition anchored without an executable baseline.
+    baseline_score: float | None
 
     def aggregate_by_subject_id(self) -> dict[str, float]:
         """Return a fresh subject-id -> mean view for logs/tests/diagnostics."""
@@ -234,6 +235,13 @@ def _competition_rules(competition: CompetitionInput) -> CompetitionRules | None
             crown_min_score=committed.crown_min_score,
             podium_min_margin=committed.podium_min_margin,
             podium_min_score=committed.podium_min_score,
+            # the anchored payout policy (tokenomics v3) travels with the rules
+            crown_competition_share=getattr(committed, "crown_competition_share", None),
+            podium_competition_share=getattr(committed, "podium_competition_share", None),
+            crown_split=getattr(committed, "crown_split", None),
+            podium_split=getattr(committed, "podium_split", None),
+            redistribute_empty_places=getattr(committed, "redistribute_empty_places", None),
+            no_qualifier_closes_window=getattr(committed, "no_qualifier_closes_window", None),
         )
     except ValueError as exc:
         raise CompetitionEconomicResultError(
@@ -247,9 +255,14 @@ def derive_competition_economics(
 ) -> CompetitionEconomicDerivation:
     """Derive the unique ranked ``CompetitionResult`` from recomputed packet scores."""
     aggregates = aggregate_subject_scores(competition, packet_scores)
-    baseline = _single_role(aggregates, "baseline", required=True)
-    if baseline is None:  # narrowed by the required=True check above
+    has_baseline = getattr(competition, "baseline_version", None) is not None
+    baseline = _single_role(aggregates, "baseline", required=has_baseline)
+    if has_baseline and baseline is None:  # narrowed by required=True above
         raise CompetitionEconomicResultError("competition has no archived baseline")
+    if not has_baseline and baseline is not None:
+        raise CompetitionEconomicResultError(
+            "a competition committed without a baseline carries a baseline subject"
+        )
     unsupported = sorted(
         subject.subject_id
         for subject in aggregates
@@ -290,7 +303,7 @@ def derive_competition_economics(
         cycle=competition.cycle,
         applied_at=applied_at,
         contenders=tuple(contenders),
-        baseline_score=baseline.score,
+        baseline_score=None if baseline is None else baseline.score,
         baseline_version=baseline_version,
         baseline_artifact_digest=baseline_artifact_digest,
         rules=rules,
@@ -298,7 +311,7 @@ def derive_competition_economics(
     return CompetitionEconomicDerivation(
         result=result,
         subject_aggregates=aggregates,
-        baseline_score=baseline.score,
+        baseline_score=None if baseline is None else baseline.score,
     )
 
 

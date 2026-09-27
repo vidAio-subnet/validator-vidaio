@@ -42,26 +42,47 @@ class LifecycleStage(StrEnum):
 
 
 class CompetitionItemBinding(BaseModel):
-    """Manifest-committed upscaling item preimage copied into a bundle."""
+    """Manifest-committed item preimage copied into a bundle.
+
+    Upscaling items carry their factor (and v2 geometry); object-removal items carry
+    the mask stream index of their two-stream input instead.  Exactly one of the two
+    is present; the absent keys are omitted from the canonical bytes so every
+    upscaling bundle published before removal existed keeps its digest.
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     item_index: int = Field(ge=0)
     input_sha256: str = Field(pattern=SHA256_HEX_PATTERN)
     reference_sha256: str = Field(pattern=SHA256_HEX_PATTERN)
-    upscale_factor: Literal[2, 4]
+    upscale_factor: Literal[2, 4] | None = None
     # NULL/NULL exists only for already-anchored v1 item commitments. New v2
     # commitments bind the exact output geometry required by scoring.
     target_width: int | None = Field(default=None, gt=0)
     target_height: int | None = Field(default=None, gt=0)
+    #: Object removal: the video stream of the served input that carries the mask.
+    mask_stream_index: Literal[1] | None = None
     item_commitment: str = Field(pattern=SHA256_HEX_PATTERN)
+
+    @property
+    def kind(self) -> str:
+        return "removal" if self.mask_stream_index is not None else "upscaling"
 
     @model_validator(mode="after")
     def _distinct_media(self) -> "CompetitionItemBinding":
         if self.reference_sha256 == self.input_sha256:
             raise ValueError(
-                "upscaling competition binding requires distinct reference/input"
+                "competition item binding requires distinct reference/input"
             )
+        if (self.upscale_factor is None) == (self.mask_stream_index is None):
+            raise ValueError(
+                "competition item binding carries exactly one of upscale_factor "
+                "(upscaling) or mask_stream_index (removal)"
+            )
+        if self.mask_stream_index is not None and (
+            self.target_width is not None or self.target_height is not None
+        ):
+            raise ValueError("removal item binding cannot carry target geometry")
         if (self.target_width is None) != (self.target_height is None):
             raise ValueError(
                 "upscaling competition target dimensions must appear together"
@@ -75,11 +96,17 @@ class CompetitionItemBinding(BaseModel):
         Geometry is mandatory for new v2 commitments. Historical v1 bindings have
         NULL/NULL in memory; omitting the two new keys keeps their pre-upgrade bundle
         digest byte-identical instead of silently orphaning an anchored digest.
+        The same rule keeps ``mask_stream_index`` out of upscaling bundles and
+        ``upscale_factor`` out of removal bundles.
         """
         payload = handler(self)
         if self.target_width is None and self.target_height is None:
             payload.pop("target_width", None)
             payload.pop("target_height", None)
+        if self.mask_stream_index is None:
+            payload.pop("mask_stream_index", None)
+        if self.upscale_factor is None:
+            payload.pop("upscale_factor", None)
         return payload
 
 

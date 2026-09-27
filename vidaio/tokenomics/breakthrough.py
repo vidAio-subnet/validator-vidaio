@@ -8,11 +8,13 @@ CPU float drift therefore cannot select a different side of the crown boundary.
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from decimal import Decimal
 
 from vidaio.tokenomics.config import TokenomicsConfig
 from vidaio.tokenomics.state import (
+    MAX_PODIUM_PLACES,
     CompetitionResult,
     CompetitionRules,
     ContenderResult,
@@ -21,7 +23,58 @@ from vidaio.tokenomics.state import (
     RewardWindowState,
 )
 
-PODIUM_SPLIT = (0.70, 0.20, 0.10)
+#: The pre-v3 fixed split (three places, 70/20/10). Kept for windows folded before
+#: schema v18, which carry no payout policy of their own.
+LEGACY_PODIUM_SPLIT = (0.70, 0.20, 0.10)
+PODIUM_SPLIT = LEGACY_PODIUM_SPLIT
+
+
+@dataclass(frozen=True)
+class PayoutPolicy:
+    """The payout policy in force for one window: per-competition rules override the
+    protocol defaults field by field, and the result is what the window carries."""
+
+    competition_share: float
+    split: tuple[float, ...]
+    redistribute_empty_places: bool
+    no_qualifier_closes_window: bool
+
+
+def effective_payout_policy(
+    config: TokenomicsConfig, rules: CompetitionRules | None, kind: EmissionState
+) -> PayoutPolicy:
+    crown = kind is EmissionState.CROWN
+    share = config.crown_competition_share if crown else config.podium_competition_share
+    split = tuple(config.crown_split if crown else config.podium_split)
+    redistribute = config.redistribute_empty_places
+    closes = config.no_qualifier_closes_window
+    if rules is not None:
+        override_share = rules.crown_competition_share if crown else rules.podium_competition_share
+        if override_share is not None:
+            share = float(override_share)
+        override_split = rules.crown_split if crown else rules.podium_split
+        if override_split is not None:
+            split = tuple(override_split)
+        if rules.redistribute_empty_places is not None:
+            redistribute = rules.redistribute_empty_places
+        if rules.no_qualifier_closes_window is not None:
+            closes = rules.no_qualifier_closes_window
+    return PayoutPolicy(
+        competition_share=share, split=split[:MAX_PODIUM_PLACES],
+        redistribute_empty_places=redistribute, no_qualifier_closes_window=closes,
+    )
+
+
+def place_shares(split: tuple[float, ...], filled: int, redistribute: bool) -> tuple[float, ...]:
+    """Fractions of the competition pot for ``filled`` paid places (Decimal-exact)."""
+    if filled <= 0:
+        return ()
+    head = [Decimal(str(x)) for x in split[:filled]]
+    if redistribute:
+        total = sum(head)
+        if total > 0:
+            head = [x / total for x in head]
+    return tuple(float(x) for x in head)
 
 
 def contender_margin(
@@ -135,6 +188,32 @@ def qualifies_for_podium(
     return True
 
 
+def decision_baseline(result: CompetitionResult) -> float | None:
+    """The baseline score the crown/podium rules compare against.
+
+    A competition anchored without an executable baseline is decided exactly like a
+    baseline measured at zero: the relative margins cannot discriminate and only the
+    anchored absolute bars (``crown_min_score`` / ``podium_min_score``) decide.
+    """
+    return 0.0 if not result.has_baseline else result.baseline_score
+
+
+def result_kind(
+    config: TokenomicsConfig, result: CompetitionResult
+) -> EmissionState | None:
+    """CROWN or PODIUM for a result that opens a window, else None (same rules as
+    :func:`resolve_reward_window`, without the cycle/prior bookkeeping)."""
+    baseline = decision_baseline(result)
+    best = winner(result)
+    if baseline is None or baseline < 0.0 or best is None:
+        return None
+    if baseline == 0.0 and not zero_baseline_payable(result.rules):
+        return None
+    if qualifies_for_crown(config, baseline, best.score, result.rules):
+        return EmissionState.CROWN
+    return EmissionState.PODIUM
+
+
 def podium_contenders(result: CompetitionResult) -> tuple[ContenderResult, ...]:
     """Ranked contenders that meet the competition's anchored podium conditions.
 
@@ -145,7 +224,7 @@ def podium_contenders(result: CompetitionResult) -> tuple[ContenderResult, ...]:
     return tuple(
         contender
         for contender in result.contenders
-        if qualifies_for_podium(result.rules, result.baseline_score, contender.score)
+        if qualifies_for_podium(result.rules, decision_baseline(result), contender.score)
     )
 
 
@@ -175,30 +254,39 @@ def resolve_reward_window(
     ):
         return prior
     best = winner(result)
-    if result.baseline_score is None or result.baseline_score < 0.0 or best is None:
+    baseline = decision_baseline(result)
+    if baseline is None or baseline < 0.0:
         return prior
-    if result.baseline_score == 0.0 and not zero_baseline_payable(result.rules):
+    if best is None:
+        # Nobody met the anchored podium conditions. Tokenomics v3: the result
+        # CLOSES the running window (the subnet burns until the next result);
+        # the pre-v3 behaviour left the previous window untouched.
+        closes = effective_payout_policy(
+            config, result.rules, EmissionState.PODIUM
+        ).no_qualifier_closes_window
+        return RewardWindowState() if closes else prior
+    if baseline == 0.0 and not zero_baseline_payable(result.rules):
         return prior
     if prior.starts_at is not None and result.applied_at < prior.starts_at:
         raise ValueError("a newer competition cycle cannot regress applied_at")
 
-    margin = contender_margin(result.baseline_score, best.score)
+    margin = contender_margin(baseline, best.score)
     if margin is None:  # fail-closed defensive seam
         return prior
     kind = (
         EmissionState.CROWN
-        if qualifies_for_crown(
-            config, result.baseline_score, best.score, result.rules
-        )
+        if qualifies_for_crown(config, baseline, best.score, result.rules)
         else EmissionState.PODIUM
     )
+    policy = effective_payout_policy(config, result.rules, kind)
+    paid = tuple(c.hotkey for c in podium_contenders(result)[: len(policy.split)])
     return RewardWindowState(
         kind=kind,
         starts_at=result.applied_at,
         ends_at=result.applied_at + timedelta(hours=config.result_window_hours),
-        podium_hotkeys=tuple(
-            c.hotkey for c in podium_contenders(result)[: len(PODIUM_SPLIT)]
-        ),
+        podium_hotkeys=paid,
+        competition_share=policy.competition_share,
+        place_shares=place_shares(policy.split, len(paid), policy.redistribute_empty_places),
         winner_hotkey=best.hotkey,
         winner_uid=best.uid,
         winner_score=best.score,
@@ -210,6 +298,62 @@ def resolve_reward_window(
         source_track=result.track,
         source_cycle=result.cycle,
         last_applied_cycle=result.cycle,
+    )
+
+
+def is_legacy_window(state: RewardWindowState) -> bool:
+    """A CROWN/PODIUM window folded before schema v18: it carries no payout policy.
+
+    Such a window names at most the three legacy podium hotkeys and no per-place
+    shares, so it cannot express the policy the tokenomics-v3 protocol promises for it.
+    """
+    return (
+        state.kind in (EmissionState.CROWN, EmissionState.PODIUM)
+        and state.competition_share is None
+        and not state.place_shares
+    )
+
+
+def upgrade_legacy_window(
+    config: TokenomicsConfig,
+    state: RewardWindowState,
+    source: CompetitionResult,
+) -> RewardWindowState:
+    """Re-resolve a legacy window's paid places and policy from its source result.
+
+    The first schema-v18 fold of a still-active legacy window replaces its three
+    legacy podium hotkeys with the places the v3 payout policy assigns from the SAME
+    committed result, and records that policy. Everything else stays: the kind (a
+    CROWN stays a CROWN), the chain-time interval, the winner and the provenance.
+    ``source`` is the ``competition_result`` committed in the epoch log that applied
+    the window; any mismatch with the window's provenance is refused, never guessed.
+    A window that is not legacy is returned unchanged, so the upgrade happens once.
+    """
+    if not is_legacy_window(state):
+        return state
+    if (
+        source.competition_id != state.source_competition_id
+        or source.cycle != state.source_cycle
+        or source.track != state.source_track
+        or source.applied_at != state.starts_at
+    ):
+        raise ValueError(
+            "legacy reward window source result does not match the window provenance "
+            f"({source.competition_id!r}, cycle {source.cycle}) vs "
+            f"({state.source_competition_id!r}, cycle {state.source_cycle})"
+        )
+    best = winner(source)
+    if best is None or best.hotkey != state.winner_hotkey or best.uid != state.winner_uid:
+        raise ValueError(
+            "legacy reward window winner differs from the winner of its source result"
+        )
+    policy = effective_payout_policy(config, source.rules, state.kind)
+    paid = tuple(c.hotkey for c in podium_contenders(source)[: len(policy.split)])
+    return replace(
+        state,
+        podium_hotkeys=paid,
+        competition_share=policy.competition_share,
+        place_shares=place_shares(policy.split, len(paid), policy.redistribute_empty_places),
     )
 
 
@@ -237,17 +381,33 @@ def emission_shares(
         if config.competition_emissions_enabled
         else EmissionState.IDLE
     )
-    if active is EmissionState.CROWN:
-        return EmissionShares(
-            config.crown_inference_share, config.crown_competition_share, 0.0
+    if active in (EmissionState.CROWN, EmissionState.PODIUM):
+        crown = active is EmissionState.CROWN
+        competition = (
+            config.crown_competition_share if crown else config.podium_competition_share
         )
-    if active is EmissionState.PODIUM:
-        return EmissionShares(
-            config.podium_inference_share, config.podium_competition_share, 0.0
-        )
+        if state.competition_share is not None:
+            competition = float(state.competition_share)
+        inference = config.crown_inference_share if crown else config.podium_inference_share
+        inference = min(inference, max(0.0, 1.0 - competition))
+        burn = float(Decimal(1) - Decimal(str(inference)) - Decimal(str(competition)))
+        return EmissionShares(inference, competition, max(0.0, burn))
     return EmissionShares(config.idle_inference_share, 0.0, config.idle_burn_share)
 
 
-def podium_hotkey_shares(state: RewardWindowState) -> dict[str, float]:
-    """Payable fractions; absent ranks deliberately remain unallocated."""
-    return {hotkey: share for hotkey, share in zip(state.podium_hotkeys, PODIUM_SPLIT)}
+def podium_hotkey_shares(
+    state: RewardWindowState, config: TokenomicsConfig | None = None
+) -> dict[str, float]:
+    """Payable fractions of the competition pot per hotkey.
+
+    A window folded under tokenomics v3 carries its own ``place_shares``. An older
+    window (no policy) is paid with the live protocol defaults, redistributed over
+    its places, or with the legacy 70/20/10 split when no config is given.
+    """
+    if state.place_shares:
+        return dict(zip(state.podium_hotkeys, state.place_shares))
+    if config is None:
+        return {h: s for h, s in zip(state.podium_hotkeys, LEGACY_PODIUM_SPLIT)}
+    policy = effective_payout_policy(config, None, state.kind)
+    shares = place_shares(policy.split, len(state.podium_hotkeys), policy.redistribute_empty_places)
+    return dict(zip(state.podium_hotkeys, shares))

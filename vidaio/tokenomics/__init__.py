@@ -1,15 +1,23 @@
 """Pure schema-v15 scoring accumulation and emission composition."""
 
 from vidaio.tokenomics.breakthrough import (
+    LEGACY_PODIUM_SPLIT,
     PODIUM_SPLIT,
+    PayoutPolicy,
+    effective_payout_policy,
+    place_shares,
     active_emission_state,
     contender_margin,
     emission_shares,
     podium_hotkey_shares,
     qualifies_for_crown,
+    decision_baseline,
     podium_contenders,
+    result_kind,
     qualifies_for_podium,
+    is_legacy_window,
     resolve_reward_window,
+    upgrade_legacy_window,
     window_active,
     winner,
 )
@@ -30,11 +38,14 @@ from vidaio.tokenomics.state import (
     EmissionState,
     MinerSnapshot,
     RewardWindowState,
+    MAX_PODIUM_PLACES,
 )
 from vidaio.tokenomics.weights import (
     build_weight_vector,
     ensure_alpha_stake_factor_disabled,
     ensure_locked_levers,
+    emission_profile,
+    EMISSION_PROFILES,
 )
 
 __all__ = [
@@ -57,17 +68,28 @@ __all__ = [
     "dedup_ip_key",
     "track_shares",
     "inference_shares",
+    "LEGACY_PODIUM_SPLIT",
     "PODIUM_SPLIT",
+    "PayoutPolicy",
+    "effective_payout_policy",
+    "place_shares",
+    "MAX_PODIUM_PLACES",
     "contender_margin",
     "qualifies_for_crown",
+    "decision_baseline",
     "podium_contenders",
+    "result_kind",
     "qualifies_for_podium",
     "winner",
+    "is_legacy_window",
     "resolve_reward_window",
+    "upgrade_legacy_window",
     "window_active",
     "active_emission_state",
     "emission_shares",
     "podium_hotkey_shares",
     "build_weight_vector",
     "ensure_locked_levers",
+    "emission_profile",
+    "EMISSION_PROFILES",
 ]

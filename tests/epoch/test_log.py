@@ -580,19 +580,19 @@ def test_from_json_refuses_burn_uid_seated_as_evidence_identity() -> None:
 
 def test_foreign_epoch_log_schema_is_refused() -> None:
     """an internal review: `schema_version` is ENFORCED. Current-shape bytes LABELLED a FOREIGN
-    schema (14, 15, 16, or 18) is refused (EpochLogInvalid), so validators on a different code version
-    cannot converge on a foreign-schema log; only the code's own EPOCH_LOG_SCHEMA_VERSION (17)
+    schema (14, 15, 16, or 17) is refused (EpochLogInvalid), so validators on a different code version
+    cannot converge on a foreign-schema log; only the code's own EPOCH_LOG_SCHEMA_VERSION (18)
     is accepted."""
     import json
 
     valid = json.loads(_valid_log().to_json())
-    assert valid["schema_version"] == EPOCH_LOG_SCHEMA_VERSION == 17
-    for bad in (14, 15, 16, 18):
+    assert valid["schema_version"] == EPOCH_LOG_SCHEMA_VERSION == 18
+    for bad in (14, 15, 16, 17):
         data = dict(valid, schema_version=bad)
         with pytest.raises(EpochLogInvalid, match="schema_version"):
             EpochLog.from_json(json.dumps(data).encode())
-    # the exact code schema (17) still parses cleanly
-    assert EpochLog.from_json(json.dumps(valid).encode()).schema_version == 17
+    # the exact code schema (18) still parses cleanly
+    assert EpochLog.from_json(json.dumps(valid).encode()).schema_version == 18
 
 
 def _v14_competition_input() -> CompetitionInput:

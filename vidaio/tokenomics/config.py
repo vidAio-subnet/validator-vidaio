@@ -24,12 +24,24 @@ class TokenomicsConfig(BaseModel):
     # Inference eligibility only; never scales a score or a competition award.
     payout_min_alpha_stake: float = 0.0
 
-    idle_inference_share: float = 0.80
-    idle_burn_share: float = 0.20
-    podium_inference_share: float = 0.60
-    podium_competition_share: float = 0.40
-    crown_inference_share: float = 0.10
-    crown_competition_share: float = 0.90
+    # Tokenomics v3 (2026-09-23): inference no longer earns; a competition result
+    # pays 100 % of miner emissions to its top places until the next result, and
+    # an idle subnet burns. Each competition may override the payout policy in its
+    # anchored result rules; these are the protocol defaults.
+    idle_inference_share: float = 0.0
+    idle_burn_share: float = 1.0
+    podium_inference_share: float = 0.0
+    podium_competition_share: float = 1.0
+    crown_inference_share: float = 0.0
+    crown_competition_share: float = 1.0
+    #: Per-rank fractions of the competition pot (1 to 5 places, each summing to 1).
+    crown_split: tuple[float, ...] = (0.90, 0.04, 0.03, 0.02, 0.01)
+    podium_split: tuple[float, ...] = (0.50, 0.24, 0.13, 0.08, 0.05)
+    #: Shares of unfilled places go to the filled ones in proportion (else: sink).
+    redistribute_empty_places: bool = True
+    #: A result with no qualifying contender closes the running window (burn until
+    #: the next result) instead of leaving the previous window untouched.
+    no_qualifier_closes_window: bool = True
     breakthrough_margin_floor: float = 0.05
     result_window_hours: float = 168.0
 
@@ -81,18 +93,20 @@ class TokenomicsConfig(BaseModel):
         ):
             if left + right != 1.0:
                 raise ValueError(f"{state} allocation shares must sum exactly to 1.0")
-        if (
-            not 0.0
-            < self.crown_inference_share
-            < self.podium_inference_share
-            < self.idle_inference_share
-            < 1.0
+        if not (
+            self.crown_inference_share
+            <= self.podium_inference_share
+            <= self.idle_inference_share
         ):
             raise ValueError(
-                "inference shares must satisfy 0 < CROWN < PODIUM < IDLE < 1"
+                "inference shares must satisfy CROWN <= PODIUM <= IDLE"
             )
-        if not 0.0 < self.podium_competition_share < self.crown_competition_share < 1.0:
-            raise ValueError("competition shares must satisfy 0 < PODIUM < CROWN < 1")
+        if not 0.0 < self.podium_competition_share <= self.crown_competition_share <= 1.0:
+            raise ValueError("competition shares must satisfy 0 < PODIUM <= CROWN <= 1")
+        from vidaio.tokenomics.state import _validate_split
+
+        object.__setattr__(self, "crown_split", _validate_split("crown_split", tuple(self.crown_split)))
+        object.__setattr__(self, "podium_split", _validate_split("podium_split", tuple(self.podium_split)))
         if (
             not math.isfinite(self.breakthrough_margin_floor)
             or not 0.0 < self.breakthrough_margin_floor < 1.0

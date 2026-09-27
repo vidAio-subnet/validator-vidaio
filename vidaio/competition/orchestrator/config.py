@@ -50,6 +50,11 @@ class OrchestratorConfig(BaseModel):
     #: budget is exhausted; beyond it the pipeline HALTS (never fails) with a
     #: CRITICAL log and an `orchestrator_halted` event.
     max_batch_requeues: int = Field(default=3, ge=0)
+    #: Evaluation batches run concurrently up to this many at a time. Managed GPU
+    #: backends give every sandbox its own GPU, so >1 only shortens the evaluation;
+    #: keep 1 on a self-hosted GPU host (remote_docker) so contenders never share a
+    #: device. Process configuration, never anchored: it may change mid-competition.
+    evaluation_parallel_batches: int = Field(default=1, ge=1, le=32)
 
     # ---- contender execution / repository composition -------------------------
     #: The model default remains dependency-free for unit tests and report-mode
@@ -57,7 +62,27 @@ class OrchestratorConfig(BaseModel):
     #: report overlays explicitly select ``docker``.  Production startup refuses
     #: Docker, and Modal startup refuses report mode, so neither path can silently
     #: drift onto the other execution boundary.
-    sandbox_backend: Literal["docker", "modal"] = "docker"
+    sandbox_backend: Literal["docker", "modal", "remote_docker"] = "docker"
+
+    #: Fallback GPU sandbox: an operator-owned GPU host whose Docker daemon is reached
+    #: through an SSH forward (runners/remote_docker_runner.py).  Selecting it on a
+    #: running competition makes the orchestrator rebuild every built contender on
+    #: that host and rerun the whole evaluation matrix there (docs/COMPETITIONS.md).
+    remote_docker_ssh_target: str = ""
+    remote_docker_ssh_key_path: str = ""
+    remote_docker_known_hosts_path: str = ""
+    remote_docker_tunnel_port: int = Field(default=23750, ge=1024, le=65535)
+    #: ``docker run --gpus`` value (``all`` or ``device=0``...).
+    remote_docker_gpus: str = "all"
+    #: The GPU model the host must report (``L40S``, ``A100``...); it must also be
+    #: committed in the manifest's ``allowed_gpus``.
+    remote_docker_expected_gpu: str = ""
+    #: Trusted, digest-pinned image used only to fill/drain sandbox volumes.
+    remote_docker_helper_image: str = (
+        "python:3.13-slim-bookworm@sha256:"
+        "00faa2debb87529f9f0764e9491d8ba400a3678976616c3bd7cb193745ac20d1"
+    )
+    remote_docker_volume_poll_seconds: float = Field(default=5.0, ge=1.0)
 
     #: Create-only Modal identity.  All four values stay empty in the schema so
     #: merely importing/constructing config can never contact a remote GPU.  A

@@ -1268,7 +1268,7 @@ def test_bittensor_adapter_config_rejects_invalid_startup_values(kwargs, match):
 
 def test_bittensor_adapter_default_version_fences_current_schema():
     config = BittensorAdapterConfig(validator_hotkey="hk")
-    assert config.version_key == 17
+    assert config.version_key == 18
     assert config.weight_readback_attempts == 5
     assert config.weight_readback_delay_seconds == 12.0
 

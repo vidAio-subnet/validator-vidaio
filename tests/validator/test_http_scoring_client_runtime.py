@@ -73,6 +73,8 @@ def _attestation() -> dict:
             "piq": "piq/0.8.0",
             "opencv": "opencv/4.12.0.88",
             "numpy": "numpy/2.2.6",
+            "removal_metrics": "removal-metrics/1",
+            "lpips": "lpips/0.1.4",
             "python": "cpython/3.13.15",
         },
     }

@@ -14,7 +14,7 @@ def test_defaults():
     assert config.chain_timeout_seconds == 180.0
     assert config.chain_retry_attempts == 3
     assert config.chain_retry_base_delay_seconds == 1.0
-    assert config.version_key == 17
+    assert config.version_key == 18
     assert config.metrics_port == 9102
     assert config.publication_enabled is True
     assert config.max_last_success_age_seconds == 2 * 72 * 60

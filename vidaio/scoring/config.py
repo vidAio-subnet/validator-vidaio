@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field, model_validator
 
 TRACK_COMPRESSION = "compression"
 TRACK_UPSCALING = "upscaling"
+TRACK_REMOVAL = "removal"
 
 #: Tolerance for weight-sum checks — weights that must partition 1.0 may carry float
 #: representation error (0.3 + 0.3 + 0.4 == 0.9999999999999999), nothing more.
@@ -81,6 +82,22 @@ class AggregateWeights(BaseModel):
         return self
 
 
+class RemovalWeights(BaseModel):
+    """Weights of the two scored terms of the object-removal formula (0.6 / 0.4)."""
+
+    psnr: float = 0.6
+    lpips: float = 0.4
+
+    @model_validator(mode="after")
+    def _finite(self) -> "RemovalWeights":
+        _require_unit_interval("removal_weights.psnr", self.psnr)
+        _require_unit_interval("removal_weights.lpips", self.lpips)
+        total = self.psnr + self.lpips
+        if abs(total - 1.0) > _WEIGHT_SUM_TOLERANCE:
+            raise ValueError(f"removal_weights must sum to 1.0, got {total!r}")
+        return self
+
+
 class ScoringConfig(BaseModel):
     # --- gates -------------------------------------------------------------
     #: Upscaling VMAF pass/fail gate on the vmaf/100 scale (< 0.5 -> score 0).
@@ -111,6 +128,29 @@ class ScoringConfig(BaseModel):
     #: behaviour; the miner cannot measure it and must keep a blind margin above the
     #: floor). The pristine-basis number is always published as metrics.vmaf_pristine.
     compression_vmaf_basis: Literal["pristine", "miner_input"] = "miner_input"
+    # --- object-removal track (vidaio/scoring/removal.py) ---------------------------
+    removal_weights: RemovalWeights = Field(default_factory=RemovalWeights)
+    #: a miner must beat the validator's free temporal-median fill by this many dB
+    #: of in-mask PSNR (and have a lower LPIPS) or the item is zeroed
+    removal_psnr_margin_db: float = 1.5
+    #: dB of PSNR above the free-fill floor that maps to s_psnr = 1
+    removal_psnr_span_db: float = 8.0
+    #: in-mask warp error may not exceed this multiple of the reference's own warp
+    #: error (temporal consistency is a cap, never a reward)
+    removal_warp_cap_factor: float = 5.0
+    #: floor for the reference warp error used by the cap (8-bit mean abs units), so a
+    #: perfectly static reference does not make the cap zero
+    removal_warp_floor: float = 0.5
+    #: outside the mask the output must equal the served input: max per-frame mean abs
+    #: RGB difference (8-bit units) tolerated, else OUTSIDE_REGION_MODIFIED
+    removal_outside_tolerance: float = 3.0
+    #: LPIPS is evaluated on every k-th masked frame (cost control; SSIM/PSNR on all)
+    removal_lpips_stride: int = 4
+    #: LPIPS-VGG is evaluated on the mask's bounding box (padded 32 px); a box whose long
+    #: side exceeds this is downscaled (INTER_AREA, both sides identically) before the net.
+    #: Bounds the per-candidate cost at 1080p+ and keeps the input at the scale LPIPS was
+    #: calibrated on; 0 disables the bound.
+    removal_lpips_max_side: int = 256
     #: Width (in VMAF points) of the sub-threshold band the compression spec calls out
     #: (``vmaf < threshold - 5 -> 0``). See vidaio/scoring/compression.py for the
     #: documented reading of scores inside the band.
@@ -151,9 +191,32 @@ class ScoringConfig(BaseModel):
             "upscale_exponent": self.upscale_exponent,
             "upscale_coefficient": self.upscale_coefficient,
             "worst_decile_fraction": self.worst_decile_fraction,
+            "removal_psnr_margin_db": self.removal_psnr_margin_db,
+            "removal_psnr_span_db": self.removal_psnr_span_db,
+            "removal_warp_cap_factor": self.removal_warp_cap_factor,
+            "removal_warp_floor": self.removal_warp_floor,
+            "removal_outside_tolerance": self.removal_outside_tolerance,
         }
         for name, value in scalars.items():
             _require_finite_config(name, value)
+        # object removal: a zero span would divide by zero in every score, and a
+        # negative margin/cap/floor/tolerance would invert the zero rules
+        for name, value, strictly in (
+            ("removal_psnr_span_db", self.removal_psnr_span_db, True),
+            ("removal_warp_cap_factor", self.removal_warp_cap_factor, True),
+            ("removal_psnr_margin_db", self.removal_psnr_margin_db, False),
+            ("removal_warp_floor", self.removal_warp_floor, False),
+            ("removal_outside_tolerance", self.removal_outside_tolerance, False),
+        ):
+            if value < 0.0 or (strictly and value == 0.0):
+                bound = "> 0" if strictly else ">= 0"
+                raise ValueError(f"{name} must be {bound}, got {value!r}")
+        if self.removal_lpips_stride < 1:
+            raise ValueError(f"removal_lpips_stride must be >= 1, got {self.removal_lpips_stride!r}")
+        if self.removal_lpips_max_side < 0:
+            raise ValueError(
+                f"removal_lpips_max_side must be >= 0, got {self.removal_lpips_max_side!r}"
+            )
         for factor, cap in self.file_size_caps.items():
             _require_finite_config(f"file_size_caps[{factor}]", cap)
             if cap <= 0.0:

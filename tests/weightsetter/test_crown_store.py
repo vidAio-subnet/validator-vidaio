@@ -43,6 +43,8 @@ def test_pristine_store_has_idle_window_and_no_result(conn):
         "starts_at": None,
         "ends_at": None,
         "podium_hotkeys_json": "[]",
+        "competition_share": None,
+        "place_shares_json": "[]",
         "winner_hotkey": None,
         "winner_uid": None,
         "winner_score": None,

@@ -20,6 +20,7 @@ import httpx
 from pydantic import ValidationError
 
 from vidaio.competition import repository as repo
+from vidaio.competition.item_commitment import REMOVAL_MASK_STREAM_INDEX
 from vidaio.competition.interfaces import BatchItem, BatchOutput, ScorePacket
 from vidaio.scoring.result import ItemScore
 from vidaio.services.protocol import (
@@ -260,6 +261,9 @@ class HttpScoringClient:
                 "target_width": int(item_row["target_width"]),
                 "target_height": int(item_row["target_height"]),
             }
+        elif manifest.track == "removal":
+            # The mask stream index is fixed by the item commitment preimage.
+            params = {"mask_stream_index": REMOVAL_MASK_STREAM_INDEX}
         else:
             params = {"vmaf_threshold": manifest.vmaf_threshold}
         request = ScoreRequest(

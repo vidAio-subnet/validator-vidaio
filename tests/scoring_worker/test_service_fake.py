@@ -270,6 +270,147 @@ async def test_compression_vmaf_basis_config_selects_scored_reference(world: Fak
     assert item.metrics["vmaf_model_delta_primary"] == 92.0
 
 
+class FakeRemovalBackend:
+    """Deterministic removal measurement keyed on the candidate role (no media)."""
+
+    def __init__(
+        self,
+        *,
+        psnr: float = 33.3,
+        lpips: float = 0.07,
+        outside: float = 0.2,
+        fail: str | None = None,
+        input_fail: str | None = None,
+    ) -> None:
+        self.psnr, self.lpips, self.outside, self.fail, self.input_fail = psnr, lpips, outside, fail, input_fail
+        self.calls: list[dict] = []
+
+    def version(self) -> str:
+        return "fake-removal/1"
+
+    def measure(self, **kwargs):
+        from vidaio.scoring.removal import RegionMetrics
+        from vidaio.scoring_worker.removal_backend import (
+            RemovalInputError,
+            RemovalMeasurement,
+            RemovalMeasurementError,
+        )
+
+        self.calls.append(kwargs)
+        if self.input_fail:
+            raise RemovalInputError(self.input_fail)
+        if self.fail:
+            raise RemovalMeasurementError(self.fail)
+        return RemovalMeasurement(
+            metrics=RegionMetrics(psnr_db=self.psnr, ssim=0.87, lpips_vgg=self.lpips, warp_error=0.83, masked_pixels=1000),
+            floor=RegionMetrics(psnr_db=29.1, ssim=0.78, lpips_vgg=0.25, warp_error=0.46, masked_pixels=1000),
+            warp_error_reference=0.59,
+            outside_change=self.outside,
+            mask_frames=60,
+            mask_fraction=0.038,
+            lpips_offset=int(kwargs.get("lpips_offset", 0)),
+        )
+
+
+def _removal_body(world: FakeWorld) -> dict:
+    return score_request_body(
+        track="removal",
+        reference=world.reference,
+        reference_digest=world.reference_digest,
+        output=world.output,
+        output_digest=world.output_digest,
+        miner_input=world.reference,  # removal input has the reference geometry
+        miner_input_digest=world.reference_digest,
+        params={"mask_stream_index": 1, "target_width": 640, "target_height": 360},
+    )
+
+
+def _removal_backends(world: FakeWorld, removal) -> ScoringBackends:
+    return ScoringBackends(
+        probe=world.fake, vmaf_primary=world.fake, vmaf_secondary=world.fake, pieapp=world.fake.pieapp,
+        perceptual=world.fake, canonicalizer=None, versions=world.fake.versions(), removal=removal,
+    )
+
+
+async def test_removal_track_scores_region_metrics_without_vmaf(world: FakeWorld) -> None:
+    removal = FakeRemovalBackend()
+    async with _client(world, backends=_removal_backends(world, removal)) as client:
+        resp = await client.post("/score", json=_removal_body(world))
+    assert resp.status_code == 200, resp.text
+    item = ItemScore.from_json(resp.json()["item_score_json"])
+    assert item.gate_passed, item.violations
+    assert item.breakdown is not None and item.breakdown.kind == "removal"
+    assert item.breakdown.zero_reason is None
+    assert item.score == pytest.approx(item.breakdown.final) and item.score > 0.5
+    assert item.metrics["region_psnr_db"] == 33.3 and item.metrics["region_floor_psnr_db"] == 29.1
+    assert item.metrics["vmaf"] is None  # no VMAF run on this track
+    assert not any(role == ("reference", "output") for role in world.fake.vmaf_calls)
+    assert removal.calls and removal.calls[0]["mask_stream_index"] == 1
+    # the LPIPS sampling phase is derived from the held-out reference digest (not
+    # miner-predictable), handed to the backend and published in the packet
+    assert 0 <= removal.calls[0]["lpips_offset"] < ScoringConfig().removal_lpips_stride
+    assert item.metrics["lpips_offset"] == removal.calls[0]["lpips_offset"]
+    assert removal.calls[0]["cancelled"] is None or callable(removal.calls[0]["cancelled"])
+    # the two zero-rule decision facts travel with the packet for audit hysteresis
+    assert item.metrics["region_psnr_margin_db"] == pytest.approx(33.3 - 29.1)
+    assert item.metrics["region_warp_cap"] == pytest.approx(5.0 * 0.59)
+
+
+async def test_removal_outside_mask_change_is_zeroed(world: FakeWorld) -> None:
+    async with _client(world, backends=_removal_backends(world, FakeRemovalBackend(outside=3.5))) as client:
+        resp = await client.post("/score", json=_removal_body(world))
+    item = ItemScore.from_json(resp.json()["item_score_json"])
+    assert not item.gate_passed and item.score == 0.0
+    assert any(v.code is ReasonCode.OUTSIDE_REGION_MODIFIED for v in item.violations)
+
+
+async def test_removal_free_fill_not_beaten_is_a_measured_zero(world: FakeWorld) -> None:
+    async with _client(world, backends=_removal_backends(world, FakeRemovalBackend(psnr=29.5, lpips=0.3))) as client:
+        resp = await client.post("/score", json=_removal_body(world))
+    item = ItemScore.from_json(resp.json()["item_score_json"])
+    assert item.gate_passed  # gates pass; the composition zeroes it
+    assert item.score == 0.0 and item.breakdown.zero_reason == "REGION_BASELINE_NOT_BEATEN"
+
+
+async def test_removal_validator_side_faults_are_refused_not_zeroed(world: FakeWorld) -> None:
+    """A missing/unreadable mask stream, reference or served input is the VALIDATOR's
+    problem: the worker refuses with a typed 422 (the authority skips the item) instead
+    of handing the miner a measured zero."""
+    async with _client(world, backends=_removal_backends(world, FakeRemovalBackend(input_fail="no video stream 1"))) as client:
+        resp = await client.post("/score", json=_removal_body(world))
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"]["error"] == "removal_input_unmeasurable"
+    async with _client(world, backends=_removal_backends(world, None)) as client:
+        resp = await client.post("/score", json=_removal_body(world))
+    assert resp.status_code == 501
+
+
+async def test_removal_candidate_side_faults_are_violations(world: FakeWorld) -> None:
+    """An unreadable candidate is the miner's fault: a violation, a zero, never a 500."""
+    async with _client(world, backends=_removal_backends(world, FakeRemovalBackend(fail="candidate unreadable"))) as client:
+        resp = await client.post("/score", json=_removal_body(world))
+    assert resp.status_code == 200, resp.text
+    item = ItemScore.from_json(resp.json()["item_score_json"])
+    assert not item.gate_passed and any(v.code is ReasonCode.METRIC_MISSING for v in item.violations)
+    assert item.score == 0.0
+
+
+async def test_removal_wrong_geometry_candidate_is_zeroed_without_measuring(world: FakeWorld) -> None:
+    """A candidate whose geometry differs from the reference must be zeroed by the
+    stream check and never reach the region metrics (where it would raise and turn
+    into a non-punitive 500 — a way to dodge a zero)."""
+    removal = FakeRemovalBackend()
+    world.fake.set_media("output", _media(1_000, width=320, height=180))
+    async with _client(world, backends=_removal_backends(world, removal)) as client:
+        resp = await client.post("/score", json=_removal_body(world))
+    assert resp.status_code == 200, resp.text
+    item = ItemScore.from_json(resp.json()["item_score_json"])
+    assert not item.gate_passed
+    assert any(v.code is ReasonCode.STREAM_DIMENSIONS_MISMATCH for v in item.violations)
+    assert removal.calls == []
+    assert item.score == 0.0
+
+
 async def test_fake_upscaling_full_round_with_derived_start_frame(
     world: FakeWorld,
 ) -> None:

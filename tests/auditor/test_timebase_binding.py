@@ -23,7 +23,7 @@ from vidaio.auditor import (
     ItemVerdictKind,
     SamplePolicy,
 )
-from vidaio.tokenomics import TokenomicsConfig
+from vidaio.tokenomics import EMISSION_PROFILES, TokenomicsConfig
 from tests.auditor.fakes import FakeChronologyAuditor as Auditor
 
 from tests.auditor.fakes import (
@@ -37,7 +37,7 @@ from tests.auditor.fakes import (
     rebuild_log,
 )
 
-CFG = TokenomicsConfig()
+CFG = TokenomicsConfig(**EMISSION_PROFILES["v2"])  # these suites run on the v2 profile
 NO_SAMPLE = SamplePolicy(sample_rate=0.0, min_samples=0)
 
 

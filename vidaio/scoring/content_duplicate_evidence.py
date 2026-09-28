@@ -391,12 +391,12 @@ def validate_member_packet(member: ContentMember, packet: Any, context: ContentR
 
 def mint_content_duplicate_packet(*, witness: ContentDuplicateWitness, config: Any) -> Any:
     from vidaio.scoring.gates import ReasonCode, ValidityViolation
-    from vidaio.scoring.result import compose_item_score, config_digest
+    from vidaio.scoring.result import accepted_config_digests, compose_item_score
 
     # Apply the same bound used by readers before emitting a stored verdict.
     witness = parse_content_witness(witness.to_json())
     context = witness.round_evidence
-    if config_digest(config) != context.scoring_config_digest:
+    if context.scoring_config_digest not in accepted_config_digests(config):
         raise InvalidContentEvidence("content round config differs from active scoring config")
     member = next(member for member in context.roster if member.uid == witness.loser_uid)
     return compose_item_score(
@@ -405,7 +405,8 @@ def mint_content_duplicate_packet(*, witness: ContentDuplicateWitness, config: A
         gate_passed=False, violations=[ValidityViolation(code=ReasonCode.DUPLICATE_CONTENT,
             detail=f"auditable same-content component; anchor-salted winner uid {witness.winner_uid}")],
         breakdown=None, config=config, metrics={CONTENT_WITNESS_METRIC: witness.to_json()},
-        backend_versions={}, scorer_version=content_duplicate_identity_v1(
+        backend_versions={}, scoring_config_digest=context.scoring_config_digest,
+        scorer_version=content_duplicate_identity_v1(
             committed_scorer_version=context.committed_scorer_version, track=context.track,
             scoring_config_digest=context.scoring_config_digest),
     )
@@ -413,11 +414,11 @@ def mint_content_duplicate_packet(*, witness: ContentDuplicateWitness, config: A
 
 def mint_content_share_packet(*, witness: ContentShareWitness, config: Any, measured_packet: Any = None) -> Any:
     from vidaio.scoring.gates import ReasonCode, ValidityViolation
-    from vidaio.scoring.result import compose_item_score, config_digest
+    from vidaio.scoring.result import accepted_config_digests, compose_item_score
 
     witness = _parse_canonical(witness.to_json(), ContentShareWitness)
     context = witness.round_evidence
-    if config_digest(config) != context.scoring_config_digest:
+    if context.scoring_config_digest not in accepted_config_digests(config):
         raise InvalidContentEvidence("content round config differs from active scoring config")
     member = next(member for member in context.roster if member.uid == witness.member_uid)
     identity = content_duplicate_identity(
@@ -427,6 +428,7 @@ def mint_content_share_packet(*, witness: ContentShareWitness, config: Any, meas
         item_id=member.receipt.metadata.task_id, challenge_id=context.challenge_id, track=context.track,
         miner_hotkey=member.hotkey, content_digest=member.output.digest, config=config,
         scorer_version=identity, shared_score=witness.share,
+        scoring_config_digest=context.scoring_config_digest,
     )
     if witness.role == "loser":
         n = len(witness.component_uids)

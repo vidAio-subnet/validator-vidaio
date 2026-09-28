@@ -315,11 +315,11 @@ def violation_detail(context: SourceRoundEvidence, uid: int) -> str:
 
 def mint_source_proximity_packet(*, witness: SourceProximityWitness, config: Any) -> Any:
     from vidaio.scoring.gates import ReasonCode, ValidityViolation
-    from vidaio.scoring.result import compose_item_score, config_digest
+    from vidaio.scoring.result import accepted_config_digests, compose_item_score
 
     witness = parse_source_witness(witness.to_json())
     context = witness.round_evidence
-    if config_digest(config) != context.scoring_config_digest:
+    if context.scoring_config_digest not in accepted_config_digests(config):
         raise InvalidSourceEvidence("source round config differs from active scoring config")
     member = context.member(witness.member_uid)
     vmaf_excess, chroma_excess = context.excess(witness.member_uid)
@@ -330,7 +330,8 @@ def mint_source_proximity_packet(*, witness: SourceProximityWitness, config: Any
             code=ReasonCode.SOURCE_PROXIMITY, detail=violation_detail(context, witness.member_uid),
             measured=chroma_excess, limit=rule_margins(context.rule)[1])],
         breakdown=None, config=config, metrics={SOURCE_WITNESS_METRIC: witness.to_json()},
-        backend_versions={}, scorer_version=source_proximity_identity(
+        backend_versions={}, scoring_config_digest=context.scoring_config_digest,
+        scorer_version=source_proximity_identity(
             committed_scorer_version=context.committed_scorer_version, track=context.track,
             scoring_config_digest=context.scoring_config_digest, rule=context.rule),
     )

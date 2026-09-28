@@ -19,9 +19,12 @@ output and reference):
                     frame i+1 of the candidate onto frame i; mean abs error inside the
                     mask. The reference's own warp error is published as the floor.
 
-Free-fill floor: the validator computes the per-pixel TEMPORAL MEDIAN of the unmasked
-frames (a static-background fill any miner could run for free) and scores it with the
-same metrics. A miner must beat that floor by ``removal_psnr_margin_db`` in PSNR, else
+Floor: the validator computes the per-pixel TEMPORAL MEDIAN of the unmasked frames (a
+static-background fill any miner could run for free) and also measures the served input
+returned UNCHANGED, both with the same metrics; the floor is the better of the two on
+every term (``best_baseline``). On a moving camera the median is often worse than leaving
+the object in place, and doing nothing must never score. A miner must beat that floor by
+``removal_psnr_margin_db`` in PSNR, else
 the item is zeroed (``REGION_BASELINE_NOT_BEATEN``): on footage where the background
 never moves the median reconstructs the reference almost exactly and nothing is worth
 paying for. LPIPS is a soft term only: a fill that does not beat the floor's LPIPS earns
@@ -35,7 +38,7 @@ Score (the audit-recompute record is :class:`RemovalBreakdown`)::
     s_lpips = clamp((lpips_floor - lpips) / lpips_floor, 0, 1)
     final   = w_psnr * s_psnr + w_lpips * s_lpips          (weights 0.6 / 0.4)
 
-It reads as "how much better than the free fill", which is the only thing worth
+It reads as "how much better than the free fill or doing nothing", which is the only thing worth
 rewarding. Warp error is a CAP (``removal_warp_cap_factor`` x the reference's own
 warp error), never a term: a flat fill is perfectly consistent and must not be rewarded
 for it.

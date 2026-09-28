@@ -103,7 +103,7 @@ def _distribution_version(*names: str) -> str:
     return "not-configured"
 
 
-REMOVAL_METRICS_VERSION = "removal-metrics/1"
+REMOVAL_METRICS_VERSION = "removal-metrics/2"
 
 
 def complete_payout_backend_versions(

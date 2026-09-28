@@ -30,6 +30,36 @@ def config_digest(config: ScoringConfig) -> str:
     return hashlib.sha256(config.model_dump_json().encode("utf-8")).hexdigest()
 
 
+#: ScoringConfig fields added with the object-removal track. A release before it
+#: serialized the same config without them, so witness evidence minted by that
+#: release carries the digest of the dump that excludes exactly these fields.
+REMOVAL_CONFIG_FIELDS = frozenset(
+    {
+        "removal_weights",
+        "removal_psnr_margin_db",
+        "removal_psnr_span_db",
+        "removal_warp_cap_factor",
+        "removal_warp_floor",
+        "removal_outside_tolerance",
+        "removal_lpips_stride",
+        "removal_lpips_max_side",
+    }
+)
+
+
+def accepted_config_digests(config: ScoringConfig) -> frozenset[str]:
+    """Config digests under which stored witness evidence is valid for ``config``.
+
+    The current digest, plus the digest the pre-removal release computed for the
+    same settings. Evidence committed before a roll that added config fields is
+    re-verified by the next finalized epoch, so it must stay verifiable.
+    """
+    legacy = hashlib.sha256(
+        config.model_dump_json(exclude=set(REMOVAL_CONFIG_FIELDS)).encode("utf-8")
+    ).hexdigest()
+    return frozenset({config_digest(config), legacy})
+
+
 class ItemScore(BaseModel):
     """One scored item, with gates-first zeroing except for witnessed content shares.
 
@@ -133,6 +163,7 @@ def compose_item_score(
     pieapp_start_frame: int | None = None,
     scorer_version: str | None = None,
     shared_score: float | None = None,
+    scoring_config_digest: str | None = None,
 ) -> ItemScore:
     """Assemble the final ItemScore, enforcing gates-first zeroing.
 
@@ -146,6 +177,9 @@ def compose_item_score(
     ``shared_score`` replaces the computed score regardless of ``gate_passed``.
     The only legitimate producer is the content equal-share rule; the packet must
     then carry the ``content_duplicate_witness`` metric.
+
+    ``scoring_config_digest`` re-mints a witness packet under the digest its round
+    evidence recorded; it must be one of :func:`accepted_config_digests`.
     """
     if gate_passed and breakdown is not None:
         score = breakdown.final
@@ -157,6 +191,10 @@ def compose_item_score(
         if metrics is None or "content_duplicate_witness" not in metrics:
             raise ValueError("shared_score requires the content_duplicate_witness metric")
         score = shared_score
+    if scoring_config_digest is None:
+        scoring_config_digest = config_digest(config)
+    elif scoring_config_digest not in accepted_config_digests(config):
+        raise ValueError("scoring_config_digest is not an accepted digest of the config in force")
     return ItemScore(
         item_id=item_id,
         challenge_id=challenge_id,
@@ -176,5 +214,5 @@ def compose_item_score(
         backend_versions=backend_versions or {},
         canonicalization_plan_digest=canonicalization_plan_digest,
         pieapp_start_frame=pieapp_start_frame,
-        scoring_config_digest=config_digest(config),
+        scoring_config_digest=scoring_config_digest,
     )

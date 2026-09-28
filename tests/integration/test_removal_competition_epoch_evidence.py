@@ -146,7 +146,7 @@ def _packet(
         miner_hotkey=hotkey,
         content_digest=output_digest,
         metrics=metrics,
-        backend_versions={"removal_metrics": "removal-metrics/1"},
+        backend_versions={"removal_metrics": "removal-metrics/2"},
         scorer_version=SCORER_VERSION,
     )
     return (
@@ -334,7 +334,7 @@ def test_removal_epoch_economics_use_the_exact_public_cpu_audit_matrix(
             competition_item=binding,
             execution_image_digest=("2" * 64 if hotkey is None else "3" * 64),
             scorer_version=SCORER_VERSION,
-            backend_versions={"removal_metrics": "removal-metrics/1"},
+            backend_versions={"removal_metrics": "removal-metrics/2"},
             created_at=(T0 + timedelta(hours=5)).isoformat(),
         )
         bundle_ref = store.put(

@@ -159,7 +159,7 @@ def test_baseline_free_removal_result_is_decided_by_absolute_bars_and_audits_cle
         miner_output=output_ref, manifest=manifest_ref, score_packet=packet_ref,
         competition_item=binding, execution_image_digest="3" * 64,
         scorer_version=SCORER_VERSION,
-        backend_versions={"removal_metrics": "removal-metrics/1"},
+        backend_versions={"removal_metrics": "removal-metrics/2"},
         created_at=(T0 + timedelta(hours=5)).isoformat(),
     )
     bundle_ref = store.put(

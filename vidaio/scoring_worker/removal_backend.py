@@ -30,6 +30,7 @@ from vidaio.scoring.removal import (
     region_metrics,
     temporal_median_fill,
 )
+from vidaio.scoring.removal_formula import best_baseline
 
 
 @dataclass(frozen=True)
@@ -76,7 +77,7 @@ class RemovalInputError(RuntimeError):
 class CpuRemovalBackend:
     """The shipped backend: numpy/OpenCV region metrics + LPIPS-VGG on CPU."""
 
-    VERSION = "removal-metrics/1"  # keep equal to runtime_identity.REMOVAL_METRICS_VERSION
+    VERSION = "removal-metrics/2"  # keep equal to runtime_identity.REMOVAL_METRICS_VERSION
 
     def __init__(self, ffmpeg_path: str = "ffmpeg", *, lpips_enabled: bool = True) -> None:
         self.ffmpeg_path = ffmpeg_path
@@ -168,6 +169,17 @@ class CpuRemovalBackend:
                 os.unlink(floor_path)
             except OSError:
                 pass
+        # the unchanged served input is a baseline too: returning the clip as received must never
+        # beat the floor. On moving-camera clips the temporal median is often worse than leaving a
+        # well-lit object in place, so the floor is the better of the two per term.
+        try:
+            unchanged, _ = region_metrics(
+                Y4MReader.open(canonical_input), ref, masks, lpips=self._lpips, lpips_stride=stride,
+                lpips_max_side=max_side, lpips_offset=offset, cancelled=cancelled,
+            )
+        except (Y4MError, OSError) as exc:
+            raise RemovalInputError(f"unchanged-input baseline unavailable: {exc}") from exc
+        floor = best_baseline(floor, unchanged)
         for name, value in (("lpips_vgg", metrics.lpips_vgg), ("floor.lpips_vgg", floor.lpips_vgg)):
             if self._lpips is not None and not math.isfinite(value):
                 raise RemovalInputError(f"{name} is not finite (no LPIPS sample)")

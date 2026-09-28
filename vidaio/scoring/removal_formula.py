@@ -26,6 +26,25 @@ class RegionMetrics:
     masked_pixels: int
 
 
+def best_baseline(*baselines: RegionMetrics) -> RegionMetrics:
+    """The floor a removal must beat: the best of the given baselines on every scored term.
+
+    The validator measures two cheap answers — its free fill and the served input returned
+    unchanged — and a candidate is only credited for what it adds over the better of them
+    (highest PSNR/SSIM, lowest LPIPS). The warp error and pixel count of the first baseline are
+    kept; the formula does not score them."""
+    if not baselines:
+        raise ValueError("best_baseline needs at least one baseline")
+    first = baselines[0]
+    return RegionMetrics(
+        psnr_db=max(b.psnr_db for b in baselines),
+        ssim=max(b.ssim for b in baselines),
+        lpips_vgg=min(b.lpips_vgg for b in baselines),
+        warp_error=first.warp_error,
+        masked_pixels=first.masked_pixels,
+    )
+
+
 class RemovalBreakdown(BaseModel):
     """Every term of the removal formula — the audit-recompute record."""
 

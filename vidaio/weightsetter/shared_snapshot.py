@@ -511,6 +511,11 @@ _EPOCH_LOG_TOP_LEVEL_FIELDS = frozenset(
 )
 
 
+#: Top-level fields a log carries only when set: tokenomics v4 names the licensing
+#: treasury it pays (``EpochLog.to_json`` omits the key without a treasury).
+_OPTIONAL_TOP_LEVEL_FIELDS = frozenset({"treasury_hotkey"})
+
+
 def _top_level_fields(schema_version: int) -> frozenset[str]:
     """Exact top-level shape per authenticated schema (v17 archives the payout floor)."""
     if schema_version >= 17:
@@ -620,11 +625,20 @@ def _parse_authority_submission(
         raise SnapshotDigestMismatch(
             f"epoch {pointer.epoch_id} log bytes are not JSON: {type(exc).__name__}: {exc}"
         ) from exc
-    if not isinstance(obj, dict) or set(obj) != _top_level_fields(expected_schema):
+    required = _top_level_fields(expected_schema)
+    if not isinstance(obj, dict) or not (
+        required <= set(obj) <= required | _OPTIONAL_TOP_LEVEL_FIELDS
+    ):
         fields = sorted(obj) if isinstance(obj, dict) else type(obj).__name__
         raise SnapshotDigestMismatch(
             f"epoch {pointer.epoch_id} log does not have the exact schema-v"
             f"{EPOCH_LOG_SCHEMA_VERSION} top-level shape: {fields!r}"
+        )
+    if "treasury_hotkey" in obj and (
+        not isinstance(obj["treasury_hotkey"], str) or not obj["treasury_hotkey"].strip()
+    ):
+        raise SnapshotDigestMismatch(
+            f"epoch {pointer.epoch_id} log names an empty or non-string treasury_hotkey"
         )
     try:
         canonical = canonical_json_bytes(obj)

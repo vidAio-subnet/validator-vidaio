@@ -170,6 +170,18 @@ class BatchOutput:
     wall_seconds: float | None = None
 
 
+class BatchOutputs(list):
+    """The outputs of one batch plus the runner-measured ``run.sh`` wall seconds.
+
+    A plain list of :class:`BatchOutput` for every existing consumer; ``wall_seconds``
+    also survives a batch whose solution produced no output at all (the speed term
+    times every batch). ``None`` when a runner cannot measure it."""
+
+    def __init__(self, outputs=(), *, wall_seconds: float | None = None) -> None:
+        super().__init__(outputs)
+        self.wall_seconds = None if wall_seconds is None else round(float(wall_seconds), 3)
+
+
 @dataclass(frozen=True)
 class IsolationProbeReport:
     """Result of the pre-run isolation probe (spec §05): each field asserts one
@@ -213,8 +225,10 @@ class SandboxRunner(Protocol):
     - clone via read-only PAT and pin repository + commit + tree SHA; ``image_digest``
       is the stable, domain-separated :func:`logical_build_identity`. Provider image
       ids/handles are separate execution evidence and must never perturb it.
-    - image size is UNATTESTED on Modal — the container_size_limit_gb manifest cap is
-      acknowledged-but-unmeasured until the trusted-builder proof lands (spec §04).
+    - image size: the Modal runner measures every built image (apparent bytes of all
+      its files, with a trusted Sandbox's own ``du`` on the mounted image, so no
+      contender binary reports it) and fails the build over the manifest's
+      ``container_size_limit_gb`` (ImageOversizeError).
     - sandbox: network blocked, secrets=[], no OIDC token, sealed inputs mounted
       read-only, per-hotkey output volume read-write.
     - isolation_probe() must run before any batch and assert no network, no reference

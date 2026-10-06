@@ -46,6 +46,7 @@ from vidaio.competition.interfaces import (
     BUILD_IDENTITY_SCHEME,
     BatchItem,
     BatchOutput,
+    BatchOutputs,
     ContenderSpec,
     IsolationProbeReport,
     logical_build_identity,
@@ -59,12 +60,14 @@ from vidaio.competition.runners.errors import (
     BuildError,
     BuildTimeout,
     ContenderBuildError,
+    ImageOversizeError,
     InputStagingError,
     OutputRejectedError,
     OversizeOutputError,
     RunnerUnavailableError,
     SandboxIsolationError,
     SandboxProbeUnavailableError,
+    SandboxTerminatedError,
     SolutionExitError,
     UnknownImageError,
     UnsafePathError,
@@ -98,6 +101,10 @@ _SECRET_NAME_RE = re.compile(
     r"(^|_)(TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|CREDENTIALS|PAT)(_|$)"
     r"|API_KEY|PRIVATE_KEY|ACCESS_KEY|SESSION_KEY|AUTH_TOKEN",
 )
+
+#: Where the image-size Sandbox mounts a built contender image.
+_IMAGE_SIZE_MOUNT = "/vidaio-contender-image"
+_DU_TOTAL_RE = re.compile(r"^(\d+)\s+" + re.escape(_IMAGE_SIZE_MOUNT) + r"\s*$", re.MULTILINE)
 
 _PROBE_SCRIPT = """\
 #!/bin/sh
@@ -160,6 +167,11 @@ def _modal_error_text(exc: BaseException) -> str:
     return _tail(f"{type(exc).__name__}: {exc}")
 
 
+#: Exit statuses of a process killed by SIGKILL/SIGTERM (shell 128+n, or a negative
+#: signal number when the process API reports the signal itself).
+_SIGNAL_EXIT_CODES = frozenset({137, 143, -9, -15})
+
+
 @dataclass(frozen=True)
 class ModalRunnerConfig:
     """Explicit resource and boundary limits for one fresh Modal run."""
@@ -178,6 +190,12 @@ class ModalRunnerConfig:
     max_output_entries: int = 4096
     output_poll_seconds: float = 0.25
     snapshot_ttl_seconds: int = 3600
+    #: Wait before each of the two liveness probes after an unexplained signal exit.
+    liveness_probe_seconds: float = 3.0
+    #: The competition's anchored ``container_size_limit_gb`` in bytes (None = not
+    #: measured). A built image over it fails the contender's build.
+    max_image_bytes: int | None = None
+    image_measure_timeout_seconds: float = 600.0
 
     def __post_init__(self) -> None:
         if not self.gpu.strip():
@@ -195,6 +213,14 @@ class ModalRunnerConfig:
             value = float(getattr(self, name))
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be finite and positive")
+        if self.max_image_bytes is not None and self.max_image_bytes <= 0:
+            raise ValueError("max_image_bytes must be positive when set")
+        measure = float(self.image_measure_timeout_seconds)
+        if not math.isfinite(measure) or measure <= 0:
+            raise ValueError("image_measure_timeout_seconds must be finite and positive")
+        probe_wait = float(self.liveness_probe_seconds)
+        if not math.isfinite(probe_wait) or probe_wait < 0:
+            raise ValueError("liveness_probe_seconds must be finite and >= 0")
         if not 60 <= self.sandbox_lifetime_seconds <= 23 * 3600 + 30 * 60:
             raise ValueError(
                 "sandbox_lifetime_seconds must be between 60 and 84600 (roll over "
@@ -607,6 +633,15 @@ class ModalSandboxRunner:
             raise BuildError(
                 "fresh Modal image build returned a malformed image object id"
             )
+        image_bytes: int | None = None
+        if self._cfg.max_image_bytes is not None:
+            image_bytes = self._measure_image_bytes(image, contender)
+            if image_bytes > self._cfg.max_image_bytes:
+                raise ImageOversizeError(
+                    f"contender {contender.contender_id}: the built image holds "
+                    f"{image_bytes / 1e9:.2f} GB, over this competition's "
+                    f"container_size_limit_gb of {self._cfg.max_image_bytes / 1e9:g} GB"
+                )
         # Modal's ``im-*`` value is an opaque per-build handle, not a content
         # digest: rebuilding byte-identical pinned source in a fresh resource
         # namespace mints another id.  Commit the stable source identity to the
@@ -632,9 +667,72 @@ class ModalSandboxRunner:
                 image_digest=image_digest,
                 build_identity_scheme=BUILD_IDENTITY_SCHEME,
                 build_seconds=round(time.monotonic() - started, 3),
+                image_bytes=image_bytes,
             ),
         )
         return image_digest
+
+    def _measure_image_bytes(self, image: object, contender: ContenderSpec) -> int:
+        """Apparent bytes of every file in a built contender image.
+
+        The image is mounted into a fresh trusted CPU Sandbox and measured with that
+        Sandbox's own ``du``; nothing from the image runs, so a contender cannot
+        misreport its size. Too many files to measure in time is the contender's
+        fault; any other failure is ours (INFRA).
+        """
+        name = self._resource_name("imagesize")
+        try:
+            lease = self._runtime.create_collector_sandbox(
+                name=name,
+                tags={
+                    "vidaio-resource": "vidaio-next",
+                    "vidaio-run": self._runtime.run_label,
+                    "vidaio-role": "image-size",
+                    "vidaio-contender": str(contender.contender_id),
+                },
+                timeout_seconds=math.ceil(self._cfg.image_measure_timeout_seconds + 120),
+            )
+        except Exception as exc:
+            raise BuildError(
+                f"could not create the image-size Sandbox {name!r}: "
+                f"{_modal_error_text(exc)}"
+            ) from exc
+        with self._lock:
+            self._owned[f"image-size:{contender.contender_id}:{lease.object_id}"] = lease
+        try:
+            try:
+                lease.mount_image(_IMAGE_SIZE_MOUNT, image)
+            except Exception as exc:
+                raise BuildError(
+                    "could not mount the built image for measurement: "
+                    f"{_modal_error_text(exc)}"
+                ) from exc
+            self._assert_request_isolation(lease, _IMAGE_SIZE_MOUNT, gpu=False)
+            try:
+                result = self._execute_watched(
+                    lease,
+                    ["du", "-sxb", _IMAGE_SIZE_MOUNT],
+                    timeout_seconds=self._cfg.image_measure_timeout_seconds,
+                    output_root=None,
+                    what="image size measurement",
+                )
+            except BatchTimeout as exc:
+                raise ImageOversizeError(
+                    f"contender {contender.contender_id}: the built image could not be "
+                    f"measured within {self._cfg.image_measure_timeout_seconds:g}s "
+                    "(too many files)"
+                ) from exc
+            except (BatchExecutionError, OversizeOutputError) as exc:
+                raise BuildError(f"image size measurement failed: {exc}") from exc
+            match = _DU_TOTAL_RE.search(result.log_text)
+            if result.returncode != 0 or match is None:
+                raise BuildError(
+                    f"image size measurement failed (du exited {result.returncode}): "
+                    f"{result.log_tail}"
+                )
+            return int(match.group(1))
+        finally:
+            self._terminate_owned(lease, reason="image_size_measured")
 
     def _bounded_build(self, checkout: Path, dockerfile: Path) -> tuple[object, str]:
         box: dict[str, Any] = {}
@@ -880,7 +978,7 @@ class ModalSandboxRunner:
                     scorer_device="none (CPU scorer is downstream)",
                 ),
             )
-            return outputs
+            return BatchOutputs(outputs, wall_seconds=result.elapsed)
         finally:
             if lease is not None:
                 self._terminate_owned(lease, reason="batch_finally")
@@ -1086,6 +1184,20 @@ class ModalSandboxRunner:
                 + "; ".join(problems)
             )
 
+    def _sandbox_alive(self, lease: ModalSandboxLease, path: str) -> bool:
+        """Whether the Sandbox still answers after an unexplained signal exit.
+
+        Probed twice, a few seconds apart, so a Sandbox that is still shutting down is
+        not read as alive. Any failure to list ``path`` counts as gone.
+        """
+        for _ in range(2):
+            time.sleep(self._cfg.liveness_probe_seconds)
+            try:
+                lease.list_files(path)
+            except Exception:
+                return False
+        return True
+
     def _execute_watched(
         self,
         lease: ModalSandboxLease,
@@ -1166,6 +1278,10 @@ class ModalSandboxRunner:
                 ) from exc
             if returncode is None:
                 time.sleep(self._cfg.output_poll_seconds)
+        # The run time stops when the exit is observed: the log join, the liveness
+        # probes and the final output scan below are the runner's work, not the
+        # solution's.
+        run_seconds = time.monotonic() - started
 
         join_deadline = time.monotonic() + min(5.0, timeout_seconds)
         for reader in readers:
@@ -1174,6 +1290,16 @@ class ModalSandboxRunner:
             lease.terminate()
             raise OversizeOutputError(
                 f"{what} wrote more than {self._cfg.max_log_bytes} bytes to logs"
+            )
+        if (
+            output_root is not None
+            and returncode in _SIGNAL_EXIT_CODES
+            and not self._sandbox_alive(lease, output_root)
+        ):
+            raise SandboxTerminatedError(
+                f"{what} was killed by a signal (exit {returncode}) the runner did not "
+                f"send, and its Sandbox is gone: {logs.tail()}",
+                wall_seconds=run_seconds,
             )
         if logs.errors:
             raise BatchExecutionError(
@@ -1193,7 +1319,7 @@ class ModalSandboxRunner:
                 )
         return _ExecutionResult(
             returncode=returncode,
-            elapsed=time.monotonic() - started,
+            elapsed=run_seconds,
             log_tail=logs.tail(),
             log_text=logs.text(),
         )

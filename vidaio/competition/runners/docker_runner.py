@@ -116,6 +116,7 @@ from vidaio.core.logging import get_logger, log_fields
 from vidaio.competition.interfaces import (
     BatchItem,
     BatchOutput,
+    BatchOutputs,
     ContenderSpec,
     IsolationProbeReport,
     logical_build_identity,
@@ -687,7 +688,7 @@ class DockerSandboxRunner:
                     wall_seconds=round(elapsed, 3),
                 ),
             )
-            return outputs
+            return BatchOutputs(outputs, wall_seconds=elapsed)
         finally:
             shutil.rmtree(run_dir, ignore_errors=True)
 

@@ -143,7 +143,7 @@ async def test_operator_can_reject_a_blocking_contender_before_it_is_built(
     b = next(c for c in repo.list_contenders(orch.conn, cid) if c.hotkey == "hk-b")
     orch.reject_contender(cid, b.contender_id, "ops", START + 20 * M, reason="repository no longer readable")
     assert repo.get_contender(orch.conn, b.contender_id).status == "REJECTED"
-    with pytest.raises(ValueError, match="only ENROLLED or ACCEPTED"):
+    with pytest.raises(ValueError, match="only ENROLLED, ACCEPTED or BUILT"):
         orch.reject_contender(cid, b.contender_id, "ops", START + 21 * M, reason="again")
     [amendment] = [a for a in pers.operator_amendments(orch.conn, cid) if a["type"] == "contender_rejected_by_operator"]
     assert amendment["details"]["reason"] == "repository no longer readable"
@@ -305,3 +305,60 @@ async def test_a_contender_rejected_while_its_build_runs_is_never_built(
     await orch.step(FINALIZATION + 6 * M)
     assert repo.get_contender(orch.conn, b.contender_id).status == "REJECTED"
     assert phase(orch, cid) is not Phase.BUILDING  # the others went on
+
+
+async def test_a_built_contender_found_breaking_the_rules_is_taken_out_until_completion(
+    orchestrator_factory, fixture_repos, tmp_path
+):
+    """After the build (here: mid-evaluation) the operator can still disqualify an entry,
+    publicly with the reason: its batches end, the rest of the field is evaluated and
+    scored, and it is absent from the scored field. A completed field is final."""
+    orch = orchestrator_factory(repos=fixture_repos)
+    cid = await start_and_enroll(orch, build_manifest(), ["hk-a", "hk-b"])
+    seed_items(orch, cid, tmp_path / "item-src")
+    await orch.step(FINALIZATION)
+    await orch.step(FINALIZATION + 2 * M)
+    await orch.step(FINALIZATION + 3 * M)  # builds -> EVALUATING
+    assert phase(orch, cid) is Phase.EVALUATING
+    b = next(c for c in repo.list_contenders(orch.conn, cid) if c.hotkey == "hk-b")
+    assert b.status == "BUILT"
+    # its batches are queued but not run yet
+    with pers.txn(orch.conn):
+        pers.ensure_batches(
+            orch.conn, cid, b.contender_id,
+            n_items=len(pers.list_items(orch.conn, cid)), batch_size=1, now=FINALIZATION + 3 * M,
+        )
+    orch.reject_contender(
+        cid, b.contender_id, "ops", FINALIZATION + 3 * M, reason="ships footage to look answers up"
+    )
+    assert repo.get_contender(orch.conn, b.contender_id).status == "REJECTED"
+    ended = orch.conn.execute(
+        "SELECT status, failure_code FROM batches WHERE contender_id = ?", (b.contender_id,)
+    ).fetchall()
+    assert ended and all(
+        row["status"] == "FAILED" and row["failure_code"] == "OPERATOR_REJECTED" for row in ended
+    )
+    for minute in range(4, 10):
+        await orch.step(FINALIZATION + minute * M)
+    await orch.step(FINALIZATION + 10 * M)
+    await orch.step(FINALIZATION + 15 * M)
+    assert phase(orch, cid) is Phase.AWAITING_END_TIME
+    scored = {
+        row["contender_id"]
+        for row in orch.conn.execute(
+            "SELECT DISTINCT contender_id FROM performance_history WHERE competition_id = ?",
+            (cid,),
+        )
+    }
+    assert b.contender_id not in scored
+    [amendment] = [
+        a for a in pers.operator_amendments(orch.conn, cid)
+        if a["type"] == "contender_rejected_by_operator"
+    ]
+    assert amendment["details"]["reason"] == "ships footage to look answers up"
+    assert amendment["details"]["previous_status"] == "BUILT"
+    await orch.step(END + M)
+    assert phase(orch, cid) is Phase.COMPLETED
+    a = next(c for c in repo.list_contenders(orch.conn, cid) if c.hotkey == "hk-a")
+    with pytest.raises(ValueError, match="rejecting a contender is allowed only"):
+        orch.reject_contender(cid, a.contender_id, "ops", END + 2 * M, reason="too late")

@@ -82,6 +82,7 @@ _REQUIRED_PAYOUT_BACKENDS = frozenset(
         "opencv",
         "numpy",
         "removal_metrics",
+        "interpolation_metrics",
         "lpips",
         "python",
     }
@@ -104,6 +105,7 @@ def _distribution_version(*names: str) -> str:
 
 
 REMOVAL_METRICS_VERSION = "removal-metrics/2"
+INTERPOLATION_METRICS_VERSION = "interpolation-metrics/1"
 
 
 def complete_payout_backend_versions(
@@ -137,6 +139,9 @@ def complete_payout_backend_versions(
             # object-removal track: region metrics implementation + the LPIPS package
             # (its VGG16 backbone + v0.1 linear heads are pinned by the package version)
             "removal_metrics": REMOVAL_METRICS_VERSION,
+            # frame-interpolation track: inserted-frame metrics implementation (same
+            # LPIPS package and OpenCV pins as removal)
+            "interpolation_metrics": INTERPOLATION_METRICS_VERSION,
             "lpips": f"lpips/{_distribution_version('lpips')}",
             "python": (
                 f"{platform.python_implementation().lower()}/"

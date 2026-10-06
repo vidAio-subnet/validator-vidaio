@@ -411,6 +411,7 @@ def test_upscaling_epoch_economics_use_the_exact_public_cpu_audit_matrix(
         "target_height": TARGET_HEIGHT,
         "item_commitment": binding.item_commitment,
         "mask_stream_index": None,
+        "frame_factor": None,
     }
     assert len(evidence.scored_items) == 2
     assert evidence.result.contenders[0].uid == 42

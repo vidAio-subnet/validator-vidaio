@@ -1,0 +1,67 @@
+{
+ "allowed_gpus": [
+  "L4",
+  "RTX6000ADA"
+ ],
+ "baseline": null,
+ "competition_id": "sn85-removal-002",
+ "container_size_limit_gb": 25.0,
+ "end_time": "2026-10-04T12:00:00Z",
+ "enrollment_deadline": "2026-10-02T14:00:00Z",
+ "evaluation_batch_size": {
+  "max": 4,
+  "min": 4
+ },
+ "evaluation_item_commitments": [
+  "bfa7632c8520770756953366c1e982ef235c3fb5e8b00bf4bc714745437ccc6c",
+  "89f3016e7e11a33014f110c4b2a61afa38ae8d746d262bfdb9b2df542685a527",
+  "bc38cc4f9799b224430cce464cce650ae9da0fdc07cd093f59241a4bd1853621",
+  "9d12668d49cb886fb65350456cc3706464d4371b05dfc96b6798bdd97e3a5522",
+  "cf2889333582e7d3a35de49c7a9e51c6c52c5874657aef9610a5c7d018207373",
+  "54fec7887142bd2de2e2f9cbe2057b965a1da76b8cec4c34c23d466df469e12f",
+  "61057272d6bb31ca67d9a2f829e089e246b4947661c66e8bd7b62fbf221af8fd",
+  "588e484600a9a071fc8dddea9e9dff24959d32f3a5ad3e494a336f29e948efab",
+  "dceab0ecefecab9753f243aa660a4efb8a2200de58fd010875cc62066c0e8e45",
+  "e2ceaf4098b202938e2d06f7b9b1d41734236140a2f5c79a05b047501e903979",
+  "3b3faf0e60ec1431fbf94be1051cc21d5731ec3d34a7a716943bf5c27d626e84",
+  "c29781be91c80999d962a69132b8c6ae35f22208de320dc1311417b1233fdd10",
+  "4abb2ab961d78f6ec150baf69ffd5eb82084f0cb9311d7ceb1297bd1edf88bed",
+  "deebfdf0286d0700641d5e0c2a9350f411c4bc544524ffad49b2bd029ed8f89e",
+  "ba0c45ebe12449b335d1bae9fc3e91c9bf599cc1c5a246b204ed75fa7bba60f1",
+  "7215103f99f060b1f5bdf6a7e470b2d15edb9597966ef98e45d5fc293e988572"
+ ],
+ "finalization_time": "2026-10-02T16:00:00Z",
+ "manifest_schema_version": 2,
+ "minimum_alpha_stake": 500.0,
+ "result_rules": {
+  "crown_competition_share": null,
+  "crown_margin": 0.05,
+  "crown_min_score": 0.69,
+  "crown_split": null,
+  "no_qualifier_closes_window": null,
+  "podium_competition_share": null,
+  "podium_min_margin": null,
+  "podium_min_score": 0.59,
+  "podium_split": null,
+  "redistribute_empty_places": null
+ },
+ "sandbox_resources": {
+  "batch_timeout_seconds": 3600,
+  "cpu": 32.0,
+  "memory_mb": 65536
+ },
+ "scoring_factors": {
+  "cost_efficiency": 0.0,
+  "length_coverage": 0.0,
+  "quality": 1.0
+ },
+ "scoring_seed_commitment": "76d64d5b1be53cad32606ae2396f81bc9756f06e248fadc32c7337e237cf205b",
+ "scoring_version": "vidaio-scorer/1+13fc3e92f614",
+ "sealed_vmaf_variants": [
+  90.0
+ ],
+ "start_time": "2026-09-29T14:00:00Z",
+ "track": "removal",
+ "use_worst_decile": false,
+ "vmaf_threshold": 90.0
+}

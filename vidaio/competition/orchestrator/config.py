@@ -50,6 +50,11 @@ class OrchestratorConfig(BaseModel):
     #: budget is exhausted; beyond it the pipeline HALTS (never fails) with a
     #: CRITICAL log and an `orchestrator_halted` event.
     max_batch_requeues: int = Field(default=3, ge=0)
+    #: A batch whose Sandbox was terminated outside the solution (SANDBOX_TERMINATED,
+    #: e.g. a platform preemption) is rerun on a fresh Sandbox at most this many times,
+    #: then scored as a contender fault. These reruns never use the infra requeue
+    #: budget above and never halt the pipeline.
+    max_sandbox_terminated_reruns: int = Field(default=2, ge=0)
     #: Evaluation batches run concurrently up to this many at a time. Managed GPU
     #: backends give every sandbox its own GPU, so >1 only shortens the evaluation;
     #: keep 1 on a self-hosted GPU host (remote_docker) so contenders never share a

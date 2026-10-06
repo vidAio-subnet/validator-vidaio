@@ -21,6 +21,7 @@ from vidaio.scoring.content_duplicate_evidence import (
 )
 from vidaio.scoring.gates import ReasonCode, ValidityViolation
 from vidaio.scoring.result import (
+    INTERPOLATION_CONFIG_FIELDS,
     REMOVAL_CONFIG_FIELDS,
     accepted_config_digests,
     compose_item_score,
@@ -29,8 +30,18 @@ from vidaio.scoring.result import (
 
 
 def _legacy(config: ScoringConfig) -> str:
+    """The digest the pre-removal release computed (it had neither later field set)."""
     return hashlib.sha256(
-        config.model_dump_json(exclude=set(REMOVAL_CONFIG_FIELDS)).encode("utf-8")
+        config.model_dump_json(
+            exclude=set(REMOVAL_CONFIG_FIELDS | INTERPOLATION_CONFIG_FIELDS)
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _pre_interpolation(config: ScoringConfig) -> str:
+    """The digest the removal release computed (before the interpolation fields)."""
+    return hashlib.sha256(
+        config.model_dump_json(exclude=set(INTERPOLATION_CONFIG_FIELDS)).encode("utf-8")
     ).hexdigest()
 
 
@@ -45,10 +56,22 @@ def test_removal_field_set_is_the_frozen_history():
     assert REMOVAL_CONFIG_FIELDS <= set(ScoringConfig.model_fields)
 
 
-def test_accepted_digests_are_current_and_pre_removal():
+def test_interpolation_field_set_is_the_frozen_history():
+    assert INTERPOLATION_CONFIG_FIELDS == {
+        "interpolation_weights", "interpolation_psnr_span_db", "interpolation_kept_tolerance",
+        "interpolation_lpips_stride", "interpolation_lpips_max_side",
+    }
+    assert INTERPOLATION_CONFIG_FIELDS <= set(ScoringConfig.model_fields)
+
+
+def test_accepted_digests_are_current_pre_interpolation_and_pre_removal():
     config = ScoringConfig()
-    assert _legacy(config) != config_digest(config)
-    assert accepted_config_digests(config) == {config_digest(config), _legacy(config)}
+    assert len({_legacy(config), _pre_interpolation(config), config_digest(config)}) == 3
+    assert accepted_config_digests(config) == {
+        config_digest(config),
+        _pre_interpolation(config),
+        _legacy(config),
+    }
 
 
 def test_compose_accepts_only_accepted_digests():

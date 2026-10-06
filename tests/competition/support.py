@@ -132,7 +132,7 @@ class Driver:
             self.conn,
             competition_id,
             hotkey=hotkey,
-            repo_url=f"https://github.com/miners/{hotkey}",
+            repo_url=f"https://github.com/{hotkey}/solution",
             commit_sha="d" * 40,
             tree_sha="e" * 40,
             stake=stake,

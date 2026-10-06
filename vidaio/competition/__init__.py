@@ -11,6 +11,7 @@ from vidaio.competition.interfaces import (
     BUILD_IDENTITY_SCHEME,
     BatchItem,
     BatchOutput,
+    BatchOutputs,
     CompetitionScoringClient,
     ContenderSpec,
     IsolationProbeReport,
@@ -28,10 +29,13 @@ from vidaio.competition.manifest import (
 )
 from vidaio.competition.item_commitment import (
     EVALUATION_ITEM_COMMITMENT_DOMAIN,
+    INTERPOLATION_FRAME_FACTOR,
+    INTERPOLATION_ITEM_COMMITMENT_DOMAIN,
     REMOVAL_ITEM_COMMITMENT_DOMAIN,
     REMOVAL_MASK_STREAM_INDEX,
     evaluation_item_commitment,
     evaluation_item_preimage,
+    interpolation_item_commitment,
     removal_item_commitment,
 )
 from vidaio.competition.repository import (
@@ -71,6 +75,9 @@ __all__ = [
     "EVALUATION_ITEM_COMMITMENT_DOMAIN",
     "evaluation_item_commitment",
     "evaluation_item_preimage",
+    "INTERPOLATION_FRAME_FACTOR",
+    "INTERPOLATION_ITEM_COMMITMENT_DOMAIN",
+    "interpolation_item_commitment",
     "REMOVAL_ITEM_COMMITMENT_DOMAIN",
     "REMOVAL_MASK_STREAM_INDEX",
     "removal_item_commitment",
@@ -98,6 +105,7 @@ __all__ = [
     "ContenderSpec",
     "BatchItem",
     "BatchOutput",
+    "BatchOutputs",
     "IsolationProbeReport",
     "ScorePacket",
 ]

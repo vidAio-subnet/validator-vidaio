@@ -247,6 +247,11 @@ CENSUS_MISMATCH = "CENSUS_MISMATCH"
 #: production hardening.
 BURN_UID_MISMATCH = "BURN_UID_MISMATCH"
 
+#: Tokenomics v4: the log's declared licensing treasury differs from the treasury this
+#: auditor is configured with. The treasury is paid by policy, so only the canonical one
+#: may be declared (an authority must not route the treasury share to another hotkey).
+TREASURY_MISMATCH = "TREASURY_MISMATCH"
+
 #: The canonical subnet-owner uid could not be resolved from the auditor's
 #: independent chain connection. This is UNKNOWN, not evidence that the declared
 #: recipient is correct: the epoch remains INCONCLUSIVE/HOLD and uid 0 is never

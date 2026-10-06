@@ -32,7 +32,13 @@ from vidaio.scoring.backends import (
     PerceptualCheckBackend,
     PerceptualCheckResult,
 )
-from vidaio.scoring.config import TRACK_COMPRESSION, TRACK_REMOVAL, TRACK_UPSCALING, ScoringConfig
+from vidaio.scoring.config import (
+    TRACK_COMPRESSION,
+    TRACK_INTERPOLATION,
+    TRACK_REMOVAL,
+    TRACK_UPSCALING,
+    ScoringConfig,
+)
 
 
 class ReasonCode(StrEnum):
@@ -71,6 +77,8 @@ class ReasonCode(StrEnum):
     OUTSIDE_REGION_MODIFIED = "OUTSIDE_REGION_MODIFIED"
     REGION_BASELINE_NOT_BEATEN = "REGION_BASELINE_NOT_BEATEN"
     WARP_ERROR_EXCEEDED = "WARP_ERROR_EXCEEDED"
+    # frame-interpolation track
+    KEPT_FRAMES_MODIFIED = "KEPT_FRAMES_MODIFIED"
 
 
 class ValidityViolation(BaseModel):
@@ -287,8 +295,8 @@ class VmafFloorGate:
     name = "vmaf_floor"
 
     def check(self, ctx: GateContext) -> list[ValidityViolation]:
-        if ctx.track == TRACK_REMOVAL:
-            return []  # region metrics, no VMAF term (vidaio/scoring/removal.py)
+        if ctx.track in (TRACK_REMOVAL, TRACK_INTERPOLATION):
+            return []  # region / inserted-frame metrics, no VMAF term
         if ctx.vmaf_primary is None:
             return [
                 ValidityViolation(
@@ -330,8 +338,8 @@ class VmafModelDeltaGate:
     name = "vmaf_model_delta"
 
     def check(self, ctx: GateContext) -> list[ValidityViolation]:
-        if ctx.track == TRACK_REMOVAL:
-            return []  # no VMAF runs on the removal track
+        if ctx.track in (TRACK_REMOVAL, TRACK_INTERPOLATION):
+            return []  # no VMAF runs on the removal and interpolation tracks
         violations: list[ValidityViolation] = []
         delta_pair_supplied = (
             ctx.vmaf_delta_primary is not None or ctx.vmaf_delta_secondary is not None
@@ -415,6 +423,18 @@ class _PerceptualGate:
                 GateSkip(
                     gate=self.name,
                     detail="removal track: the outside-mask identity check applies instead",
+                )
+            )
+            return []
+        if ctx.track == TRACK_INTERPOLATION:
+            # The output carries twice the input's frames, so whole-clip comparisons
+            # against the served input do not line up. The input frames must come back
+            # unchanged (KEPT_FRAMES_MODIFIED), and the inserted frames are measured
+            # against the real ones, which rules out what these gates look for.
+            ctx.skips.append(
+                GateSkip(
+                    gate=self.name,
+                    detail="interpolation track: the kept-frame identity check applies instead",
                 )
             )
             return []

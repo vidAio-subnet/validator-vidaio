@@ -58,7 +58,17 @@ def test_reward_parameter_digest_binds_both_splits() -> None:
     config = TokenomicsConfig()
     expected_policy = {
         "domain": REWARD_POLICY_DOMAIN,
-        "tokenomics": config.model_dump(mode="json", exclude={"payout_min_alpha_stake"}),
+        # Without a licensing treasury the v4 treasury fields stay out of the policy, so
+        # v3 policies keep their anchored digest.
+        "tokenomics": config.model_dump(
+            mode="json",
+            exclude={
+                "payout_min_alpha_stake",
+                "treasury_hotkey",
+                "idle_treasury_share",
+                "window_treasury_share",
+            },
+        ),
         "competition_podium_split": [0.50, 0.24, 0.13, 0.08, 0.05],
         "competition_crown_split": [0.90, 0.04, 0.03, 0.02, 0.01],
     }

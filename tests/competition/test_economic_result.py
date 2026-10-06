@@ -10,6 +10,7 @@ from vidaio.competition.economic_result import (
     CompetitionEconomicResultError,
     aggregate_subject_scores,
     competition_dedup_losers,
+    repo_account_key,
     derive_competition_economics,
     derive_competition_result,
 )
@@ -358,3 +359,60 @@ def test_dedup_excluded_subject_is_audited_but_not_paid() -> None:
     assert [(entry.uid, entry.hotkey) for entry in derivation.result.contenders] == [
         (2, "hk-2")
     ]
+
+
+def test_repo_account_key_is_the_lowercase_host_and_owner() -> None:
+    assert repo_account_key("https://github.com/Alice/comp2-sub") == "github.com/alice"
+    assert repo_account_key("https://github.com/alice/other-repo.git") == "github.com/alice"
+    assert repo_account_key("https://GitHub.com/ALICE/x/") == "github.com/alice"
+    assert repo_account_key("https://gitlab.example/team/repo") == "gitlab.example/team"
+    for unusable in (None, "", "https://github.com/alice", "https://github.com/", "not a url"):
+        assert repo_account_key(unusable) is None
+
+
+def test_competition_dedup_counts_one_entry_per_repository_account() -> None:
+    """One operator, several entries from one GitHub account (any coldkeys and IPs):
+    only the lowest uid holds a slot."""
+    candidates = (
+        CompetitionDedupCandidate(
+            "first", 3, "ck-3", "198.51.100.3", (_digest(1),), "github.com/alice"
+        ),
+        CompetitionDedupCandidate(
+            "same-account", 9, "ck-9", "198.51.100.9", (_digest(2),), "github.com/alice"
+        ),
+        CompetitionDedupCandidate(
+            "other-account", 11, "ck-11", "198.51.100.11", (_digest(3),), "github.com/bob"
+        ),
+        CompetitionDedupCandidate(
+            "no-account-a", 12, "ck-12", "198.51.100.12", (_digest(4),), None
+        ),
+        CompetitionDedupCandidate(
+            "no-account-b", 13, "ck-13", "198.51.100.13", (_digest(5),), None
+        ),
+    )
+    assert competition_dedup_losers(candidates) == frozenset({"same-account"})
+
+
+def test_competition_dedup_counts_one_entry_per_source_tree() -> None:
+    """Forks of one solution under several accounts, coldkeys and IPs, with outputs
+    made to differ by a byte, are one operator: only the lowest uid holds a slot."""
+    tree = "ab" * 20
+    candidates = (
+        CompetitionDedupCandidate(
+            "original", 4, "ck-4", "198.51.100.4", (_digest(1),), "github.com/alice", tree
+        ),
+        CompetitionDedupCandidate(
+            "fork", 7, "ck-7", "198.51.100.7", (_digest(2),), "github.com/mallory",
+            tree.upper(),
+        ),
+        CompetitionDedupCandidate(
+            "own-tree", 8, "ck-8", "198.51.100.8", (_digest(3),), "github.com/bob", "cd" * 20
+        ),
+        CompetitionDedupCandidate(
+            "no-tree-a", 12, "ck-12", "198.51.100.12", (_digest(4),), None, None
+        ),
+        CompetitionDedupCandidate(
+            "no-tree-b", 13, "ck-13", "198.51.100.13", (_digest(5),), None, None
+        ),
+    )
+    assert competition_dedup_losers(candidates) == frozenset({"fork"})

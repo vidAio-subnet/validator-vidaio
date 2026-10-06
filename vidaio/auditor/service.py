@@ -96,6 +96,7 @@ from vidaio.competition.economic_result import (
     CompetitionEconomicResultError,
     competition_dedup_losers,
     derive_competition_economics,
+    repo_account_key,
 )
 from vidaio.competition.anchor_evidence import (
     CompetitionAnchorMismatch,
@@ -105,6 +106,7 @@ from vidaio.competition.anchor_evidence import (
 from vidaio.competition.item_commitment import (
     compression_item_commitment,
     evaluation_item_commitment,
+    interpolation_item_commitment,
     removal_item_commitment,
 )
 from vidaio.competition.manifest import CompetitionManifest
@@ -118,6 +120,7 @@ from vidaio.auditor.client import AuditResultsClient, SubmitAck
 from vidaio.auditor.recomputer import RecomputeUnavailable
 from vidaio.auditor.report import (
     BURN_UID_MISMATCH,
+    TREASURY_MISMATCH,
     BURN_UID_UNVERIFIED,
     CENSUS_MISMATCH,
     COMPETITION_MISMATCH,
@@ -652,6 +655,9 @@ class Auditor:
                         mask_stream_index=competition_items[
                             (item.challenge_id, item.item_id)
                         ].mask_stream_index,
+                        frame_factor=competition_items[
+                            (item.challenge_id, item.item_id)
+                        ].frame_factor,
                     )
                     if item.source == "competition"
                     and competition_input is not None
@@ -758,6 +764,7 @@ class Auditor:
         # DISPUTED (BURN_UID_MISMATCH). Fires only on a burn epoch (log.burn_uid is not None); a
         # None burn uid is a normal epoch with no burn recipient to canonicalize.
         burn_verdict = self._burn_uid_verdict(epoch_log)
+        treasury_verdict = self._treasury_verdict(epoch_log)
         # The snapshot-binding + time-base + census + burn verdicts ride the same earning-verdicts
         # channel (a FAIL disputes, a SKIP holds INCONCLUSIVE) — never counted toward the media
         # coverage floor (their sources are not media strata).
@@ -779,6 +786,7 @@ class Auditor:
             + ((predecessor_verdict,) if predecessor_verdict is not None else ())
             + track_verdicts
             + ((burn_verdict,) if burn_verdict is not None else ())
+            + ((treasury_verdict,) if treasury_verdict is not None else ())
             + competition_verdicts
         )
         # An earning/snapshot FAIL disputes the epoch. It is reflected THROUGH the weight
@@ -1424,6 +1432,44 @@ class Auditor:
                                 "open its anchored manifest commitment"
                             )
 
+                if manifest.track == "interpolation":
+                    commitments = manifest.evaluation_item_commitments or []
+                    if len(comp_input.items) != len(commitments):
+                        raise ValueError(
+                            f"interpolation competition input has {len(comp_input.items)} "
+                            f"item(s), but the anchored manifest commits "
+                            f"{len(commitments)}"
+                        )
+                    for expected_index, (item, committed) in enumerate(
+                        zip(comp_input.items, commitments, strict=True)
+                    ):
+                        if (
+                            item.item_index != expected_index
+                            or item.input_sha256 is None
+                            or item.reference_sha256 is None
+                            or item.frame_factor is None
+                            or item.item_commitment is None
+                        ):
+                            raise ValueError(
+                                f"interpolation evaluation item {expected_index} has an "
+                                "incomplete or reordered commitment preimage"
+                            )
+                        derived_item_commitment = interpolation_item_commitment(
+                            competition_id=comp_input.competition_id,
+                            item_index=item.item_index,
+                            input_sha256=item.input_sha256,
+                            reference_sha256=item.reference_sha256,
+                            frame_factor=item.frame_factor,
+                        )
+                        if (
+                            item.item_commitment != derived_item_commitment
+                            or committed != derived_item_commitment
+                        ):
+                            raise ValueError(
+                                f"interpolation evaluation item {expected_index} does not "
+                                "open its anchored manifest commitment"
+                            )
+
                 compression_commitments = (
                     manifest.evaluation_item_commitments
                     if manifest.track == "compression"
@@ -1608,6 +1654,34 @@ class Auditor:
                                     "removal competition bundle does not bind the "
                                     "committed evaluation-item preimage"
                                 )
+                        if comp_input.track == "interpolation":
+                            binding = bundle.competition_item
+                            actual_binding = (
+                                None
+                                if binding is None
+                                else (
+                                    binding.item_index,
+                                    binding.input_sha256,
+                                    binding.reference_sha256,
+                                    binding.frame_factor,
+                                    binding.item_commitment,
+                                )
+                            )
+                            if (
+                                bundle.stage.value != "competition_sealed"
+                                or actual_binding
+                                != (
+                                    item.item_index,
+                                    item.input_sha256,
+                                    item.reference_sha256,
+                                    item.frame_factor,
+                                    item.item_commitment,
+                                )
+                            ):
+                                raise ValueError(
+                                    "interpolation competition bundle does not bind the "
+                                    "committed evaluation-item preimage"
+                                )
                         if bundle.execution_image_digest is None:
                             raise ValueError(
                                 "competition bundle does not bind its execution image"
@@ -1687,6 +1761,8 @@ class Auditor:
                                 coldkey=census.coldkey,
                                 ip=census.ip,
                                 output_digests=tuple(output_digests),
+                                repo_account=repo_account_key(subject.repo_url),
+                                tree_sha=subject.tree_sha,
                             )
                         )
 
@@ -1699,7 +1775,8 @@ class Auditor:
                 if dedup_losers != committed_losers:
                     raise ValueError(
                         "competition dedup exclusions differ from the independent "
-                        "close-census/coldkey/IP/exact-output derivation: "
+                        "close-census/coldkey/IP/repo-account/source-tree/exact-output "
+                        "derivation: "
                         f"expected {sorted(dedup_losers)}, committed "
                         f"{sorted(committed_losers)}"
                     )
@@ -2431,6 +2508,32 @@ class Auditor:
 
     # -- canonical burn-recipient binding -----------------------
 
+    def _treasury_verdict(self, log: EpochLog) -> ItemVerdict | None:
+        """Tokenomics v4: the declared licensing treasury must be this auditor's own.
+
+        The treasury share is paid by policy, so the log's ``treasury_hotkey`` must equal
+        ``AuditorConfig.tokenomics.treasury_hotkey`` (both unset is fine). The weight
+        verdict re-derives the share from the auditor's config either way; this names the
+        fault directly instead of leaving it to a vector mismatch."""
+        expected = self._config.tokenomics.treasury_hotkey
+        if log.treasury_hotkey == expected:
+            return None
+        return ItemVerdict(
+            source=_CENSUS_SOURCE,
+            challenge_id="",
+            item_id="treasury",
+            miner_hotkey=log.treasury_hotkey,
+            uid=None,
+            bundle_digest="",
+            packet_digest="",
+            verdict=ItemVerdictKind.FAIL,
+            code=TREASURY_MISMATCH,
+            detail=(
+                f"the log declares licensing treasury {log.treasury_hotkey!r} but this "
+                f"auditor's tokenomics policy names {expected!r}"
+            ),
+        )
+
     def _burn_uid_verdict(self, log: EpochLog) -> ItemVerdict | None:
         """The empty-epoch burn recipient must be the CANONICAL burn uid.
 
@@ -2984,6 +3087,37 @@ class Auditor:
 
     # -- earning-state re-derivation (#1) -------------------------------------------
 
+    def _treasury_only_uids(self, log: EpochLog) -> set[int]:
+        """Return the configured licensing treasury's uid when its weight is policy-paid.
+
+        Tokenomics v4 pays the treasury hotkey a fixed share that the weight verdict
+        re-derives from this auditor's OWN tokenomics config. Like a competition-only
+        carrier it has no inference state or evidence to fold. The exemption is narrow:
+        the exact configured hotkey, an inactive inference state and no inference packet,
+        earning input or availability observation; anything else gets the ordinary audit.
+        """
+        hotkey = self._config.tokenomics.treasury_hotkey
+        if not hotkey:
+            return set()
+        manifest = log.audit_manifest
+        out: set[int] = set()
+        for miner in log.miners:
+            if miner.hotkey != hotkey:
+                continue
+            inference_inactive = (
+                miner.excluded
+                or is_excluded(miner.accumulate_score)
+                or miner.accumulate_score <= 0.0
+            )
+            has_inference_evidence = (
+                miner.uid in manifest.earning_inputs
+                or bool(manifest.refs_for(miner.uid))
+                or bool(manifest.availability_for(miner.uid))
+            )
+            if inference_inactive and not has_inference_evidence:
+                out.add(miner.uid)
+        return out
+
     @staticmethod
     def _competition_window_only_earning_uids(log: EpochLog) -> set[int]:
         """Return paid uids whose weight is backed only by competition evidence.
@@ -3085,6 +3219,9 @@ class Auditor:
         # Competition-window payees with no inference state are verified by the
         # competition-result/reward-window fold above, not by the inference EWMA fold.
         audited.difference_update(self._competition_window_only_earning_uids(log))
+        # The licensing treasury is paid by policy (re-derived by the weight verdict from
+        # this auditor's own tokenomics config), not by an inference fold.
+        audited.difference_update(self._treasury_only_uids(log))
         for uid in sorted(audited):
             verdicts.append(
                 self._earning_verdict_for_uid(

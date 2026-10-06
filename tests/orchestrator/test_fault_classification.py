@@ -9,6 +9,8 @@ Two layers:
 
 from __future__ import annotations
 
+import json
+
 import logging
 import sqlite3
 
@@ -37,6 +39,7 @@ from vidaio.competition.runners.errors import (
     RunnerUnavailableError,
     SandboxIsolationError,
     SandboxProbeUnavailableError,
+    SandboxTerminatedError,
     SolutionExitError,
     UnknownImageError,
     UnsafePathError,
@@ -62,6 +65,7 @@ from orchestrator_support import (
 
 CONTENDER_CASES = [
     SolutionExitError("exit 1"),
+    SandboxTerminatedError("killed by a signal and its Sandbox is gone"),
     BatchTimeout("blew its budget"),
     OutputRejectedError("output is a symlink"),
     OversizeOutputError("filled /output"),
@@ -158,6 +162,7 @@ def test_classification_sees_through_retries_exhausted():
 
 def test_fault_codes_are_stable_strings():
     assert fault_code(SolutionExitError("x")) == "SOLUTION_EXIT_NONZERO"
+    assert fault_code(SandboxTerminatedError("x")) == "SANDBOX_TERMINATED"
     assert fault_code(BatchTimeout("x")) == "SOLUTION_TIMEOUT"
     assert fault_code(OutputRejectedError("x")) == "OUTPUT_REJECTED"
     assert fault_code(OversizeOutputError("x")) == "OUTPUT_OVERSIZE"
@@ -547,3 +552,98 @@ async def test_infra_batch_failure_still_requeues_then_halts(
         await orch.step(FINALIZATION + 5 * M)  # budget exhausted -> halt
     assert pers.is_halted(orch.conn, cid)
     assert phase(orch, cid) is Phase.EVALUATING  # halted, never FAILED
+
+
+class _TerminatedSandboxRunner(ContenderFaultRunner):
+    """The chosen contender's Sandbox is stopped under it ``times`` times, then runs."""
+
+    def __init__(self, outputs_dir, hotkey: str, times: int) -> None:
+        super().__init__(outputs_dir)
+        self.tree_sha = CONTENDER_SHAS[hotkey][1]
+        self.remaining = times
+
+    def run_batch(self, image_digest, items, batch_index):
+        if self.remaining > 0 and self.digest_for(self.tree_sha) == image_digest:
+            self.remaining -= 1
+            self.batch_calls.append((image_digest, batch_index))
+            raise SandboxTerminatedError(
+                f"batch {batch_index} was killed by a signal (exit 143) the runner did "
+                "not send, and its Sandbox is gone",
+                wall_seconds=4.5,
+            )
+        return super().run_batch(image_digest, items, batch_index)
+
+
+async def _drive_with_reruns(orch, cid, tmp_path):
+    seed_items(orch, cid, tmp_path / "item-src")
+    await orch.step(FINALIZATION)
+    await orch.step(FINALIZATION + 2 * M)
+    await orch.step(FINALIZATION + 3 * M)  # builds -> EVALUATING
+    for minute in range(4, 10):  # batches, reruns included
+        await orch.step(FINALIZATION + minute * M)
+    await orch.step(FINALIZATION + 10 * M)  # -> SCORING
+    await orch.step(FINALIZATION + 15 * M)  # scoring -> AWAITING_END_TIME
+
+
+def _rerun_events(orch, cid):
+    return [
+        e for e in events_of(orch, cid, "batch_requeued")
+        if '"SANDBOX_TERMINATED"' in e["payload_json"]
+    ]
+
+
+async def test_a_terminated_sandbox_is_rerun_and_the_contender_keeps_its_score(
+    orchestrator_factory, fixture_repos, tmp_path, caplog
+):
+    runner = _TerminatedSandboxRunner(tmp_path / "work" / "outputs", "hk-exit", times=2)
+    orch = orchestrator_factory(runner=runner, repos=fixture_repos)
+    cid = await start_and_enroll(orch, build_manifest(), ["hk-a", "hk-exit"])
+    with caplog.at_level(logging.CRITICAL):
+        await _drive_with_reruns(orch, cid, tmp_path)
+
+    assert not pers.is_halted(orch.conn, cid)
+    assert not [r for r in caplog.records if r.levelno == logging.CRITICAL]
+    assert phase(orch, cid) is Phase.AWAITING_END_TIME
+    assert len(_rerun_events(orch, cid)) == 2
+    # each rerun records how long the stopped attempt ran (the speed term charges it)
+    assert all(
+        json.loads(e["payload_json"])["wall_seconds"] == 4.5 for e in _rerun_events(orch, cid)
+    )
+    assert not pers.contender_fault_events(orch.conn, cid)
+    by_hotkey = {c.hotkey: c for c in repo.list_contenders(orch.conn, cid)}
+    rows = orch.conn.execute(
+        "SELECT valid, item_score FROM performance_history"
+        " WHERE competition_id = ? AND contender_id = ?",
+        (cid, by_hotkey["hk-exit"].contender_id),
+    ).fetchall()
+    assert len(rows) == 3 and all(r["valid"] == 1 and r["item_score"] > 0 for r in rows)
+
+
+async def test_a_sandbox_that_keeps_being_terminated_is_zeroed_and_never_halts(
+    orchestrator_factory, fixture_repos, tmp_path, caplog
+):
+    runner = _TerminatedSandboxRunner(tmp_path / "work" / "outputs", "hk-exit", times=10_000)
+    orch = orchestrator_factory(runner=runner, repos=fixture_repos, max_batch_requeues=0)
+    cid = await start_and_enroll(orch, build_manifest(), ["hk-a", "hk-exit"])
+    with caplog.at_level(logging.CRITICAL):
+        await _drive_with_reruns(orch, cid, tmp_path)
+
+    # max_batch_requeues=0 proves the reruns never touch the infra budget (it would halt).
+    assert not pers.is_halted(orch.conn, cid)
+    assert phase(orch, cid) is Phase.AWAITING_END_TIME
+    faults = pers.contender_fault_events(orch.conn, cid)
+    assert faults and all("SANDBOX_TERMINATED" in f["payload_json"] for f in faults)
+    batches = orch.conn.execute(
+        "SELECT COUNT(*) AS n FROM batches b JOIN contenders c USING (contender_id)"
+        " WHERE b.competition_id = ? AND c.hotkey = 'hk-exit'",
+        (cid,),
+    ).fetchone()["n"]
+    assert len(_rerun_events(orch, cid)) == 2 * batches  # two reruns per batch, then zero
+    by_hotkey = {c.hotkey: c for c in repo.list_contenders(orch.conn, cid)}
+    rows = orch.conn.execute(
+        "SELECT valid, item_score FROM performance_history"
+        " WHERE competition_id = ? AND contender_id = ?",
+        (cid, by_hotkey["hk-exit"].contender_id),
+    ).fetchall()
+    assert len(rows) == 3 and all(r["valid"] == 0 and r["item_score"] == 0 for r in rows)
+

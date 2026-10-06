@@ -15,6 +15,12 @@ builds with Docker locally but not in the sandbox is caught before the deadline:
   are ignored at run time, and an image reference may carry a tag OR a digest, never
   both (``name:tag@sha256:...`` fails; ``name@sha256:...`` works).
 
+With ``--commercial`` (frame interpolation) it also requires ``LICENSE`` and
+``LICENSES.md`` and flags downloads in ``RUN`` steps that are not pinned by content
+(a sha256 check in the same step, a 40-hex commit, a Hugging Face revision): what is
+reviewed must be what is built. It reads the Dockerfile only, not the scripts a ``RUN``
+step calls.
+
 With ``--commit`` the check runs on exactly that commit (``git archive``), which is what
 the evaluator fetches; without it, the working tree is checked. Exit status 0 = no
 blocking problem found; 1 = at least one problem that would lose the entry.
@@ -89,6 +95,116 @@ def check_dockerfile(text: str) -> tuple[list[str], list[str]]:
     return problems, notes
 
 
+_URL = re.compile(r"https?://[^\s'\"|;&)]+")
+_COMMIT = re.compile(r"\b[0-9a-f]{40}\b")
+_SHA256_CHECK = re.compile(r"sha256sum|shasum\s+-a\s*256|hashlib\.sha256|--require-hashes")
+_PIP_INSTALL = re.compile(r"\b(?:uv\s+pip|pip3?|python3?\s+-m\s+pip)\s+install\b")
+#: pip options whose value is the next token (never a requirement).
+_PIP_VALUE_OPTIONS = {
+    "-r", "--requirement", "-c", "--constraint", "-i", "--index-url", "--extra-index-url",
+    "-f", "--find-links", "-t", "--target", "--prefix", "--root", "--platform",
+    "--python-version", "--implementation", "--abi", "--only-binary", "--no-binary",
+    "--progress-bar", "--upgrade-strategy", "-e", "--editable", "--src", "--cache-dir",
+}
+
+
+def _pip_requirements(command: str) -> list[str]:
+    """Requirement specifiers named on one ``pip install`` command line."""
+    found: list[str] = []
+    for match in _PIP_INSTALL.finditer(command):
+        segment = re.split(r"&&|\|\||;|\|", command[match.end():], maxsplit=1)[0]
+        skip = False
+        for token in segment.split():
+            token = token.strip("'\"")
+            if skip:
+                skip = False
+                continue
+            if token in _PIP_VALUE_OPTIONS:
+                skip = True
+                continue
+            if not token or token.startswith("-"):
+                continue
+            found.append(token)
+    return found
+
+
+def check_downloads(text: str) -> tuple[list[str], list[str]]:
+    """Commercial competitions: every file a RUN step downloads must be pinned by
+    content, so the image that is built is the one that was reviewed."""
+    problems: list[str] = []
+    notes: list[str] = []
+    stages: set[str] = set()
+    for line, word, rest in _instructions(text):
+        if word == "FROM":
+            tokens = [tok for tok in rest.split() if not tok.startswith("--")]
+            ref = tokens[0] if tokens else ""
+            if len(tokens) >= 3 and tokens[1].upper() == "AS":
+                stages.add(tokens[2].lower())
+            if ref and "@sha256:" not in ref and ref.lower() not in stages | {"scratch"}:
+                notes.append(
+                    f"line {line}: base image {ref!r} is pinned by tag only; "
+                    "name@sha256:... builds exactly what was reviewed"
+                )
+            continue
+        if word != "RUN":
+            continue
+        checked = bool(_SHA256_CHECK.search(rest))
+        url = _URL.search(rest)
+        if re.search(r"\b(?:wget|curl|aria2c)\b", rest) and url and not checked:
+            problems.append(
+                f"line {line}: downloads {url.group(0)!r} without checking its sha256 in "
+                "the same RUN step"
+            )
+        if re.search(r"\bgdown\b", rest) and not checked:
+            problems.append(
+                f"line {line}: gdown download without checking its sha256 in the same RUN step"
+            )
+        if re.search(r"\bgit\s+clone\b", rest) and not re.search(
+            r"\b(?:checkout|reset\s+--hard|switch\s+--detach)\s+(?:-\S+\s+)*[0-9a-f]{40}\b",
+            rest,
+        ):
+            problems.append(
+                f"line {line}: git clone without checking out a full 40-hex commit in the "
+                "same RUN step"
+            )
+        if re.search(r"\b(?:huggingface-cli|hf)\s+download\b", rest) and not re.search(
+            r"--revision[=\s]+['\"]?[0-9a-f]{40}\b", rest
+        ):
+            problems.append(
+                f"line {line}: Hugging Face download without --revision <40-hex commit>"
+            )
+        if re.search(r"\b(?:hf_hub_download|snapshot_download|from_pretrained)\s*\(", rest) and not re.search(
+            r"revision\s*=\s*['\"][0-9a-f]{40}['\"]", rest
+        ):
+            problems.append(
+                f"line {line}: Hugging Face download without revision='<40-hex commit>'"
+            )
+        if re.search(r"\btorch\.hub\.load\s*\(", rest) and not _COMMIT.search(rest):
+            problems.append(
+                f"line {line}: torch.hub.load without a 40-hex commit ('org/repo:<commit>')"
+            )
+        for requirement in _pip_requirements(rest):
+            if requirement.startswith("git+") or "://" in requirement:
+                if not re.search(r"@[0-9a-f]{40}\b", requirement) and not checked:
+                    problems.append(
+                        f"line {line}: pip requirement {requirement!r} is not pinned to a "
+                        "40-hex commit (...@<commit>) or a hash"
+                    )
+            elif not checked and "==" not in requirement and not requirement.startswith(
+                (".", "/")
+            ):
+                notes.append(
+                    f"line {line}: pip requirement {requirement!r} has no == version; pin "
+                    "it (or use --require-hashes)"
+                )
+        if _PIP_INSTALL.search(rest) and re.search(r"(?:^|\s)(?:-r|--requirement)[=\s]", rest) and not checked:
+            notes.append(
+                f"line {line}: pin every line of the requirements file with == (or use "
+                "--require-hashes)"
+            )
+    return problems, notes
+
+
 def _tree_from_commit(repo: Path, commit: str) -> dict[str, tuple[int, bytes | None]]:
     data = subprocess.run(
         ["git", "-C", str(repo), "archive", "--format=tar", commit],
@@ -126,6 +242,12 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("repo", type=Path)
     ap.add_argument("--commit", help="check exactly this commit (what the evaluator fetches)")
+    ap.add_argument(
+        "--commercial",
+        action="store_true",
+        help="the competition is commercial-use only (frame interpolation): require LICENSE "
+        "and LICENSES.md at the repository root and content-pinned downloads",
+    )
     args = ap.parse_args(argv)
 
     files = _tree_from_commit(args.repo, args.commit) if args.commit else _tree_from_dir(args.repo)
@@ -154,8 +276,23 @@ def main(argv: list[str] | None = None) -> int:
         found, hints = check_dockerfile(text)
         problems += found
         notes += hints
+        if args.commercial:
+            found, hints = check_downloads(text)
+            problems += found
+            notes += hints
     if not any(name == "run.sh" or name.endswith("/run.sh") for name in files):
         problems.append("no run.sh in the tree")
+    if args.commercial:
+        if not any(name in files for name in ("LICENSE", "LICENSE.md", "LICENSE.txt")):
+            problems.append(
+                "no LICENSE at the repository root: your own code must be released under "
+                "Apache-2.0 or MIT"
+            )
+        if "LICENSES.md" not in files:
+            problems.append(
+                "no LICENSES.md at the repository root: list every third-party component "
+                "(name, source URL, licence, location in the repository)"
+            )
     for note in notes:
         print(f"note: {note}")
     for problem in problems:

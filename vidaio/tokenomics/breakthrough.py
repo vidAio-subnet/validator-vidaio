@@ -390,9 +390,19 @@ def emission_shares(
             competition = float(state.competition_share)
         inference = config.crown_inference_share if crown else config.podium_inference_share
         inference = min(inference, max(0.0, 1.0 - competition))
-        burn = float(Decimal(1) - Decimal(str(inference)) - Decimal(str(competition)))
-        return EmissionShares(inference, competition, max(0.0, burn))
-    return EmissionShares(config.idle_inference_share, 0.0, config.idle_burn_share)
+        # Tokenomics v4: the licensing treasury keeps a small share of an active window;
+        # the window's own allocation applies to the rest.
+        treasury = Decimal(str(config.window_treasury_share))
+        rest = Decimal(1) - treasury
+        inference_d = Decimal(str(inference)) * rest
+        competition_d = Decimal(str(competition)) * rest
+        burn = Decimal(1) - inference_d - competition_d - treasury
+        return EmissionShares(
+            float(inference_d), float(competition_d), max(0.0, float(burn)), float(treasury)
+        )
+    return EmissionShares(
+        config.idle_inference_share, 0.0, config.idle_burn_share, config.idle_treasury_share
+    )
 
 
 def podium_hotkey_shares(

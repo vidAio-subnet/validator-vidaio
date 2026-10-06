@@ -18,10 +18,12 @@ from vidaio.scoring.compression import CompressionBreakdown
 from vidaio.scoring.config import ScoringConfig
 from vidaio.scoring.gates import GateSkip, ValidityViolation
 from vidaio.scoring.upscaling import UpscalingBreakdown
+from vidaio.scoring.interpolation_formula import InterpolationBreakdown
 from vidaio.scoring.removal_formula import RemovalBreakdown
 
 Breakdown = Annotated[
-    Union[CompressionBreakdown, UpscalingBreakdown, RemovalBreakdown], Field(discriminator="kind")
+    Union[CompressionBreakdown, UpscalingBreakdown, RemovalBreakdown, InterpolationBreakdown],
+    Field(discriminator="kind"),
 ]
 
 
@@ -47,17 +49,39 @@ REMOVAL_CONFIG_FIELDS = frozenset(
 )
 
 
+#: ScoringConfig fields added with the frame-interpolation track (same reasoning as
+#: :data:`REMOVAL_CONFIG_FIELDS`: the release before it dumped the config without them).
+INTERPOLATION_CONFIG_FIELDS = frozenset(
+    {
+        "interpolation_weights",
+        "interpolation_psnr_span_db",
+        "interpolation_kept_tolerance",
+        "interpolation_lpips_stride",
+        "interpolation_lpips_max_side",
+    }
+)
+
+#: Config generations, oldest addition first. Each prefix of exclusions reproduces the
+#: digest an earlier release computed for the same settings.
+_CONFIG_FIELD_GENERATIONS = (REMOVAL_CONFIG_FIELDS, INTERPOLATION_CONFIG_FIELDS)
+
+
 def accepted_config_digests(config: ScoringConfig) -> frozenset[str]:
     """Config digests under which stored witness evidence is valid for ``config``.
 
-    The current digest, plus the digest the pre-removal release computed for the
-    same settings. Evidence committed before a roll that added config fields is
-    re-verified by the next finalized epoch, so it must stay verifiable.
+    The current digest, plus the digest every earlier release computed for the same
+    settings (pre-interpolation, pre-removal). Evidence committed before a roll that
+    added config fields is re-verified by the next finalized epoch, so it must stay
+    verifiable.
     """
-    legacy = hashlib.sha256(
-        config.model_dump_json(exclude=set(REMOVAL_CONFIG_FIELDS)).encode("utf-8")
-    ).hexdigest()
-    return frozenset({config_digest(config), legacy})
+    digests = {config_digest(config)}
+    excluded: set[str] = set()
+    for fields in reversed(_CONFIG_FIELD_GENERATIONS):
+        excluded |= fields
+        digests.add(
+            hashlib.sha256(config.model_dump_json(exclude=set(excluded)).encode("utf-8")).hexdigest()
+        )
+    return frozenset(digests)
 
 
 class ItemScore(BaseModel):
@@ -149,7 +173,9 @@ def compose_item_score(
     track: str,
     gate_passed: bool,
     violations: list[ValidityViolation],
-    breakdown: CompressionBreakdown | UpscalingBreakdown | RemovalBreakdown | None,
+    breakdown: (
+        CompressionBreakdown | UpscalingBreakdown | RemovalBreakdown | InterpolationBreakdown | None
+    ),
     config: ScoringConfig,
     skips: list[GateSkip] | None = None,
     miner_hotkey: str | None = None,

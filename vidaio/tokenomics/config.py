@@ -44,6 +44,13 @@ class TokenomicsConfig(BaseModel):
     no_qualifier_closes_window: bool = True
     breakthrough_margin_floor: float = 0.05
     result_window_hours: float = 168.0
+    #: Licensing treasury (tokenomics v4, 2026-10): a registered hotkey that receives
+    #: ``idle_treasury_share`` of miner emissions while no result window is active
+    #: (instead of burning all of it) and ``window_treasury_share`` while one is, which
+    #: keeps it registered. Without a registered treasury hotkey these shares burn.
+    treasury_hotkey: str | None = None
+    idle_treasury_share: float = 0.0
+    window_treasury_share: float = 0.0
 
     # False forces IDLE; it never redirects IDLE's 20% sink share to inference.
     competition_emissions_enabled: bool = False
@@ -77,6 +84,8 @@ class TokenomicsConfig(BaseModel):
         for name in (
             "idle_inference_share",
             "idle_burn_share",
+            "idle_treasury_share",
+            "window_treasury_share",
             "podium_inference_share",
             "podium_competition_share",
             "crown_inference_share",
@@ -86,13 +95,17 @@ class TokenomicsConfig(BaseModel):
             if not math.isfinite(value) or not 0.0 <= value <= 1.0:
                 raise ValueError(f"{name} must be finite and in [0, 1]")
         # Exact checks prevent implementation-specific renormalisation.
-        for state, left, right in (
-            ("IDLE", self.idle_inference_share, self.idle_burn_share),
-            ("PODIUM", self.podium_inference_share, self.podium_competition_share),
-            ("CROWN", self.crown_inference_share, self.crown_competition_share),
+        for state, shares in (
+            ("IDLE", (self.idle_inference_share, self.idle_burn_share, self.idle_treasury_share)),
+            ("PODIUM", (self.podium_inference_share, self.podium_competition_share)),
+            ("CROWN", (self.crown_inference_share, self.crown_competition_share)),
         ):
-            if left + right != 1.0:
+            if sum(shares) != 1.0:
                 raise ValueError(f"{state} allocation shares must sum exactly to 1.0")
+        if self.window_treasury_share >= 1.0:
+            raise ValueError("window_treasury_share must be below 1.0")
+        if self.treasury_hotkey is not None and not self.treasury_hotkey.strip():
+            raise ValueError("treasury_hotkey must be a non-empty hotkey or unset")
         if not (
             self.crown_inference_share
             <= self.podium_inference_share

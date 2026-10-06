@@ -62,6 +62,7 @@ from vidaio.audit.canonical import canonical_json_bytes, sha256_hex
 from vidaio.audit.store import ArtifactKind, ArtifactRef, AuditStore, IntegrityError
 from vidaio.competition.item_commitment import (
     evaluation_item_commitment,
+    interpolation_item_commitment,
     removal_item_commitment,
 )
 
@@ -120,6 +121,23 @@ DEFAULT_TOLERANCES: Mapping[str, float] = MappingProxyType(
         "region_warp_cap": 1e-4,
         "region_outside_change": 1e-6,
         "mask_fraction": 1e-9,
+        # Frame-interpolation metrics of the inserted frames and of the hold/blend
+        # floor: integer-exact squared-error sums with one log10 (PSNR), float64
+        # Gaussian SSIM pinned to one OpenCV thread, LPIPS on the canonical CPU torch
+        # policy — last-decimal allowances only.
+        "interp_psnr_db": 1e-6,
+        "interp_floor_psnr_db": 1e-6,
+        "interp_hold_psnr_db": 1e-6,
+        "interp_blend_psnr_db": 1e-6,
+        "interp_ssim": 1e-6,
+        "interp_floor_ssim": 1e-6,
+        "interp_hold_ssim": 1e-6,
+        "interp_blend_ssim": 1e-6,
+        "interp_lpips_vgg": 1e-5,
+        "interp_floor_lpips_vgg": 1e-5,
+        "interp_hold_lpips_vgg": 1e-5,
+        "interp_blend_lpips_vgg": 1e-5,
+        "interp_kept_change": 1e-6,
         "final_score": 1e-5,
         "score": 1e-5,
     }
@@ -194,6 +212,65 @@ class CompetitionAuditContext:
     item_commitment: str | None = None
     #: Object removal: the served input's mask stream (committed in the preimage).
     mask_stream_index: int | None = None
+    #: Frame interpolation: output frames per input frame interval (committed).
+    frame_factor: int | None = None
+
+
+def _interpolation_binding_problems(
+    bundle: AuditBundle,
+    context: CompetitionAuditContext,
+    manifest: Mapping[str, Any] | None,
+) -> list[str]:
+    """Frame-interpolation counterpart of the removal preimage checks: the bundle, the
+    epoch evidence and the anchored manifest must all name the same input/reference
+    pair and frame factor at the same committed index."""
+    problems: list[str] = []
+    binding = bundle.competition_item
+    context_binding = (
+        context.item_index,
+        context.input_sha256,
+        context.reference_sha256,
+        context.frame_factor,
+        context.item_commitment,
+    )
+    if binding is None or any(value is None for value in context_binding):
+        return ["interpolation competition item commitment preimage is incomplete"]
+    if (
+        binding.item_index,
+        binding.input_sha256,
+        binding.reference_sha256,
+        binding.frame_factor,
+        binding.item_commitment,
+    ) != context_binding:
+        problems.append("bundle interpolation item preimage differs from epoch evidence")
+    if (
+        bundle.challenge_input.digest != binding.input_sha256
+        or bundle.reference_original is None
+        or bundle.reference_original.digest != binding.reference_sha256
+    ):
+        problems.append("bundle media refs differ from the interpolation item preimage")
+    try:
+        derived = interpolation_item_commitment(
+            competition_id=context.competition_id,
+            item_index=binding.item_index,
+            input_sha256=binding.input_sha256,
+            reference_sha256=binding.reference_sha256,
+            frame_factor=int(binding.frame_factor or 0),
+        )
+    except ValueError as exc:
+        problems.append(f"interpolation item preimage is invalid: {exc}")
+        return problems
+    if derived != binding.item_commitment:
+        problems.append("interpolation item commitment does not hash its preimage")
+    if manifest is not None:
+        commitments = manifest.get("evaluation_item_commitments")
+        if (
+            not isinstance(commitments, list)
+            or binding.item_index >= len(commitments)
+            or commitments[binding.item_index] != derived
+        ):
+            problems.append("interpolation item is not at its committed manifest index")
+    return problems
 
 
 def _removal_binding_problems(
@@ -1040,7 +1117,7 @@ def verify_bundle(
             and bundle.stage is LifecycleStage.PRE_REVEAL
         )
         or (
-            competition_context.track in ("upscaling", "removal")
+            competition_context.track in ("upscaling", "removal", "interpolation")
             and bundle.stage is LifecycleStage.COMPETITION_SEALED
         )
     )
@@ -1265,6 +1342,14 @@ def verify_bundle(
             if ArtifactKind.REFERENCE_ORIGINAL not in artifacts:
                 manifest_problems.append(
                     "removal clean reference is unavailable or unreleased"
+                )
+        if competition_context.track == "interpolation":
+            manifest_problems.extend(
+                _interpolation_binding_problems(bundle, competition_context, competition_manifest)
+            )
+            if ArtifactKind.REFERENCE_ORIGINAL not in artifacts:
+                manifest_problems.append(
+                    "interpolation full-rate reference is unavailable or unreleased"
                 )
         if manifest_problems:
             checks.append(

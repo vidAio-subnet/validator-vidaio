@@ -45,6 +45,7 @@ from vidaio.auditor.chronology import (
 from vidaio.auditor.recomputer import RealScoreRecomputer, RecomputeUnavailable
 from vidaio.auditor.report import (
     BURN_UID_MISMATCH,
+    TREASURY_MISMATCH,
     BURN_UID_UNVERIFIED,
     CENSUS_MISMATCH,
     CREATED_AT_MISMATCH,
@@ -156,6 +157,7 @@ __all__ = [
     "CREATED_AT_UNVERIFIED",
     "CENSUS_MISMATCH",
     "BURN_UID_MISMATCH",
+    "TREASURY_MISMATCH",
     "BURN_UID_UNVERIFIED",
     "PREDECESSOR_CHAIN_BROKEN",
     "PREDECESSOR_UNVERIFIED",

@@ -79,14 +79,14 @@ async def test_result_requires_census_and_evidence_and_ignores_manual_review_sta
         assert no_census.status_code == 409
         assert no_census.json()["detail"]["code"] == "unauditable_result"
 
-        # Likewise, a partial census may not cherry-pick the registered contender.
+        # A BUILT contender that left the subnet has no payable uid: the preview
+        # ranks the registered field instead of refusing the whole result.
         host.chain = _chain("hk-a")
         partial_census = await client.get(
             f"/competitions/{competition_id}/result", headers=AUTH
         )
-        assert partial_census.status_code == 409
-        assert partial_census.json()["detail"]["code"] == "unauditable_result"
-        assert "absent from the close-block census" in partial_census.text
+        assert partial_census.status_code == 200, partial_census.text
+        assert [row["uid"] for row in partial_census.json()["contenders"]] == [10]
 
         host.chain = _chain("hk-a", "hk-b")
         request_thread = threading.get_ident()

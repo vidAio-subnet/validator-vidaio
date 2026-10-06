@@ -14,6 +14,7 @@ import numbers
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Mapping
+from urllib.parse import urlsplit
 
 from vidaio.epoch.log import CompetitionInput
 from vidaio.tokenomics.rank_curve import dedup_ip_key
@@ -26,13 +27,20 @@ class CompetitionEconomicResultError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class SubjectAggregate:
-    """Arithmetic mean independently derived for one committed audit subject."""
+    """Score independently derived for one committed audit subject.
+
+    ``score`` is what ranks: the arithmetic mean of the packet scores (``quality``),
+    times the speed multiplier when the anchored rules carry a speed term.
+    """
 
     subject_id: str
     role: str
     uid: int | None
     hotkey: str | None
     score: float
+    quality: float | None = None
+    run_seconds: float | None = None
+    speed_score: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,26 +62,57 @@ class CompetitionEconomicDerivation:
 
 @dataclass(frozen=True, slots=True)
 class CompetitionDedupCandidate:
-    """Close-census and exact-output identity for one payable contender."""
+    """Close-census, repository-account and exact-output identity for one payable
+    contender."""
 
     subject_id: str
     uid: int
     coldkey: str
     ip: str
     output_digests: tuple[str, ...]
+    #: :func:`repo_account_key` of the enrolled repository (None = no account).
+    repo_account: str | None = None
+    #: Git tree SHA of the enrolled commit (None = unknown).
+    tree_sha: str | None = None
+
+
+def repo_account_key(repo_url: str | None) -> str | None:
+    """The hosting account a repository URL belongs to, as ``host/owner`` (lowercase),
+    or None when the URL names no owner and repository.
+
+    Entries enrolled from repositories of the same account count as one operator in
+    :func:`competition_dedup_losers`, whatever coldkeys and hotkeys they use.
+    """
+    if not repo_url:
+        return None
+    try:
+        parts = urlsplit(repo_url.strip())
+    except ValueError:
+        return None
+    host = (parts.hostname or "").lower()
+    segments = [segment for segment in parts.path.split("/") if segment]
+    if not host or len(segments) < 2:
+        return None
+    return f"{host}/{segments[0].lower()}"
 
 
 def competition_dedup_losers(
     candidates: tuple[CompetitionDedupCandidate, ...],
 ) -> frozenset[str]:
-    """Lowest uid wins each advertised-IP, coldkey, and exact-output slot.
+    """Lowest uid wins each advertised-IP, coldkey, repository-account, source-tree
+    and exact-output slot.
 
     The scan deliberately mirrors inference dedup. Unspecified addresses are not a
     shared identity, while a byte-identical full output matrix is: later contenders
-    cannot occupy a second podium/crown slot with the same solution output.
+    cannot occupy a second podium/crown slot with the same solution output. One
+    operator enrolling several repositories of one account (any coldkeys) likewise
+    holds a single slot, and so does one source tree enrolled from several accounts
+    (forks of one solution whose outputs were made to differ by a byte).
     """
     seen_ips: set[str] = set()
     seen_coldkeys: set[str] = set()
+    seen_accounts: set[str] = set()
+    seen_trees: set[str] = set()
     seen_outputs: set[tuple[str, ...]] = set()
     losers: set[str] = set()
     for candidate in sorted(candidates, key=lambda value: value.uid):
@@ -82,9 +121,13 @@ def competition_dedup_losers(
                 f"competition contender {candidate.subject_id!r} has no output matrix"
             )
         ip_key = dedup_ip_key(candidate.ip)
+        account = candidate.repo_account
+        tree = None if not candidate.tree_sha else candidate.tree_sha.lower()
         if (
             (ip_key is not None and ip_key in seen_ips)
             or candidate.coldkey in seen_coldkeys
+            or (account is not None and account in seen_accounts)
+            or (tree is not None and tree in seen_trees)
             or candidate.output_digests in seen_outputs
         ):
             losers.add(candidate.subject_id)
@@ -92,8 +135,36 @@ def competition_dedup_losers(
         if ip_key is not None:
             seen_ips.add(ip_key)
         seen_coldkeys.add(candidate.coldkey)
+        if account is not None:
+            seen_accounts.add(account)
+        if tree is not None:
+            seen_trees.add(tree)
         seen_outputs.add(candidate.output_digests)
     return frozenset(losers)
+
+
+def speed_score(
+    run_seconds: float, *, inserted_frames: int, fast_spf: float, slow_spf: float
+) -> float:
+    """Speed credit in [0, 1] from a measured run time (log scale: every 2x faster is
+    worth the same). ``spf`` = seconds per inserted frame; 1 at or under ``fast_spf``,
+    0 at or over ``slow_spf``."""
+    for name, value in (("run_seconds", run_seconds), ("fast_spf", fast_spf), ("slow_spf", slow_spf)):
+        if not math.isfinite(value) or value < 0:
+            raise CompetitionEconomicResultError(f"{name} must be finite and >= 0, got {value!r}")
+    if inserted_frames < 1 or not 0 < fast_spf < slow_spf:
+        raise CompetitionEconomicResultError("speed term needs inserted_frames >= 1 and 0 < fast_spf < slow_spf")
+    spf = run_seconds / inserted_frames
+    if spf <= fast_spf:
+        return 1.0
+    if spf >= slow_spf:
+        return 0.0
+    return math.log(slow_spf / spf) / math.log(slow_spf / fast_spf)
+
+
+def speed_adjusted_score(quality: float, speed: float, *, weight: float) -> float:
+    """``quality * (1 - weight + weight * speed)``, clamped to [0, 1]."""
+    return min(1.0, max(0.0, quality * (1.0 - weight + weight * speed)))
 
 
 def _required_packet_digests(competition: CompetitionInput) -> tuple[str, ...]:
@@ -157,16 +228,35 @@ def aggregate_subject_scores(
     validated = {
         digest: _validated_score(digest, packet_scores[digest]) for digest in required
     }
+    rules = getattr(competition, "rules", None)
+    timed = rules is not None and rules.has_speed_term
     aggregates: list[SubjectAggregate] = []
     for subject in competition.subjects:
         values = [validated[digest] for digest in subject.packet_digests]
+        quality = math.fsum(values) / len(values)
+        score, speed = quality, None
+        if timed:
+            if subject.run_seconds is None:
+                raise CompetitionEconomicResultError(
+                    f"competition subject {subject.subject_id!r} has no measured run time"
+                )
+            speed = speed_score(
+                subject.run_seconds,
+                inserted_frames=rules.speed_inserted_frames,
+                fast_spf=rules.speed_fast_spf,
+                slow_spf=rules.speed_slow_spf,
+            )
+            score = speed_adjusted_score(quality, speed, weight=rules.speed_weight)
         aggregates.append(
             SubjectAggregate(
                 subject_id=subject.subject_id,
                 role=subject.role,
                 uid=subject.uid,
                 hotkey=subject.hotkey,
-                score=math.fsum(values) / len(values),
+                score=score,
+                quality=quality,
+                run_seconds=subject.run_seconds,
+                speed_score=speed,
             )
         )
     return tuple(aggregates)

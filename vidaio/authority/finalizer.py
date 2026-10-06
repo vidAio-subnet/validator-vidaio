@@ -763,6 +763,8 @@ class EpochFinalizer:
             prior_log_digest=prior_log_digest,
             gap_epochs=gap_epochs,
             burn_uid=log_burn_uid,
+            # Tokenomics v4: declare the treasury this vector pays by policy.
+            treasury_hotkey=self._config.treasury_hotkey,
             # D-025: archive the exact floor this vector was built with.
             payout_min_alpha_stake=self._config.payout_min_alpha_stake,
             competition_result=competition_result,
@@ -895,6 +897,16 @@ class EpochFinalizer:
             if miner.hotkey in rewarded_hotkeys
             and (miner.excluded or miner.accumulate_score <= 0.0)
         )
+        # Tokenomics v4: the licensing treasury is paid by policy, not by an earning fold;
+        # the auditor re-derives its share from its own tokenomics config.
+        treasury = self._config.treasury_hotkey
+        if treasury:
+            competition_uids.update(
+                miner.uid
+                for miner in snapshots
+                if miner.hotkey == treasury
+                and (miner.excluded or miner.accumulate_score <= 0.0)
+            )
         nonzero = sorted(
             uid
             for uid, w in weight_shares.items()

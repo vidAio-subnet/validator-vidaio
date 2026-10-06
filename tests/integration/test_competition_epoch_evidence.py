@@ -558,16 +558,83 @@ def test_competition_cannot_be_applied_before_its_completion_time(
         )
 
 
-def test_built_contender_missing_from_close_census_fails_closed(
+def test_built_contender_missing_from_close_census_leaves_the_field(
     fresh_world: GoldenWorld,
 ) -> None:
-    with pytest.raises(CompetitionEvidenceError, match="absent from the close-block census"):
+    """hk-b reached BUILT and then left the subnet: it has no payable uid, so the
+    result ranks the registered field. Holding the result instead would hand any one
+    entrant a switch that stops everyone's payout. The auditor, bound to the same
+    complete close-block census, derives the identical result."""
+    cfg = TokenomicsConfig(competition_emissions_enabled=True)
+    census = _competition_census("hk-a")
+    evidence = build_competition_epoch_evidence(
+        fresh_world.comp_conn,
+        census_by_hotkey=census,
+        store=fresh_world.store,
+        tokenomics=cfg,
+        through_time=COMPLETED_AT,
+    )
+    assert evidence is not None
+    assert [
+        subject.hotkey
+        for subject in evidence.competition_input.subjects
+        if subject.role == "contender"
+    ] == ["hk-a"]
+    assert [(entry.uid, entry.hotkey) for entry in evidence.result.contenders] == [
+        (10, "hk-a")
+    ]
+
+    manifest = build_audit_manifest(
+        evidence.scored_items,
+        store=fresh_world.store,
+        competition_input=evidence.competition_input,
+        commitment_source=_InferenceCommitmentMustNotHandleCompetition(),
+    )
+    snapshots = tuple(
+        replace(miner, coldkey=census[miner.hotkey].coldkey, ip=census[miner.hotkey].ip)
+        for miner in _competition_miners()
+        if miner.hotkey in census
+    )
+    log = EpochFinalizer(cfg, scorer_version="scorer-v1").build_log(
+        epoch_id=2,
+        close_block=719,
+        snapshots=snapshots,
+        burn_uid=94,
+        audit_manifest=manifest,
+        now=COMPLETED_AT,
+        competition_result=evidence.result,
+        competition_packet_scores=evidence.packet_scores,
+    )
+    bundle_source = InMemoryBundleSource()
+    for bundle in (*fresh_world.bundles.values(), fresh_world.baseline_bundle):
+        bundle_source.add(bundle)
+    auditor = Auditor(
+        AuditorConfig(auditor_hotkey="auditor-test", tokenomics=cfg, burn_uid=94),
+        bundle_source,
+        chain=fresh_world.anchor_chain,
+    )
+    derived, _reward_window, verdicts = auditor._competition_verdicts(
+        log, fresh_world.store, None, True
+    )
+    assert derived == evidence.result
+    assert verdicts
+    assert all(verdict.verdict is ItemVerdictKind.PASS for verdict in verdicts), [
+        (verdict.verdict, verdict.code, verdict.detail) for verdict in verdicts
+    ]
+
+
+def test_no_registered_built_contender_has_no_payable_result(
+    fresh_world: GoldenWorld,
+) -> None:
+    assert (
         build_competition_epoch_evidence(
             fresh_world.comp_conn,
-            census_by_hotkey=_competition_census("hk-a"),
+            census_by_hotkey=_competition_census(),
             store=fresh_world.store,
             through_time=COMPLETED_AT,
         )
+        is None
+    )
 
 
 def test_authority_and_auditor_rederive_competition_coldkey_dedup(
@@ -728,6 +795,150 @@ def test_authority_and_auditor_rederive_competition_coldkey_dedup(
     assert forged_verdicts[0].verdict is ItemVerdictKind.FAIL
     assert forged_verdicts[0].code == COMPETITION_MISMATCH
     assert "dedup exclusions differ" in forged_verdicts[0].detail
+
+
+def test_authority_and_auditor_rederive_competition_repo_account_dedup(
+    fresh_world: GoldenWorld,
+) -> None:
+    """Two entries from one repository account are one operator on both sides, whatever
+    their coldkeys and IPs: only the lowest uid keeps a ranked place."""
+    cfg = TokenomicsConfig(competition_emissions_enabled=True)
+    fresh_world.comp_conn.execute(
+        "UPDATE contenders SET repo_url = ? WHERE hotkey = ?",
+        ("https://github.com/HK-A/second-solution", "hk-b"),
+    )
+    fresh_world.comp_conn.commit()
+    census = _competition_census("hk-a", "hk-b")
+    assert census["hk-a"].coldkey != census["hk-b"].coldkey
+    assert census["hk-a"].ip != census["hk-b"].ip
+    evidence = build_competition_epoch_evidence(
+        fresh_world.comp_conn,
+        census_by_hotkey=census,
+        store=fresh_world.store,
+        tokenomics=cfg,
+        through_time=COMPLETED_AT,
+    )
+    assert evidence is not None
+    by_hotkey = {
+        subject.hotkey: subject
+        for subject in evidence.competition_input.subjects
+        if subject.role == "contender"
+    }
+    assert not by_hotkey["hk-a"].dedup_excluded
+    assert by_hotkey["hk-b"].dedup_excluded
+    assert [(entry.uid, entry.hotkey) for entry in evidence.result.contenders] == [
+        (10, "hk-a")
+    ]
+
+    manifest = build_audit_manifest(
+        evidence.scored_items,
+        store=fresh_world.store,
+        competition_input=evidence.competition_input,
+        commitment_source=_InferenceCommitmentMustNotHandleCompetition(),
+    )
+    snapshots = tuple(
+        replace(
+            miner,
+            coldkey=census[miner.hotkey].coldkey,
+            ip=census[miner.hotkey].ip,
+        )
+        for miner in _competition_miners()
+    )
+    log = EpochFinalizer(cfg, scorer_version="scorer-v1").build_log(
+        epoch_id=2,
+        close_block=719,
+        snapshots=snapshots,
+        burn_uid=94,
+        audit_manifest=manifest,
+        now=COMPLETED_AT,
+        competition_result=evidence.result,
+        competition_packet_scores=evidence.packet_scores,
+    )
+    bundle_source = InMemoryBundleSource()
+    for bundle in (*fresh_world.bundles.values(), fresh_world.baseline_bundle):
+        bundle_source.add(bundle)
+    auditor = Auditor(
+        AuditorConfig(auditor_hotkey="auditor-test", tokenomics=cfg, burn_uid=94),
+        bundle_source,
+        chain=fresh_world.anchor_chain,
+    )
+    derived, _reward_window, verdicts = auditor._competition_verdicts(
+        log, fresh_world.store, None, True
+    )
+    assert derived == evidence.result
+    assert verdicts
+    assert all(verdict.verdict is ItemVerdictKind.PASS for verdict in verdicts), [
+        (verdict.verdict, verdict.code, verdict.detail) for verdict in verdicts
+    ]
+
+
+def test_authority_and_auditor_rederive_competition_source_tree_dedup(
+    fresh_world: GoldenWorld,
+) -> None:
+    """One source tree enrolled from two accounts (a fork) is one operator on both
+    sides, whatever the coldkeys, IPs and outputs: only the lowest uid keeps a place."""
+    cfg = TokenomicsConfig(competition_emissions_enabled=True)
+    (tree,) = fresh_world.comp_conn.execute(
+        "SELECT tree_sha FROM contenders WHERE hotkey = ?", ("hk-a",)
+    ).fetchone()
+    fresh_world.comp_conn.execute(
+        "UPDATE contenders SET tree_sha = ?, repo_url = ? WHERE hotkey = ?",
+        (tree, "https://github.com/someone-else/fork", "hk-b"),
+    )
+    fresh_world.comp_conn.commit()
+    census = _competition_census("hk-a", "hk-b")
+    evidence = build_competition_epoch_evidence(
+        fresh_world.comp_conn,
+        census_by_hotkey=census,
+        store=fresh_world.store,
+        tokenomics=cfg,
+        through_time=COMPLETED_AT,
+    )
+    assert evidence is not None
+    by_hotkey = {
+        subject.hotkey: subject
+        for subject in evidence.competition_input.subjects
+        if subject.role == "contender"
+    }
+    assert by_hotkey["hk-a"].tree_sha == by_hotkey["hk-b"].tree_sha
+    assert not by_hotkey["hk-a"].dedup_excluded
+    assert by_hotkey["hk-b"].dedup_excluded
+
+    manifest = build_audit_manifest(
+        evidence.scored_items,
+        store=fresh_world.store,
+        competition_input=evidence.competition_input,
+        commitment_source=_InferenceCommitmentMustNotHandleCompetition(),
+    )
+    snapshots = tuple(
+        replace(miner, coldkey=census[miner.hotkey].coldkey, ip=census[miner.hotkey].ip)
+        for miner in _competition_miners()
+    )
+    log = EpochFinalizer(cfg, scorer_version="scorer-v1").build_log(
+        epoch_id=2,
+        close_block=719,
+        snapshots=snapshots,
+        burn_uid=94,
+        audit_manifest=manifest,
+        now=COMPLETED_AT,
+        competition_result=evidence.result,
+        competition_packet_scores=evidence.packet_scores,
+    )
+    bundle_source = InMemoryBundleSource()
+    for bundle in (*fresh_world.bundles.values(), fresh_world.baseline_bundle):
+        bundle_source.add(bundle)
+    auditor = Auditor(
+        AuditorConfig(auditor_hotkey="auditor-test", tokenomics=cfg, burn_uid=94),
+        bundle_source,
+        chain=fresh_world.anchor_chain,
+    )
+    derived, _reward_window, verdicts = auditor._competition_verdicts(
+        log, fresh_world.store, None, True
+    )
+    assert derived == evidence.result
+    assert all(verdict.verdict is ItemVerdictKind.PASS for verdict in verdicts), [
+        (verdict.verdict, verdict.code, verdict.detail) for verdict in verdicts
+    ]
 
 
 def test_already_applied_cycle_is_not_replayed_or_reopened(

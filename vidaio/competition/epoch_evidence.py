@@ -13,6 +13,7 @@ import contextlib
 import hashlib
 import io
 import json
+import logging
 import math
 import re
 import sqlite3
@@ -32,6 +33,7 @@ from vidaio.audit.store import ArtifactKind, ArtifactRef, AuditStore, backend_ke
 from vidaio.authority.finalizer import ScoredItem
 from vidaio.competition import repository as repo
 from vidaio.competition.item_commitment import (
+    INTERPOLATION_FRAME_FACTOR,
     REMOVAL_MASK_STREAM_INDEX,
     SEALED_REFERENCE_TRACKS,
 )
@@ -39,6 +41,7 @@ from vidaio.competition.economic_result import (
     CompetitionDedupCandidate,
     competition_dedup_losers,
     derive_competition_result,
+    repo_account_key,
 )
 from vidaio.competition.orchestrator.persistence import (
     EVENT_COMMITMENT_ANCHORED,
@@ -46,6 +49,7 @@ from vidaio.competition.orchestrator.persistence import (
 )
 from vidaio.competition.orchestrator.results import competition_cycle, completed_at
 from vidaio.competition.states import Phase
+from vidaio.core.logging import log_fields
 from vidaio.epoch.log import (
     CompetitionRulesInput,
     CompetitionAuditItem,
@@ -65,6 +69,9 @@ _MAX_AUDIT_BUNDLE_BYTES = 4 * 1024 * 1024
 
 class CompetitionEvidenceError(ValueError):
     """Persisted competition state cannot produce a complete auditable result."""
+
+
+logger = logging.getLogger("vidaio.competition.epoch_evidence")
 
 
 @dataclass(frozen=True, slots=True)
@@ -393,6 +400,73 @@ def latest_completed_competition_id(
     return None
 
 
+def _subject_run_seconds(
+    conn: sqlite3.Connection,
+    competition_id: str,
+    contender_id: int,
+    *,
+    batch_timeout_seconds: int,
+    subject_id: str,
+) -> float:
+    """Speed term: the runner-measured ``run.sh`` seconds summed over every batch of
+    one subject. A batch the contender failed (exit, timeout, unsafe output) counts
+    its full effective timeout, so failing fast never buys speed. A completed batch
+    also counts every attempt whose Sandbox was stopped and rerun, up to the time of
+    the run that completed: a solution that brings its own Sandbox down cannot shop
+    for a faster run, and a late platform stop costs at most one more run of that
+    batch. Fails closed on a batch that is not terminal or a completed batch without
+    a measurement."""
+    from vidaio.competition.orchestrator.persistence import (
+        batch_wall_seconds,
+        requeued_attempt_seconds,
+    )
+    from vidaio.competition.runners.errors import SandboxTerminatedError
+
+    rows = conn.execute(
+        "SELECT batch_id, status FROM batches WHERE competition_id = ? AND contender_id = ? ORDER BY batch_index",
+        (competition_id, contender_id),
+    ).fetchall()
+    if not rows:
+        raise CompetitionEvidenceError(f"competition subject {subject_id!r} has no batches to time")
+    walls = batch_wall_seconds(conn, competition_id, contender_id)
+    stopped = requeued_attempt_seconds(
+        conn, competition_id, code=SandboxTerminatedError.code
+    )
+    total = 0.0
+    for row in rows:
+        status = row["status"]
+        if status == "COMPLETED":
+            wall = walls.get(int(row["batch_id"]))
+            if wall is None:
+                raise CompetitionEvidenceError(
+                    f"competition subject {subject_id!r} batch {row['batch_id']} completed "
+                    "without a measured run time; the speed term cannot be priced"
+                )
+            total += float(wall)
+            for attempt in stopped.get(int(row["batch_id"]), ()):
+                total += float(wall) if attempt is None else min(attempt, float(wall))
+        elif status == "FAILED":
+            total += float(batch_timeout_seconds)
+        else:
+            raise CompetitionEvidenceError(
+                f"competition subject {subject_id!r} batch {row['batch_id']} is {status}, not terminal"
+            )
+    return round(total, 3)
+
+
+def _effective_batch_timeout(
+    conn: sqlite3.Connection, competition_id: str, anchored: int
+) -> int:
+    """The anchored batch timeout, raised by the latest execution amendment if any:
+    a failed batch ran under the raised envelope and is charged that."""
+    from vidaio.competition.orchestrator.persistence import latest_execution_amendment
+
+    amended = latest_execution_amendment(conn, competition_id)
+    if amended is None or amended.get("batch_timeout_seconds") is None:
+        return int(anchored)
+    return max(int(anchored), int(amended["batch_timeout_seconds"]))
+
+
 def _performance_rows(
     conn: sqlite3.Connection, competition_id: str, contender_id: int
 ) -> list[sqlite3.Row]:
@@ -486,6 +560,34 @@ def _require_bundle(
             raise CompetitionEvidenceError(
                 f"competition subject {subject_id!r} audit bundle {digest} has "
                 "no valid manifest-bound removal item preimage"
+            )
+    if track == "interpolation":
+        binding = bundle.competition_item
+        expected_interpolation = (
+            int(row["item_index"]),
+            str(row["input_sha256"]),
+            str(row["reference_sha256"]),
+            INTERPOLATION_FRAME_FACTOR,
+            str(row["item_commitment"]),
+        )
+        actual_interpolation = (
+            None
+            if binding is None
+            else (
+                binding.item_index,
+                binding.input_sha256,
+                binding.reference_sha256,
+                binding.frame_factor,
+                binding.item_commitment,
+            )
+        )
+        if (
+            bundle.stage.value != "competition_sealed"
+            or actual_interpolation != expected_interpolation
+        ):
+            raise CompetitionEvidenceError(
+                f"competition subject {subject_id!r} audit bundle {digest} has "
+                "no valid manifest-bound interpolation item preimage"
             )
     if track == "upscaling":
         binding = bundle.competition_item
@@ -787,6 +889,9 @@ def build_competition_epoch_evidence(
             mask_stream_index=(
                 REMOVAL_MASK_STREAM_INDEX if manifest.track == "removal" else None
             ),
+            frame_factor=(
+                INTERPOLATION_FRAME_FACTOR if manifest.track == "interpolation" else None
+            ),
         )
         for row in item_rows
     )
@@ -799,23 +904,34 @@ def build_competition_epoch_evidence(
             f"competition {selected!r} needs exactly {expected_baselines} archived "
             f"baseline(s); found {len(baselines)}"
         )
-    built_contenders = [
+    machine_accepted = [
         record
         for record in contenders
         if not record.is_calibration and record.status == "BUILT"
     ]
-    missing_census = sorted(
-        str(record.hotkey or f"contender-id:{record.contender_id}")
-        for record in built_contenders
-        if not record.hotkey or record.hotkey not in census_by_hotkey
-    )
-    if missing_census:
-        # Silently omitting a machine-accepted contender would let the authority
-        # cherry-pick the ranked field after seeing its scores.  A close-block
-        # identity mismatch is therefore an epoch HOLD, not a smaller podium.
+    if any(not record.hotkey for record in machine_accepted):
         raise CompetitionEvidenceError(
-            f"competition {selected!r} has BUILT contender(s) absent from the "
-            f"close-block census: {missing_census}"
+            f"competition {selected!r} has a BUILT contender without a hotkey"
+        )
+    # A BUILT contender whose hotkey is not registered at the close block has no
+    # payable uid, so it leaves the ranked field.  This is not authority
+    # discretion: the census is the complete close-block metagraph, which every
+    # auditor binds exactly (CENSUS_MISMATCH), so nobody can drop a registered
+    # contender this way.  Holding the whole result instead would let any one
+    # entrant who deregisters (or is pruned) stop the payout for everyone.
+    built_contenders = [
+        record for record in machine_accepted if record.hotkey in census_by_hotkey
+    ]
+    unregistered = sorted(
+        str(record.hotkey)
+        for record in machine_accepted
+        if record.hotkey not in census_by_hotkey
+    )
+    if unregistered:
+        logger.warning(
+            "BUILT contender(s) absent from the close-block census leave the "
+            "competition result",
+            extra=log_fields(competition_id=selected, hotkeys=unregistered),
         )
     included = list(baselines)
     included.extend(
@@ -961,6 +1077,8 @@ def build_competition_epoch_evidence(
                     coldkey=census.coldkey,
                     ip=census.ip,
                     output_digests=tuple(output_digests),
+                    repo_account=repo_account_key(record.repo_url),
+                    tree_sha=record.tree_sha,
                 )
             )
         subjects.append(
@@ -985,6 +1103,21 @@ def build_competition_epoch_evidence(
                 tree_sha=None if record.is_calibration else record.tree_sha,
                 packet_digests=tuple(packet_digests),
                 audit_bundle_digests=tuple(bundle_digests),
+                run_seconds=(
+                    _subject_run_seconds(
+                        conn,
+                        selected,
+                        record.contender_id,
+                        batch_timeout_seconds=_effective_batch_timeout(
+                            conn,
+                            selected,
+                            manifest.sandbox_resources.batch_timeout_seconds,
+                        ),
+                        subject_id=subject_id,
+                    )
+                    if manifest.result_rules is not None and manifest.result_rules.has_speed_term
+                    else None
+                ),
             )
         )
 

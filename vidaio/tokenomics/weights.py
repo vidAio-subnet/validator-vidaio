@@ -20,12 +20,16 @@ _LAUNCH_TRACK_WEIGHTS = {"compression": 0.8, "upscaling": 0.2}
 # emissions, an idle subnet burns. Per-competition rules may override the pot and
 # the split for THEIR window; these pins keep the protocol defaults from drifting
 # through configuration.
-# Exactly two emission profiles are valid; anything in between is configuration drift.
+# Exactly three emission profiles are valid; anything in between is configuration drift.
+#   v4 (mainnet from 2026-10): v3, but a gap with no active result pays 50 % to the
+#       licensing treasury (50 % burns) and an active window keeps 0.5 % for it.
 #   v3 (mainnet from 2026-09-27): inference earns nothing, a result pays 100 %.
 #   v2 (launch, 2026-09-04 .. 09-27): 80/20 idle, 60/40 podium, 10/90 crown, 70/20/10.
 _V3_PROFILE = {
     "idle_inference_share": 0.0,
     "idle_burn_share": 1.0,
+    "idle_treasury_share": 0.0,
+    "window_treasury_share": 0.0,
     "podium_inference_share": 0.0,
     "podium_competition_share": 1.0,
     "crown_inference_share": 0.0,
@@ -38,6 +42,8 @@ _V3_PROFILE = {
 _V2_PROFILE = {
     "idle_inference_share": 0.80,
     "idle_burn_share": 0.20,
+    "idle_treasury_share": 0.0,
+    "window_treasury_share": 0.0,
     "podium_inference_share": 0.60,
     "podium_competition_share": 0.40,
     "crown_inference_share": 0.10,
@@ -47,7 +53,13 @@ _V2_PROFILE = {
     "redistribute_empty_places": False,
     "no_qualifier_closes_window": False,
 }
-EMISSION_PROFILES = {"v3": _V3_PROFILE, "v2": _V2_PROFILE}
+_V4_PROFILE = {
+    **_V3_PROFILE,
+    "idle_burn_share": 0.5,
+    "idle_treasury_share": 0.5,
+    "window_treasury_share": 0.005,
+}
+EMISSION_PROFILES = {"v4": _V4_PROFILE, "v3": _V3_PROFILE, "v2": _V2_PROFILE}
 _LAUNCH_BREAKTHROUGH_MARGIN_FLOOR = 0.05
 
 
@@ -95,7 +107,8 @@ def ensure_locked_levers(config: TokenomicsConfig) -> None:
         raise ValueError(
             "emission shares/splits must match exactly one supported profile "
             "(v3: inference 0, result pays 100 %, 90/4/3/2/1 and 50/24/13/8/5, "
-            "redistribute, close-on-no-qualifier; or the v2 launch profile)"
+            "redistribute, close-on-no-qualifier; v4: v3 with the 50 % gap / 0.5 % "
+            "window licensing-treasury shares; or the v2 launch profile)"
         )
     if config.breakthrough_margin_floor != _LAUNCH_BREAKTHROUGH_MARGIN_FLOOR:
         raise ValueError("breakthrough_margin_floor must stay 0.05 for launch")
@@ -151,6 +164,13 @@ def build_weight_vector(
         if uid is not None:
             vector[uid] += pools.competition * share
 
+    # Tokenomics v4: the licensing treasury's share goes to its registered hotkey; an
+    # unregistered (or unconfigured) treasury leaves it to the canonical sink below.
+    if pools.treasury > 0.0 and config.treasury_hotkey:
+        uid = by_hotkey.get(config.treasury_hotkey)
+        if uid is not None:
+            vector[uid] += pools.treasury
+
     total = sum(vector.values())
     withheld = max(0.0, 1.0 - total)
     if withheld > 1e-12 and burn_uid is None:
@@ -174,6 +194,7 @@ def build_weight_vector(
             inference_pool=pools.inference,
             competition_pool=pools.competition,
             protocol_burn_pool=pools.burn,
+            treasury_pool=pools.treasury,
             miners=len(miners),
             inference_eligible=len(inf_shares),
             allocated_total=total,

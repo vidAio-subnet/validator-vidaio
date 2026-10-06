@@ -133,6 +133,27 @@ class ResultRules(BaseModel):
     #: A result with no qualifying contender closes the running window (burn until
     #: the next result) instead of leaving the previous window untouched.
     no_qualifier_closes_window: bool | None = None
+    # ---- speed term (frame interpolation): a contender's score is its mean item
+    # quality times ``1 - speed_weight + speed_weight * speed_score``, where
+    # ``speed_score = clamp(log(speed_slow_spf / spf) / log(speed_slow_spf /
+    # speed_fast_spf), 0, 1)`` and ``spf`` is the contender's measured ``run.sh`` wall
+    # time summed over every batch, divided by ``speed_inserted_frames`` (all four
+    # fields together, or none). A batch the contender failed counts its full
+    # ``batch_timeout_seconds``. See vidaio/competition/economic_result.py.
+    #: Share of the score that depends on speed: the slowest keep ``1 - weight``.
+    speed_weight: float | None = Field(default=None, gt=0, le=1, allow_inf_nan=False)
+    #: Seconds per inserted frame at (or under) which the speed score is 1.
+    speed_fast_spf: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    #: Seconds per inserted frame at (or over) which the speed score is 0.
+    speed_slow_spf: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    #: Inserted frames over the whole hidden item matrix (sum of N - 1 per item).
+    speed_inserted_frames: int | None = Field(default=None, ge=1)
+
+    _SPEED_FIELDS = ("speed_weight", "speed_fast_spf", "speed_slow_spf", "speed_inserted_frames")
+
+    @property
+    def has_speed_term(self) -> bool:
+        return self.speed_weight is not None
 
     @model_validator(mode="after")
     def _ordered(self) -> "ResultRules":
@@ -141,6 +162,14 @@ class ResultRules(BaseModel):
             and self.podium_min_margin > self.crown_margin
         ):
             raise ValueError("podium_min_margin cannot exceed crown_margin")
+        speed = [getattr(self, name) is not None for name in self._SPEED_FIELDS]
+        if any(speed) and not all(speed):
+            raise ValueError(
+                "speed_weight, speed_fast_spf, speed_slow_spf and speed_inserted_frames "
+                "are set together or not at all"
+            )
+        if all(speed) and not self.speed_fast_spf < self.speed_slow_spf:
+            raise ValueError("speed_fast_spf must be below speed_slow_spf")
         from vidaio.tokenomics.state import _validate_split
 
         for name in ("crown_split", "podium_split"):
@@ -184,7 +213,7 @@ class CompetitionManifest(BaseModel):
 
     manifest_schema_version: Literal[2] = 2
     competition_id: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{2,63}$")
-    track: Literal["compression", "upscaling", "removal"] = "compression"
+    track: Literal["compression", "upscaling", "removal", "interpolation"] = "compression"
 
     # Lifecycle times (all timezone-aware; normalized to UTC on validation):
     #   start_time           SCHEDULED -> ENROLLING (gated on no other running)
@@ -302,10 +331,19 @@ class CompetitionManifest(BaseModel):
             raise ValueError(
                 "allowed_upscale_factors is valid only for the upscaling track"
             )
-        elif self.track == "removal" and not self.evaluation_item_commitments:
-            # The clean reference of a removal item is sealed until completion; only
-            # the precommitted input/reference pairs make the result auditable.
-            raise ValueError("removal manifest requires precommitted evaluation items")
+        if self.result_rules is not None and self.result_rules.has_speed_term:
+            if self.track != "interpolation":
+                raise ValueError("the speed term is defined for the interpolation track only")
+            if self.sandbox_resources is None:
+                raise ValueError(
+                    "the speed term requires anchored sandbox_resources (every contender "
+                    "must be timed on the same envelope; a failed batch counts its timeout)"
+                )
+        if self.track in ("removal", "interpolation") and not self.evaluation_item_commitments:
+            # The clean reference of a removal / interpolation item is sealed until
+            # completion; only the precommitted input/reference pairs make the result
+            # auditable.
+            raise ValueError(f"{self.track} manifest requires precommitted evaluation items")
         elif self.evaluation_item_commitments is not None and not (
             self.evaluation_item_commitments
         ):
@@ -330,6 +368,16 @@ class CompetitionManifest(BaseModel):
         ):
             if payload[field] is None:
                 del payload[field]
+        # The rules block serializes exactly the fields the manifest carries. A field
+        # added to ResultRules later (the v3 payout policy, the speed term) is then
+        # absent from an older manifest's canonical bytes, as it was when that manifest
+        # was anchored: sn85-compression-001c (no policy fields) and sn85-removal-002
+        # (policy fields, some explicitly null) both reproduce their anchored digests.
+        if self.result_rules is not None:
+            carried = self.result_rules.model_fields_set
+            payload["result_rules"] = {
+                key: value for key, value in payload["result_rules"].items() if key in carried
+            }
         return json.dumps(
             payload,
             sort_keys=True,
@@ -371,7 +419,7 @@ def validate_against_config(manifest: CompetitionManifest, cfg: CompetitionConfi
         )
     if (
         cfg.require_item_commitments
-        and manifest.track in ("compression", "removal")
+        and manifest.track in ("compression", "removal", "interpolation")
         and not manifest.evaluation_item_commitments
     ):
         raise ManifestBoundsError(

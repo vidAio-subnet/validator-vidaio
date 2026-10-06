@@ -718,9 +718,9 @@ def build_golden_world(root: Path, *, manifest_overrides: dict | None = None) ->
             comp_conn,
             COMPETITION_ID,
             hotkey=hk,
-            repo_url=f"https://github.com/miners/{hk}",
+            repo_url=f"https://github.com/{hk}/solution",
             commit_sha="d" * 40,
-            tree_sha="e" * 40,
+            tree_sha={"hk-a": "e", "hk-b": "f"}[hk] * 40,
             stake=1000.0,
             now=START + timedelta(minutes=5),
         )

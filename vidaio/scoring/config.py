@@ -23,6 +23,7 @@ from pydantic import BaseModel, Field, model_validator
 TRACK_COMPRESSION = "compression"
 TRACK_UPSCALING = "upscaling"
 TRACK_REMOVAL = "removal"
+TRACK_INTERPOLATION = "interpolation"
 
 #: Tolerance for weight-sum checks — weights that must partition 1.0 may carry float
 #: representation error (0.3 + 0.3 + 0.4 == 0.9999999999999999), nothing more.
@@ -98,6 +99,24 @@ class RemovalWeights(BaseModel):
         return self
 
 
+class InterpolationWeights(BaseModel):
+    """Weights of the three scored terms of the frame-interpolation formula (0.3 / 0.3 / 0.4)."""
+
+    psnr: float = 0.3
+    ssim: float = 0.3
+    lpips: float = 0.4
+
+    @model_validator(mode="after")
+    def _finite(self) -> "InterpolationWeights":
+        _require_unit_interval("interpolation_weights.psnr", self.psnr)
+        _require_unit_interval("interpolation_weights.ssim", self.ssim)
+        _require_unit_interval("interpolation_weights.lpips", self.lpips)
+        total = self.psnr + self.ssim + self.lpips
+        if abs(total - 1.0) > _WEIGHT_SUM_TOLERANCE:
+            raise ValueError(f"interpolation_weights must sum to 1.0, got {total!r}")
+        return self
+
+
 class ScoringConfig(BaseModel):
     # --- gates -------------------------------------------------------------
     #: Upscaling VMAF pass/fail gate on the vmaf/100 scale (< 0.5 -> score 0).
@@ -151,6 +170,18 @@ class ScoringConfig(BaseModel):
     #: Bounds the per-candidate cost at 1080p+ and keeps the input at the scale LPIPS was
     #: calibrated on; 0 disables the bound.
     removal_lpips_max_side: int = 256
+    # --- frame-interpolation track (vidaio/scoring/interpolation.py) ------------------
+    interpolation_weights: InterpolationWeights = Field(default_factory=InterpolationWeights)
+    #: dB of PSNR above the hold/blend floor that maps to s_psnr = 1
+    interpolation_psnr_span_db: float = 8.0
+    #: the input frames must come back unchanged at the even output positions: max
+    #: per-frame mean abs RGB difference (8-bit units) tolerated, else KEPT_FRAMES_MODIFIED
+    interpolation_kept_tolerance: float = 3.0
+    #: LPIPS is evaluated on every k-th inserted frame (cost control; PSNR/SSIM on all)
+    interpolation_lpips_stride: int = 4
+    #: frames are downscaled (INTER_AREA, all sides identically) so the long side is at
+    #: most this before LPIPS-VGG; bounds the per-candidate cost at 1080p+; 0 disables
+    interpolation_lpips_max_side: int = 512
     #: Width (in VMAF points) of the sub-threshold band the compression spec calls out
     #: (``vmaf < threshold - 5 -> 0``). See vidaio/scoring/compression.py for the
     #: documented reading of scores inside the band.
@@ -196,6 +227,8 @@ class ScoringConfig(BaseModel):
             "removal_warp_cap_factor": self.removal_warp_cap_factor,
             "removal_warp_floor": self.removal_warp_floor,
             "removal_outside_tolerance": self.removal_outside_tolerance,
+            "interpolation_psnr_span_db": self.interpolation_psnr_span_db,
+            "interpolation_kept_tolerance": self.interpolation_kept_tolerance,
         }
         for name, value in scalars.items():
             _require_finite_config(name, value)
@@ -211,6 +244,24 @@ class ScoringConfig(BaseModel):
             if value < 0.0 or (strictly and value == 0.0):
                 bound = "> 0" if strictly else ">= 0"
                 raise ValueError(f"{name} must be {bound}, got {value!r}")
+        # frame interpolation: a zero span divides by zero; a negative tolerance would
+        # reject every output
+        if self.interpolation_psnr_span_db <= 0.0:
+            raise ValueError(
+                f"interpolation_psnr_span_db must be > 0, got {self.interpolation_psnr_span_db!r}"
+            )
+        if self.interpolation_kept_tolerance < 0.0:
+            raise ValueError(
+                f"interpolation_kept_tolerance must be >= 0, got {self.interpolation_kept_tolerance!r}"
+            )
+        if self.interpolation_lpips_stride < 1:
+            raise ValueError(
+                f"interpolation_lpips_stride must be >= 1, got {self.interpolation_lpips_stride!r}"
+            )
+        if self.interpolation_lpips_max_side < 0:
+            raise ValueError(
+                f"interpolation_lpips_max_side must be >= 0, got {self.interpolation_lpips_max_side!r}"
+            )
         if self.removal_lpips_stride < 1:
             raise ValueError(f"removal_lpips_stride must be >= 1, got {self.removal_lpips_stride!r}")
         if self.removal_lpips_max_side < 0:

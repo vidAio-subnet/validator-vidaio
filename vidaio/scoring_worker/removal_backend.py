@@ -91,6 +91,11 @@ class CpuRemovalBackend:
         if self._lpips_enabled and self._lpips is None:
             self._lpips = LpipsVgg()
 
+    def lpips_net(self) -> LpipsVgg | None:
+        """The loaded LPIPS-VGG network (loading it on first use), for sharing."""
+        self.preload()
+        return self._lpips
+
     def measure(
         self,
         *,

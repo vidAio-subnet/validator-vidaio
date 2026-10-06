@@ -100,6 +100,14 @@ from prometheus_client import CollectorRegistry, Counter, Histogram
 
 from vidaio.audit.canonical import canonical_json_bytes, sha256_hex
 from vidaio.core import log_fields, section
+from vidaio.scoring.interpolation_formula import INTERPOLATION_FRAME_FACTOR
+from vidaio.scoring_worker.interpolation_backend import (
+    CpuInterpolationBackend,
+    InterpolationCancelled,
+    InterpolationInputError,
+    InterpolationMeasurementError,
+    InterpolationMetricsBackend,
+)
 from vidaio.scoring_worker.removal_backend import (
     CpuRemovalBackend,
     RemovalCancelled,
@@ -111,6 +119,7 @@ from vidaio.scoring import (
     TRACK_COMPRESSION,
     TRACK_UPSCALING,
     TRACK_REMOVAL,
+    TRACK_INTERPOLATION,
     GateContext,
     MediaInfo,
     PerceptualCheckBackend,
@@ -123,6 +132,7 @@ from vidaio.scoring import (
     build_canonicalization_plan,
     compose_item_score,
     score_removal,
+    score_interpolation,
     default_pipeline,
     derive_pieapp_start_frame,
     pipeline_without_perceptual_checks,
@@ -188,7 +198,7 @@ from vidaio.scoring_worker.runtime_identity import (
 from vidaio.services.base import BaseService
 from vidaio.services.protocol import ScoreRequest, ScoreResponse
 
-_TRACKS = (TRACK_COMPRESSION, TRACK_UPSCALING, TRACK_REMOVAL)
+_TRACKS = (TRACK_COMPRESSION, TRACK_UPSCALING, TRACK_REMOVAL, TRACK_INTERPOLATION)
 
 # Bump whenever scoring semantics change without a ScoringConfig field changing.
 # v2: VMAF model-delta pair moved from pristine-reference to miner-input basis.
@@ -225,6 +235,9 @@ class ScoringBackends:
     #: Object-removal region metrics (vidaio/scoring_worker/removal_backend.py);
     #: None = track not configured (a removal request then gets an honest 501).
     removal: RemovalMetricsBackend | None = None
+    #: Frame-interpolation metrics (vidaio/scoring_worker/interpolation_backend.py);
+    #: None = track not configured (an interpolation request then gets an honest 501).
+    interpolation: InterpolationMetricsBackend | None = None
     #: Stamped into every packet (probed once at composition time, spec §08).
     versions: Mapping[str, str] = field(default_factory=dict)
     #: Complete executable-runtime preimage for the ``versions["runtime"]``
@@ -282,6 +295,8 @@ def real_backends(
     )
     perceptual = CpuPerceptualCheckBackend(config.perceptual_cpu)
     removal_backend = CpuRemovalBackend(config.ffmpeg_path)
+    # one LPIPS-VGG network per worker thread, shared by the removal and interpolation tracks
+    interpolation_backend = CpuInterpolationBackend(lpips_loader=removal_backend.lpips_net)
     versions = complete_payout_backend_versions(
         versions,
         pieapp=pieapp,
@@ -301,6 +316,7 @@ def real_backends(
         pieapp=pieapp,
         perceptual=perceptual,
         removal=removal_backend,
+        interpolation=interpolation_backend,
         canonicalizer=CanonicalizeExecutor(
             config.ffmpeg_path, timeout=config.subprocess_timeout
         ),
@@ -714,7 +730,7 @@ def _score_in_dir(
     vmaf_primary: float | None = None
     vmaf_delta_primary: float | None = None
     vmaf_delta_secondary: float | None = None
-    if dims_match and request.track != TRACK_REMOVAL:
+    if dims_match and request.track not in (TRACK_REMOVAL, TRACK_INTERPOLATION):
         # Round-4 an internal review: each VMAF run's JSON log is hard-bounded to the
         # per-run share of the metric-log reservation taken above — the same
         # watchdog that bounds a canonicalization kills the run past it. Blown
@@ -869,6 +885,77 @@ def _score_in_dir(
                     ),
                 ]
 
+    # 5e) Frame interpolation: the inserted frames vs the sealed reference, the hold/blend
+    #     floor, and the kept-frame identity check (vidaio/scoring/interpolation.py).
+    interpolation_measurement = None
+    if request.track == TRACK_INTERPOLATION and dims_match:
+        # (geometry or frame-count mismatches already carry their violation and are zeroed
+        # by the gates; measuring them would only raise inside the metrics)
+        if backends.interpolation is None:
+            raise NotConfiguredError("interpolation metrics backend is not configured")
+        frame_factor = _param_int(params, "frame_factor")
+        if frame_factor not in (None, INTERPOLATION_FRAME_FACTOR):
+            raise ScoreRejected(
+                422,
+                {
+                    "error": "interpolation_frame_factor_unsupported",
+                    "detail": f"frame_factor {frame_factor} (supported: {INTERPOLATION_FRAME_FACTOR})",
+                },
+            )
+        lpips_stride = max(1, int(scoring_config.interpolation_lpips_stride))
+        # Which inserted frames LPIPS samples is derived from the HELD-OUT reference
+        # digest (verifier-recomputable, not miner-predictable), like removal's sample.
+        lpips_offset = (
+            derive_pieapp_start_frame(snapshot.reference.digest, request.challenge_id, lpips_stride)
+            if lpips_stride > 1
+            else 0
+        )
+        frame_count_ok = not any(
+            v.code == ReasonCode.FRAME_COUNT_MISMATCH for v in extra_violations
+        )
+        scope = current_process_scope()
+        if frame_count_ok:
+            try:
+                interpolation_measurement = backends.interpolation.measure(
+                    canonical_reference=canon_ref,
+                    canonical_candidate=canon_cand,
+                    canonical_input=canon_input,
+                    config=scoring_config,
+                    lpips_offset=lpips_offset,
+                    cancelled=(lambda: scope.cancelled) if scope else None,
+                    # the floor depends only on the verified reference + served input
+                    floor_key=(snapshot.reference.digest, snapshot.miner_input.digest),
+                )
+            except InterpolationCancelled as exc:
+                raise MediaWorkCancelled(str(exc)) from exc
+            except InterpolationInputError as exc:
+                # validator-side: reference / served input unusable — not the miner's
+                # doing, so refuse (the authority skips the item, never a zero)
+                raise ScoreRejected(
+                    422, {"error": "interpolation_input_unmeasurable", "detail": str(exc)[:300]}
+                ) from exc
+            except InterpolationMeasurementError as exc:
+                extra_violations = [
+                    *extra_violations,
+                    ValidityViolation(code=ReasonCode.METRIC_MISSING, detail=str(exc)[:300]),
+                ]
+        if (
+            interpolation_measurement is not None
+            and interpolation_measurement.kept_change
+            > scoring_config.interpolation_kept_tolerance
+        ):
+            extra_violations = [
+                *extra_violations,
+                ValidityViolation(
+                    code=ReasonCode.KEPT_FRAMES_MODIFIED,
+                    detail=(
+                        f"max per-frame mean abs change of the input frames "
+                        f"{interpolation_measurement.kept_change:.3f} > "
+                        f"{scoring_config.interpolation_kept_tolerance}"
+                    ),
+                ),
+            ]
+
     # 6) Gates, then composition (gates-first zeroing lives in compose_item_score).
     #    perceptual_checks="skip" swaps the three backend-driven perceptual gates
     #    for auditable GateSkip records (config.py); "required" runs them for real
@@ -970,6 +1057,32 @@ def _score_in_dir(
         )
         if breakdown.zero_reason:
             metrics["removal_zero_reason"] = breakdown.zero_reason
+    elif request.track == TRACK_INTERPOLATION and interpolation_measurement is not None:
+        measured = interpolation_measurement
+        breakdown = score_interpolation(
+            metrics=measured.metrics, floor=measured.floor, config=scoring_config
+        )
+        metrics.update(
+            {
+                "interp_psnr_db": breakdown.psnr_db,
+                "interp_ssim": breakdown.ssim,
+                "interp_lpips_vgg": breakdown.lpips_vgg,
+                "interp_floor_psnr_db": breakdown.floor_psnr_db,
+                "interp_floor_ssim": breakdown.floor_ssim,
+                "interp_floor_lpips_vgg": breakdown.floor_lpips_vgg,
+                "interp_hold_psnr_db": measured.hold.psnr_db,
+                "interp_hold_ssim": measured.hold.ssim,
+                "interp_hold_lpips_vgg": measured.hold.lpips_vgg,
+                "interp_blend_psnr_db": measured.blend.psnr_db,
+                "interp_blend_ssim": measured.blend.ssim,
+                "interp_blend_lpips_vgg": measured.blend.lpips_vgg,
+                "interp_kept_change": measured.kept_change,
+                "interp_inserted_frames": breakdown.inserted_frames,
+                "interp_input_frames": measured.input_frames,
+                "lpips_offset": measured.lpips_offset,
+                "final_score": breakdown.final,
+            }
+        )
     elif request.track == TRACK_UPSCALING and pieapp_value is not None:
         content_length = _param_float(params, "content_length")
         if content_length is None:

@@ -67,7 +67,7 @@ PROTOCOL_TRACKS: frozenset[str] = frozenset(TRACK_RULES)
 #: object-removal track.  Competition payouts follow the committed competition result,
 #: never the inference track pools, so a competition ref's committed track is checked
 #: against this set (and against its competition's own track) instead.
-COMPETITION_TRACKS: frozenset[str] = PROTOCOL_TRACKS | frozenset({"removal"})
+COMPETITION_TRACKS: frozenset[str] = PROTOCOL_TRACKS | frozenset({"removal", "interpolation"})
 GIT_SHA1_HEX_PATTERN = r"^[0-9a-f]{40}$"
 
 #: Bump on ANY change to the EpochLog canonical-JSON shape (it changes every
@@ -487,6 +487,9 @@ class CompetitionAuditItem(BaseModel):
     #: Object removal: the served input's mask stream (bound by the item commitment).
     #: Omitted from canonical bytes when absent, so earlier logs keep their bytes.
     mask_stream_index: Literal[1] | None = None
+    #: Frame interpolation: output frames per input frame interval (bound by the item
+    #: commitment). Omitted from canonical bytes when absent, like ``mask_stream_index``.
+    frame_factor: Literal[2] | None = None
 
     def _canonical_obj(self) -> dict[str, Any]:
         obj: dict[str, Any] = {
@@ -503,6 +506,8 @@ class CompetitionAuditItem(BaseModel):
         }
         if self.mask_stream_index is not None:
             obj["mask_stream_index"] = self.mask_stream_index
+        if self.frame_factor is not None:
+            obj["frame_factor"] = self.frame_factor
         return obj
 
 
@@ -535,6 +540,12 @@ class CompetitionAuditSubject(BaseModel):
     tree_sha: str | None = Field(default=None, pattern=GIT_SHA1_HEX_PATTERN)
     packet_digests: tuple[str, ...] = Field(min_length=1)
     audit_bundle_digests: tuple[str, ...] = Field(min_length=1)
+    #: Speed term only: the runner-measured ``run.sh`` wall seconds summed over the
+    #: subject's batches (a batch the subject failed counts its full anchored
+    #: timeout). Attested by the authority, which ran the sandboxes; the auditor
+    #: re-derives the score from it but cannot re-measure it. Omitted from canonical
+    #: bytes when absent.
+    run_seconds: float | None = Field(default=None, ge=0, allow_inf_nan=False)
 
     @model_validator(mode="after")
     def _identity_and_pairs(self) -> "CompetitionAuditSubject":
@@ -608,6 +619,7 @@ class CompetitionAuditSubject(BaseModel):
             "tree_sha": self.tree_sha,
             "packet_digests": list(self.packet_digests),
             "audit_bundle_digests": list(self.audit_bundle_digests),
+            **({} if self.run_seconds is None else {"run_seconds": self.run_seconds}),
         }
 
 
@@ -636,6 +648,16 @@ class CompetitionRulesInput(BaseModel):
     podium_split: tuple[float, ...] | None = None
     redistribute_empty_places: bool | None = None
     no_qualifier_closes_window: bool | None = None
+    # Speed term (frame interpolation). Same omission rule: absent from canonical
+    # bytes unless the anchored manifest carries it.
+    speed_weight: float | None = Field(default=None, gt=0, le=1, allow_inf_nan=False)
+    speed_fast_spf: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    speed_slow_spf: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    speed_inserted_frames: int | None = Field(default=None, ge=1)
+
+    @property
+    def has_speed_term(self) -> bool:
+        return self.speed_weight is not None
 
     @model_validator(mode="after")
     def _ordered(self) -> "CompetitionRulesInput":
@@ -651,7 +673,14 @@ class CompetitionRulesInput(BaseModel):
                 object.__setattr__(self, name, _validate_split(name, getattr(self, name)))
             except ValueError as exc:
                 raise EpochLogInvalid(str(exc)) from exc
+        speed = [getattr(self, name) is not None for name in self._SPEED_FIELDS]
+        if any(speed) and not all(speed):
+            raise EpochLogInvalid("the speed term fields are set together or not at all")
+        if all(speed) and not self.speed_fast_spf < self.speed_slow_spf:
+            raise EpochLogInvalid("speed_fast_spf must be below speed_slow_spf")
         return self
+
+    _SPEED_FIELDS = ("speed_weight", "speed_fast_spf", "speed_slow_spf", "speed_inserted_frames")
 
     _POLICY_FIELDS = (
         "crown_competition_share",
@@ -669,7 +698,7 @@ class CompetitionRulesInput(BaseModel):
             "podium_min_margin": self.podium_min_margin,
             "podium_min_score": self.podium_min_score,
         }
-        for name in self._POLICY_FIELDS:
+        for name in self._POLICY_FIELDS + self._SPEED_FIELDS:
             value = getattr(self, name)
             if value is not None:
                 obj[name] = list(value) if isinstance(value, tuple) else value
@@ -688,7 +717,7 @@ class CompetitionInput(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     competition_id: str = Field(min_length=1)
-    track: Literal["compression", "upscaling", "removal"]
+    track: Literal["compression", "upscaling", "removal", "interpolation"]
     cycle: int = Field(ge=1)
     completed_at: datetime
     applied_at: datetime
@@ -757,6 +786,18 @@ class CompetitionInput(BaseModel):
         subject_ids = [subject.subject_id for subject in self.subjects]
         if len(set(subject_ids)) != len(subject_ids):
             raise EpochLogInvalid("competition audit subject_id values must be unique")
+        timed = self.rules is not None and self.rules.has_speed_term
+        for subject in self.subjects:
+            if timed and subject.run_seconds is None:
+                raise EpochLogInvalid(
+                    f"competition subject {subject.subject_id!r} has no measured run time "
+                    "but the anchored rules carry a speed term"
+                )
+            if not timed and subject.run_seconds is not None:
+                raise EpochLogInvalid(
+                    f"competition subject {subject.subject_id!r} carries a run time the "
+                    "anchored rules do not price"
+                )
         contenders = [
             subject for subject in self.subjects if subject.role == "contender"
         ]
@@ -848,9 +889,10 @@ class CompetitionInput(BaseModel):
                         f"upscaling competition item {expected_index} has incomplete "
                         "target geometry"
                     )
-                if item.mask_stream_index is not None:
+                if item.mask_stream_index is not None or item.frame_factor is not None:
                     raise EpochLogInvalid(
-                        f"upscaling competition item {expected_index} carries a mask stream"
+                        f"upscaling competition item {expected_index} carries a mask "
+                        "stream or frame factor"
                     )
         elif self.track == "removal":
             for expected_index, item in enumerate(self.items):
@@ -883,8 +925,46 @@ class CompetitionInput(BaseModel):
                         f"removal competition item {expected_index} carries upscaling "
                         "factor/geometry"
                     )
+                if item.frame_factor is not None:
+                    raise EpochLogInvalid(
+                        f"removal competition item {expected_index} carries a frame factor"
+                    )
+        elif self.track == "interpolation":
+            for expected_index, item in enumerate(self.items):
+                if item.item_index != expected_index:
+                    raise EpochLogInvalid(
+                        "interpolation competition audit items must cover ordered indices "
+                        f"0..N-1; expected {expected_index}, got {item.item_index}"
+                    )
+                if (
+                    item.input_sha256 is None
+                    or item.reference_sha256 is None
+                    or item.frame_factor is None
+                    or item.item_commitment is None
+                ):
+                    raise EpochLogInvalid(
+                        f"interpolation competition item {expected_index} lacks its "
+                        "reference/input/frame-factor commitment preimage"
+                    )
+                if item.input_sha256 == item.reference_sha256:
+                    raise EpochLogInvalid(
+                        f"interpolation competition item {expected_index} aliases "
+                        "reference and miner input"
+                    )
+                if (
+                    item.upscale_factor is not None
+                    or item.target_width is not None
+                    or item.target_height is not None
+                    or item.mask_stream_index is not None
+                ):
+                    raise EpochLogInvalid(
+                        f"interpolation competition item {expected_index} carries upscaling "
+                        "factor/geometry or a mask stream"
+                    )
         elif any(item.mask_stream_index is not None for item in self.items):
             raise EpochLogInvalid("only removal competition items carry a mask stream")
+        elif any(item.frame_factor is not None for item in self.items):
+            raise EpochLogInvalid("only interpolation competition items carry a frame factor")
         return self
 
     def _canonical_obj(self) -> dict[str, Any]:
@@ -1590,6 +1670,11 @@ class EpochLog(BaseModel):
     #: cross-subsidising an empty/below-floor pool.  It is also the sole recipient in a
     #: genuinely empty epoch and is always exempt from measurement-evidence coverage.
     burn_uid: int | None = None
+    #: Tokenomics v4: the licensing-treasury hotkey whose zero-score carrier row this
+    #: epoch pays by policy (half of a gap, 0.5 % of a window). Auditors bind it to their
+    #: own tokenomics config. Omitted from canonical bytes when absent, so earlier logs
+    #: keep their bytes.
+    treasury_hotkey: str | None = None
     #: v17 (owner D-025): the inference payout floor the finalizer APPLIED —
     #: ``tokenomics.payout_min_alpha_stake``, alpha on the hotkey at ``close_block``.
     #: Archived so an auditor re-derives this vector from the log alone; a later
@@ -1969,6 +2054,14 @@ class EpochLog(BaseModel):
             for miner in self.miners
             if miner.hotkey in reward_hotkeys and miner.accumulate_score <= 0.0
         )
+        # Tokenomics v4: the declared licensing treasury is paid by policy (auditors bind
+        # the hotkey to their own config and re-derive the share), never by an EWMA fold.
+        if self.treasury_hotkey:
+            competition_backed_uids.update(
+                miner.uid
+                for miner in self.miners
+                if miner.hotkey == self.treasury_hotkey and miner.accumulate_score <= 0.0
+            )
         for uid, weight in self.weight_shares.items():
             if weight <= 0.0 or uid == self.burn_uid:
                 continue
@@ -2033,6 +2126,7 @@ class EpochLog(BaseModel):
             "prior_log_digest": self.prior_log_digest,
             "gap_epochs": list(self.gap_epochs),
             "burn_uid": self.burn_uid,
+            **({"treasury_hotkey": self.treasury_hotkey} if self.treasury_hotkey else {}),
             "payout_min_alpha_stake": self.payout_min_alpha_stake,
             "competition_result": _competition_obj(self.competition_result),
             "reward_window_state": _reward_window_obj(
@@ -2113,6 +2207,7 @@ class EpochLog(BaseModel):
             "prior_log_digest",
             "gap_epochs",
             "burn_uid",
+            "treasury_hotkey",
             "competition_result",
             "reward_window_state",
             "miner_census",
@@ -2351,6 +2446,7 @@ class EpochLog(BaseModel):
                         target_height=item.get("target_height"),
                         item_commitment=item.get("item_commitment"),
                         mask_stream_index=item.get("mask_stream_index"),
+                        frame_factor=item.get("frame_factor"),
                     )
                     for item in competition_input_obj.get("items", [])
                 ),
@@ -2376,6 +2472,11 @@ class EpochLog(BaseModel):
                         packet_digests=tuple(subject.get("packet_digests", [])),
                         audit_bundle_digests=tuple(
                             subject.get("audit_bundle_digests", [])
+                        ),
+                        run_seconds=(
+                            None
+                            if subject.get("run_seconds") is None
+                            else float(subject["run_seconds"])
                         ),
                     )
                     for subject in competition_input_obj.get("subjects", [])
@@ -2443,6 +2544,7 @@ class EpochLog(BaseModel):
             prior_log_digest=obj.get("prior_log_digest"),
             gap_epochs=tuple(int(g) for g in obj["gap_epochs"]),
             burn_uid=obj["burn_uid"],
+            treasury_hotkey=obj.get("treasury_hotkey"),
             payout_min_alpha_stake=float(obj.get("payout_min_alpha_stake", 0.0)),
             competition_result=_competition_from_obj(obj["competition_result"]),
             reward_window_state=_reward_window_from_obj(obj["reward_window_state"]),

@@ -24,6 +24,8 @@ from vidaio.competition.runners.errors import (
     OversizeOutputError,
     RunnerUnavailableError,
     SandboxIsolationError,
+    SandboxTerminatedError,
+    SolutionExitError,
     UnknownImageError,
 )
 from vidaio.competition.runners.modal_runner import (
@@ -61,12 +63,15 @@ class _Image:
 
 
 class _Process:
-    def __init__(self, stdout: bytes, *, returncode: int = 0) -> None:
+    def __init__(self, stdout: bytes, *, returncode: int = 0, on_exit=None) -> None:
         self.stdout = [stdout]
         self.stderr: list[bytes] = []
         self._returncode = returncode
+        self._on_exit = on_exit
 
     def poll(self) -> int:
+        if self._on_exit is not None:
+            self._on_exit()
         return self._returncode
 
 
@@ -85,6 +90,7 @@ class _Lease:
         self.directories: set[str] = {"/", "/tmp"}
         self.terminated = 0
         self.detached = 0
+        self.solution_exited = False
 
     def attestation(self) -> SandboxRequestAttestation:
         return SandboxRequestAttestation(
@@ -115,6 +121,14 @@ class _Lease:
                     "ENV_END\nPROBE_DONE=1\n"
                 ).encode()
             )
+        if list(args[:2]) == ["du", "-sxb"]:
+            self.runtime.du_calls.append(tuple(args))
+            total = (
+                b""
+                if self.runtime.du_returncode
+                else f"{self.runtime.image_bytes}\t{args[2]}\n".encode()
+            )
+            return _Process(total, returncode=self.runtime.du_returncode)
         if "input-overlay-check" in " ".join(args):
             return _Process(
                 (
@@ -141,9 +155,15 @@ class _Lease:
                     "file",
                     data[: self.runtime.output_bytes],
                 )
-        return _Process(self.runtime.solution_log, returncode=self.runtime.returncode)
+        return _Process(
+            self.runtime.solution_log,
+            returncode=self.runtime.returncode,
+            on_exit=lambda: setattr(self, "solution_exited", True),
+        )
 
     def list_files(self, path: str) -> Sequence[RemoteFile]:
+        if self.runtime.sandbox_gone_after_exit and self.solution_exited:
+            raise RuntimeError("Sandbox has been terminated")
         root = PurePosixPath(path)
         entries: list[RemoteFile] = []
         for remote, (kind, data) in sorted(self.files.items()):
@@ -198,10 +218,14 @@ class _Runtime:
         self.output_kind = "file"
         self.solution_log = b"solution complete\n"
         self.returncode = 0
+        self.sandbox_gone_after_exit = False
         self.bad_network_attestation = False
         self.restored_image_ids: list[str] = []
         self.probe_input_write = "1"
         self.probe_overlay_mutated = "0"
+        self.image_bytes = 5_000_000_000
+        self.du_returncode = 0
+        self.du_calls: list[tuple[str, ...]] = []
 
     def available(self) -> bool:
         return not self.closed
@@ -210,7 +234,7 @@ class _Runtime:
         self, checkout: Path, dockerfile: Path
     ) -> tuple[object, str]:
         assert dockerfile == checkout / "Dockerfile"
-        return object(), "im-fresh-0001"
+        return _Image({"app/run.sh": ("file", b"#!/bin/sh\n")}), "im-fresh-0001"
 
     def restore_contender_image(self, image_object_id: str) -> tuple[object, str]:
         self.restored_image_ids.append(image_object_id)
@@ -647,6 +671,39 @@ def test_batch_requires_live_owned_image_and_passed_probe(tmp_path: Path):
         runner.run_batch("f" * 64, [item], 0)
     digest = runner.build(spec)
     with pytest.raises(SandboxIsolationError, match="has not passed"):
+        runner.run_batch(digest, [item], 0)
+
+
+def test_a_signal_exit_whose_sandbox_is_gone_is_a_terminated_sandbox(tmp_path: Path):
+    """A platform stop (preemption) kills run.sh by signal and takes the Sandbox with it."""
+    runtime = _Runtime()
+    runtime.returncode = 143
+    runtime.sandbox_gone_after_exit = True
+    runner, spec = _make_runner(
+        tmp_path, runtime, output_poll_seconds=0.001, liveness_probe_seconds=0
+    )
+    digest = runner.build(spec)
+    assert runner.isolation_probe(digest).passed
+    item = _stage(runner, b"preempted")
+    with pytest.raises(SandboxTerminatedError, match="exit 143") as stopped:
+        runner.run_batch(digest, [item], 0)
+    assert not any(runner.outputs_dir.iterdir())
+    # the stopped attempt's run time travels with the error (a timed competition
+    # charges it), measured up to the observed exit, not the liveness probes
+    assert stopped.value.wall_seconds is not None and stopped.value.wall_seconds >= 0
+
+
+def test_a_signal_exit_inside_a_live_sandbox_stays_the_solutions_fault(tmp_path: Path):
+    """E.g. the solution was OOM-killed while its Sandbox kept running."""
+    runtime = _Runtime()
+    runtime.returncode = 137
+    runner, spec = _make_runner(
+        tmp_path, runtime, output_poll_seconds=0.001, liveness_probe_seconds=0
+    )
+    digest = runner.build(spec)
+    assert runner.isolation_probe(digest).passed
+    item = _stage(runner, b"oom")
+    with pytest.raises(SolutionExitError, match="exited 137"):
         runner.run_batch(digest, [item], 0)
 
 
@@ -1142,3 +1199,52 @@ def test_output_watchdog_rescans_when_the_root_listing_races_a_vanishing_child(
 
     assert runner._remote_tree_usage(lease, "/output") == (77, 1)  # noqa: SLF001
     assert lease.root_scans == 2
+
+
+def test_a_built_image_is_measured_by_a_trusted_sandbox_within_the_cap(tmp_path: Path):
+    runtime = _Runtime()
+    runner, spec = _make_runner(
+        tmp_path, runtime, output_poll_seconds=0.001, max_image_bytes=20_000_000_000
+    )
+    digest = runner.build(spec)
+    assert digest
+    # the image was mounted into a CPU collector (our tools), never executed
+    (call,) = runtime.du_calls
+    assert call == ("du", "-sxb", "/vidaio-contender-image")
+    (lease,) = [lease for lease in runtime.leases if lease.mounts == ["/vidaio-contender-image"]]
+    assert lease.request.gpu is None and lease.request.block_network
+    assert lease.terminated >= 1
+
+
+def test_an_image_over_the_cap_fails_the_contenders_build(tmp_path: Path):
+    from vidaio.competition.runners.errors import ContenderBuildError, ImageOversizeError
+
+    runtime = _Runtime()
+    runtime.image_bytes = 31_400_000_000
+    runner, spec = _make_runner(
+        tmp_path, runtime, output_poll_seconds=0.001, max_image_bytes=25_000_000_000
+    )
+    with pytest.raises(ImageOversizeError, match="31.40 GB, over this competition's") as err:
+        runner.build(spec)
+    assert isinstance(err.value, ContenderBuildError)
+    assert err.value.code == "IMAGE_OVERSIZE"
+
+
+def test_an_unmeasurable_image_is_our_failure_not_the_contenders(tmp_path: Path):
+    from vidaio.competition.runners.errors import BuildError, ContenderBuildError
+
+    runtime = _Runtime()
+    runtime.du_returncode = 1
+    runner, spec = _make_runner(
+        tmp_path, runtime, output_poll_seconds=0.001, max_image_bytes=25_000_000_000
+    )
+    with pytest.raises(BuildError, match="image size measurement failed") as err:
+        runner.build(spec)
+    assert not isinstance(err.value, ContenderBuildError)
+
+
+def test_without_a_cap_no_image_is_measured(tmp_path: Path):
+    runtime = _Runtime()
+    runner, spec = _make_runner(tmp_path, runtime, output_poll_seconds=0.001)
+    runner.build(spec)
+    assert runtime.du_calls == []

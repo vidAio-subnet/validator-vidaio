@@ -121,6 +121,17 @@ class BuildTimeout(ContenderBuildError):
     code = "BUILD_TIMEOUT"
 
 
+class ImageOversizeError(ContenderBuildError):
+    """CONTENDER: the built image holds more than the competition's anchored
+    ``container_size_limit_gb`` (or has too many files to be measured in time).
+
+    Measured by the runner's own tools in a trusted Sandbox that mounts the image,
+    so no contender binary reports its own size. BUILD_FAILED, competition continues.
+    """
+
+    code = "IMAGE_OVERSIZE"
+
+
 class BatchExecutionError(SandboxRunnerError):
     """INFRA: the batch could not be run/collected for a reason outside the
     contender's control (docker refused the run, the image is gone, a sealed input
@@ -143,6 +154,28 @@ class SolutionExitError(ContenderFaultError):
     the halt-everything bug of review service-review #14."""
 
     code = "SOLUTION_EXIT_NONZERO"
+
+
+class SandboxTerminatedError(ContenderFaultError):
+    """The solution died from a signal the runner did not send (exit 137/143) and its
+    Sandbox is gone: the platform stopped the Sandbox (preemption, host loss) or the
+    solution brought the whole Sandbox down (for example its memory limit).
+
+    The orchestrator reruns the batch on a fresh Sandbox a bounded number of times
+    (``max_sandbox_terminated_reruns``) and only then scores it as the contender's
+    fault. A platform stop never zero-scores a contender on the first occurrence, and
+    a submission that keeps killing its own Sandbox can never halt the competition.
+
+    ``wall_seconds`` is how long the stopped attempt ran (None = not measured). A
+    timed competition charges it, so a solution that brings its own Sandbox down
+    cannot shop for a faster rerun.
+    """
+
+    code = "SANDBOX_TERMINATED"
+
+    def __init__(self, message: str = "", *, wall_seconds: float | None = None) -> None:
+        super().__init__(message)
+        self.wall_seconds = None if wall_seconds is None else round(float(wall_seconds), 3)
 
 
 class OutputRejectedError(ContenderFaultError):

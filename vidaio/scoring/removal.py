@@ -139,6 +139,15 @@ class Y4MReader:
         i420 = np.asarray(planes).reshape(self.height * 3 // 2, self.width)
         return cv2.cvtColor(i420, cv2.COLOR_YUV2RGB_I420)
 
+    def frame_i420(self, index: int) -> np.ndarray:
+        """Frame ``index`` as its raw (h * 3/2, w) uint8 I420 planes (a copy)."""
+        if not 0 <= index < self.frame_count:
+            raise IndexError(index)
+        mm = self._mm()
+        start = self.header_bytes + index * self.frame_bytes + 6
+        planes = np.array(mm[start : start + self.frame_bytes - 6])
+        return planes.reshape(self.height * 3 // 2, self.width)
+
     def frame_luma(self, index: int) -> np.ndarray:
         mm = self._mm()
         start = self.header_bytes + index * self.frame_bytes + 6

@@ -1,0 +1,64 @@
+{
+ "allowed_gpus": [
+  "L4"
+ ],
+ "baseline": {
+  "artifact_bytes": 30720,
+  "artifact_digest": "f5325d6cfd5ee27d278d5461ab79ed525d11fa45367653016d8bf526c23b5bc4",
+  "commit_sha": "3f23f8c990b18640b57d0e4514e1bdbf32f3f790",
+  "image_digest": "b35a3e8191cc15232a1bbc95ea930ea9260dcab9a5d2931016c7a1244babe660",
+  "provenance_bytes": 613,
+  "provenance_digest": "fd6f876598e793734b95868f795b3b6306f0c94f5aaac714773080e4d0f2bb49",
+  "repo_url": "https://95.133.253.64/git/m1-compression-v0.git",
+  "tree_sha": "26f41d411bf0e6f83390b27bc124abf00f79d118",
+  "version": 0
+ },
+ "competition_id": "sn85-compression-001c",
+ "container_size_limit_gb": 25.0,
+ "end_time": "2026-09-27T12:00:00Z",
+ "enrollment_deadline": "2026-09-24T14:00:00Z",
+ "evaluation_batch_size": {
+  "max": 5,
+  "min": 5
+ },
+ "evaluation_item_commitments": [
+  "4e093448c60a384b3a9303f2de2ff3e1e432c2f8413f15c7675bb23fc3ef7295",
+  "b3905365c52be4a7ef66275c7233f9ce67536929c9f3bd03c6e131f2d8ccdd09",
+  "9a69ba00929025e4fc79bf4ec51416ca53e516f11a7630886e2246b68bee6193",
+  "bea6c2addb10508e1b2caaadc71ae6e5fbac478e97ea27f3bb36c36c0cd27026",
+  "925a11c396c2e4eeb7c8d3c79e425b5d9a173d314569ba529d7ba031e46f1bac",
+  "79ee655b5978ef41743fbdac32c875e885b1588748596bdc0b3843cdb0711221",
+  "fc846ca2e31ff7c750d6b2472f7ef14f211f6389809885eacb9517eb32d5b401",
+  "328d9d526b3f31e5ea5604c3e644a6975c981e9179898da50493222e43f22f3f",
+  "e6b77c992904da8e20de38510a73a7338988e7b45372a7060597d27da88fa2ea",
+  "7c1543f2b5167fe83b09fd02478da8d8984f5a00a6d1b5e23cb8adadf53fcf1b"
+ ],
+ "finalization_time": "2026-09-24T16:00:00Z",
+ "manifest_schema_version": 2,
+ "minimum_alpha_stake": 500.0,
+ "result_rules": {
+  "crown_margin": 0.05,
+  "crown_min_score": 0.869,
+  "podium_min_margin": 0.0,
+  "podium_min_score": 0.86
+ },
+ "sandbox_resources": {
+  "batch_timeout_seconds": 1500,
+  "cpu": 32.0,
+  "memory_mb": 65536
+ },
+ "scoring_factors": {
+  "cost_efficiency": 0.0,
+  "length_coverage": 0.0,
+  "quality": 1.0
+ },
+ "scoring_seed_commitment": "a69d8faa128deb8a1502d848f3fd6f00935e81b2cd4ef22f4c312b4c96401fce",
+ "scoring_version": "vidaio-scorer/1+8e482b18796d",
+ "sealed_vmaf_variants": [
+  90.0
+ ],
+ "start_time": "2026-09-21T14:00:00Z",
+ "track": "compression",
+ "use_worst_decile": false,
+ "vmaf_threshold": 90.0
+}

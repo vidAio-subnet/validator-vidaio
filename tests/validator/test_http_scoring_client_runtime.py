@@ -74,6 +74,7 @@ def _attestation() -> dict:
             "opencv": "opencv/4.12.0.88",
             "numpy": "numpy/2.2.6",
             "removal_metrics": "removal-metrics/2",
+            "interpolation_metrics": "interpolation-metrics/1",
             "lpips": "lpips/0.1.4",
             "python": "cpython/3.13.15",
         },

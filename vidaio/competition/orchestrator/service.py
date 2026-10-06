@@ -179,6 +179,7 @@ from vidaio.competition import (
 )
 from vidaio.competition import repository as repo
 from vidaio.competition.item_commitment import (
+    INTERPOLATION_FRAME_FACTOR,
     REMOVAL_MASK_STREAM_INDEX,
     SEALED_REFERENCE_TRACKS,
 )
@@ -1365,7 +1366,7 @@ class Orchestrator(BaseService):
         if callable(acquire):
             configure = getattr(self.runner, "configure", None)
             if callable(configure):
-                configure(self.effective_sandbox_resources(competition_id))
+                configure(self.runner_envelope(competition_id))
             try:
                 await asyncio.to_thread(acquire)
             except Exception as exc:
@@ -2005,10 +2006,43 @@ class Orchestrator(BaseService):
                 if fenced(started_floor, batch):
                     return True
                 if classify_failure(exc) is Fault.CONTENDER:
-                    # The SUBMISSION failed (exit != 0, timeout, unsafe/oversize
-                    # output): fail THIS batch terminally and keep going. One
-                    # untrusted contender never halts the competition (#14).
+                    from vidaio.competition.runners.errors import SandboxTerminatedError
+
                     code = fault_code(exc)
+                    if code == SandboxTerminatedError.code:
+                        # The Sandbox itself was stopped (e.g. a platform preemption):
+                        # rerun on a fresh Sandbox within a bounded budget of its own,
+                        # never the infra budget and never a halt.
+                        reruns = pers.requeue_count(
+                            self.conn, competition_id, batch["batch_id"], code=code
+                        )
+                        if reruns < self.cfg.max_sandbox_terminated_reruns:
+                            pers.requeue_batch(
+                                self.conn,
+                                competition_id,
+                                batch["batch_id"],
+                                str(exc),
+                                now,
+                                code=code,
+                                wall_seconds=getattr(exc, "wall_seconds", None),
+                            )
+                            self.m_batches.labels(result="requeued").inc()
+                            self.log.warning(
+                                "batch Sandbox was terminated outside the solution; "
+                                "rerunning it on a fresh Sandbox",
+                                extra=log_fields(
+                                    competition_id=competition_id,
+                                    contender_id=batch["contender_id"],
+                                    batch_id=batch["batch_id"],
+                                    rerun=reruns + 1,
+                                    reason=str(exc)[:500],
+                                ),
+                            )
+                            return True
+                    # The SUBMISSION failed (exit != 0, timeout, unsafe/oversize
+                    # output, or its Sandbox kept being terminated): fail THIS batch
+                    # terminally and keep going. One untrusted contender never halts
+                    # the competition (#14).
                     pers.fail_batch_contender_fault(
                         self.conn,
                         competition_id,
@@ -2058,6 +2092,9 @@ class Orchestrator(BaseService):
                 return True
             if fenced(started_floor, batch):
                 return True
+            wall = getattr(outputs, "wall_seconds", None)
+            if wall is None:
+                wall = next((o.wall_seconds for o in outputs if o.wall_seconds is not None), None)
             pers.complete_batch(
                 self.conn,
                 competition_id,
@@ -2065,6 +2102,7 @@ class Orchestrator(BaseService):
                 batch["contender_id"],
                 list(outputs),
                 now,
+                wall_seconds=wall,
             )
             self.m_batches.labels(result="ok").inc()
             return True
@@ -2482,6 +2520,17 @@ class Orchestrator(BaseService):
                 item_commitment=str(item_row["item_commitment"]),
             )
             stage = LifecycleStage.COMPETITION_SEALED
+        elif manifest.track == "interpolation":
+            repo.validate_evaluation_item_bindings(self.conn, competition_id)
+            reference_ref = self._reference_original_ref(item_row)
+            competition_item = CompetitionItemBinding(
+                item_index=int(item_row["item_index"]),
+                input_sha256=str(item_row["input_sha256"]),
+                reference_sha256=str(item_row["reference_sha256"]),
+                frame_factor=INTERPOLATION_FRAME_FACTOR,
+                item_commitment=str(item_row["item_commitment"]),
+            )
+            stage = LifecycleStage.COMPETITION_SEALED
         bundle = build_bundle(
             challenge_id=item_row["challenge_id"],
             item_id=item_row["scoring_item_id"],
@@ -2604,6 +2653,13 @@ class Orchestrator(BaseService):
     # ---- operator recovery actions (docs/COMPETITIONS.md "Saving a running
     # competition").  Every action is an append-only public amendment; none of them
     # can change the anchored manifest, the hidden items, the scorer or the rules.
+
+    def runner_envelope(self, competition_id: str) -> dict[str, Any]:
+        """What the runner enforces for this competition: the effective compute
+        envelope (when the manifest pins one) and the anchored image-size cap."""
+        resources = self.effective_sandbox_resources(competition_id) or {}
+        manifest = repo.get_manifest(self.conn, competition_id)
+        return {**resources, "container_size_limit_gb": float(manifest.container_size_limit_gb)}
 
     def effective_sandbox_resources(self, competition_id: str) -> dict[str, Any] | None:
         """The anchored envelope, raised by the latest execution amendment if any."""
@@ -2749,8 +2805,14 @@ class Orchestrator(BaseService):
         *,
         reason: str,
     ) -> None:
-        """Take a not-yet-built contender out (e.g. its repository became unreadable
-        and blocks finalization for everyone).  Public, with the reason."""
+        """Take a contender out, publicly with the reason.
+
+        Before the build, e.g. its repository became unreadable and blocks
+        finalization for everyone, or it fails the licence review. After the build
+        and until the competition completes, an entry found breaking the rules (an
+        unlicensed component, footage shipped to look answers up): its remaining
+        batches end and it leaves scoring and the result. A completed competition's
+        field is final."""
         operator, reason = pers._operator_text(operator, reason, what="reject")
         self._require_phase(
             competition_id,
@@ -2759,6 +2821,9 @@ class Orchestrator(BaseService):
                 Phase.FINALIZING_SUBMISSIONS,
                 Phase.VALIDATING,
                 Phase.BUILDING,
+                Phase.EVALUATING,
+                Phase.SCORING,
+                Phase.AWAITING_END_TIME,
             },
             "rejecting a contender",
         )
@@ -2774,13 +2839,17 @@ class Orchestrator(BaseService):
             raise KeyError(f"contender {contender_id} is not part of {competition_id}")
         if contender.is_calibration:
             raise ValueError("the calibration baseline cannot be rejected")
-        if contender.status not in ("ENROLLED", "ACCEPTED"):
+        if contender.status not in ("ENROLLED", "ACCEPTED", "BUILT"):
             raise ValueError(
-                f"contender {contender_id} is {contender.status}; only ENROLLED or "
-                "ACCEPTED contenders can be rejected"
+                f"contender {contender_id} is {contender.status}; only ENROLLED, "
+                "ACCEPTED or BUILT contenders can be rejected"
             )
         with pers.txn(self.conn):
             repo.set_contender_status(self.conn, contender_id, "REJECTED", now)
+            if contender.status == "BUILT":
+                pers.end_contender_batches(
+                    self.conn, competition_id, contender_id, "OPERATOR_REJECTED", now
+                )
             repo.record_event(
                 self.conn,
                 competition_id,
@@ -3697,8 +3766,9 @@ class Orchestrator(BaseService):
         """Seed a manifest-bound evaluation item.
 
         The miner-visible ``input_path`` is staged as ``CHALLENGE_INPUT``.  An
-        upscaling or removal item additionally requires a distinct pristine
-        ``reference_path`` (removal: the clean clip under the object);
+        upscaling, removal or interpolation item additionally requires a distinct
+        pristine ``reference_path`` (removal: the clean clip under the object;
+        interpolation: the full-frame-rate clip);
         it is stored as sealed ``REFERENCE_ORIGINAL`` and staged only in the trusted
         scorer pool.  Sandbox batches are constructed solely from the low-resolution
         input digest, so contender code never receives the pristine bytes.
@@ -3748,7 +3818,7 @@ class Orchestrator(BaseService):
         ):
             raise ValueError(
                 "reference_path/upscale_factor/target geometry are valid only for "
-                "upscaling and removal competitions"
+                "upscaling, removal and interpolation competitions"
             )
         with pers.txn(self.conn):
             return repo.add_evaluation_item(

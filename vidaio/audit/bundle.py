@@ -45,9 +45,10 @@ class CompetitionItemBinding(BaseModel):
     """Manifest-committed item preimage copied into a bundle.
 
     Upscaling items carry their factor (and v2 geometry); object-removal items carry
-    the mask stream index of their two-stream input instead.  Exactly one of the two
-    is present; the absent keys are omitted from the canonical bytes so every
-    upscaling bundle published before removal existed keeps its digest.
+    the mask stream index of their two-stream input instead; frame-interpolation items
+    carry their frame factor.  Exactly one of the three is present; the absent keys are
+    omitted from the canonical bytes so every bundle published before a track existed
+    keeps its digest.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -62,11 +63,17 @@ class CompetitionItemBinding(BaseModel):
     target_height: int | None = Field(default=None, gt=0)
     #: Object removal: the video stream of the served input that carries the mask.
     mask_stream_index: Literal[1] | None = None
+    #: Frame interpolation: output frames per input frame interval.
+    frame_factor: Literal[2] | None = None
     item_commitment: str = Field(pattern=SHA256_HEX_PATTERN)
 
     @property
     def kind(self) -> str:
-        return "removal" if self.mask_stream_index is not None else "upscaling"
+        if self.mask_stream_index is not None:
+            return "removal"
+        if self.frame_factor is not None:
+            return "interpolation"
+        return "upscaling"
 
     @model_validator(mode="after")
     def _distinct_media(self) -> "CompetitionItemBinding":
@@ -74,15 +81,20 @@ class CompetitionItemBinding(BaseModel):
             raise ValueError(
                 "competition item binding requires distinct reference/input"
             )
-        if (self.upscale_factor is None) == (self.mask_stream_index is None):
+        present = [
+            name
+            for name in ("upscale_factor", "mask_stream_index", "frame_factor")
+            if getattr(self, name) is not None
+        ]
+        if len(present) != 1:
             raise ValueError(
                 "competition item binding carries exactly one of upscale_factor "
-                "(upscaling) or mask_stream_index (removal)"
+                "(upscaling), mask_stream_index (removal) or frame_factor (interpolation)"
             )
-        if self.mask_stream_index is not None and (
+        if (self.mask_stream_index is not None or self.frame_factor is not None) and (
             self.target_width is not None or self.target_height is not None
         ):
-            raise ValueError("removal item binding cannot carry target geometry")
+            raise ValueError(f"{self.kind} item binding cannot carry target geometry")
         if (self.target_width is None) != (self.target_height is None):
             raise ValueError(
                 "upscaling competition target dimensions must appear together"
@@ -105,6 +117,8 @@ class CompetitionItemBinding(BaseModel):
             payload.pop("target_height", None)
         if self.mask_stream_index is None:
             payload.pop("mask_stream_index", None)
+        if self.frame_factor is None:
+            payload.pop("frame_factor", None)
         if self.upscale_factor is None:
             payload.pop("upscale_factor", None)
         return payload

@@ -1,0 +1,5 @@
+# Same numpy as the VidAIO scorer (uv.lock). Hashes cover the CPython 3.13 wheels for
+# linux/amd64 (what the sandbox builds) and linux/arm64 (local builds on arm machines).
+numpy==2.2.6 \
+    --hash=sha256:1bc23a79bfabc5d056d106f9befb8d50c31ced2fbc70eedb8155aec74a45798f \
+    --hash=sha256:f92729c95468a2f4f15e9bb94c432a9229d0d50de67304399627a943201baa2f

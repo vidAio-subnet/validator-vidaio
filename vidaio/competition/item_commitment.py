@@ -153,7 +153,7 @@ REMOVAL_ITEM_COMMITMENT_DOMAIN = "vidaio.competition.removal-item.v1"
 #: Tracks whose scorer reference differs from the miner input: the pristine
 #: reference is sealed during the competition and released at completion so a
 #: keyless auditor can recompute every packet.
-SEALED_REFERENCE_TRACKS = frozenset({"upscaling", "removal"})
+SEALED_REFERENCE_TRACKS = frozenset({"upscaling", "removal", "interpolation"})
 #: The served removal input carries the per-frame mask as this video stream
 #: (stream 0 = the frames to repair, stream 1 = the mask).  The index is part of the
 #: committed preimage so a scorer can never be pointed at another stream.
@@ -199,6 +199,58 @@ def removal_item_commitment(
             "input_sha256": input_sha256,
             "item_index": item_index,
             "mask_stream_index": mask_stream_index,
+            "reference_sha256": reference_sha256,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return hashlib.sha256(preimage).hexdigest()
+
+
+INTERPOLATION_ITEM_COMMITMENT_DOMAIN = "vidaio.competition.interpolation-item.v1"
+#: The served interpolation input keeps every ``INTERPOLATION_FRAME_FACTOR``-th frame of
+#: the sealed reference (frames 0, 2, 4, ...); contenders return the full grid. Part of
+#: the committed preimage so a scorer can never be pointed at another grid.
+INTERPOLATION_FRAME_FACTOR = 2
+
+
+def interpolation_item_commitment(
+    *,
+    competition_id: str,
+    item_index: int,
+    input_sha256: str,
+    reference_sha256: str,
+    frame_factor: int = INTERPOLATION_FRAME_FACTOR,
+) -> str:
+    """Commitment to one hidden FRAME-INTERPOLATION item.
+
+    The preimage binds the exact decimated input contenders receive, the sealed
+    full-frame-rate reference the inserted frames are scored against, and the frame
+    factor. The reference is released only after the competition, so the ordered list
+    anchored in the manifest proves that no item or reference was swapped in between.
+    """
+    if not competition_id:
+        raise ValueError("competition_id must be non-empty")
+    if type(item_index) is not int or item_index < 0:
+        raise ValueError("item_index must be a non-negative integer")
+    for field, digest in (
+        ("input_sha256", input_sha256),
+        ("reference_sha256", reference_sha256),
+    ):
+        if _SHA256_HEX.fullmatch(digest) is None:
+            raise ValueError(f"{field} must be lowercase sha256 hex")
+    if input_sha256 == reference_sha256:
+        raise ValueError("interpolation reference and miner input must be distinct")
+    if frame_factor != INTERPOLATION_FRAME_FACTOR:
+        raise ValueError(f"interpolation frame factor must be {INTERPOLATION_FRAME_FACTOR}")
+    preimage = json.dumps(
+        {
+            "competition_id": competition_id,
+            "domain": INTERPOLATION_ITEM_COMMITMENT_DOMAIN,
+            "frame_factor": frame_factor,
+            "input_sha256": input_sha256,
+            "item_index": item_index,
             "reference_sha256": reference_sha256,
         },
         sort_keys=True,

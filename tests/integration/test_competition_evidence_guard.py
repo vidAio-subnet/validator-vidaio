@@ -45,6 +45,23 @@ def _builder(world: GoldenWorld, *hotkeys: str):
     return build
 
 
+def _relabelled_census_builder(world: GoldenWorld):
+    """A census whose mapping key disagrees with its committed hotkey: an
+    authority-side inconsistency that must still fail the evidence closed."""
+    census = _census("hk-a", "hk-b")
+    census["hk-b"] = census["hk-b"].model_copy(update={"hotkey": "hk-relabelled"})
+
+    def build():
+        return build_competition_epoch_evidence(
+            world.comp_conn,
+            census_by_hotkey=census,
+            store=world.store,
+            through_time=COMPLETED_AT,
+        )
+
+    return build
+
+
 def test_complete_evidence_passes_through_unchanged(fresh_world: GoldenWorld) -> None:
     guarded = guarded_competition_evidence(
         _builder(fresh_world, "hk-a", "hk-b"),
@@ -55,27 +72,27 @@ def test_complete_evidence_passes_through_unchanged(fresh_world: GoldenWorld) ->
     assert guarded.evidence.result.contenders[0].hotkey in {"hk-a", "hk-b"}
 
 
-def test_missing_census_contender_defers_instead_of_holding(
+def test_inconsistent_census_defers_instead_of_holding(
     fresh_world: GoldenWorld, caplog: pytest.LogCaptureFixture
 ) -> None:
     deferred: list[str] = []
     with caplog.at_level(logging.CRITICAL):
         guarded = guarded_competition_evidence(
-            _builder(fresh_world, "hk-a"),  # hk-b is BUILT but left the census
+            _relabelled_census_builder(fresh_world),
             policy="defer", config=CONFIG, prior=None, now=COMPLETED_AT,
             on_defer=deferred.append,
         )
     assert guarded.evidence is None
     assert guarded.deferred_error is not None
-    assert "absent from the close-block census" in guarded.deferred_error
+    assert "do not match their committed hotkeys" in guarded.deferred_error
     assert len(deferred) == 1
     assert any("DEFERRED" in record.getMessage() for record in caplog.records)
 
 
 def test_hold_policy_keeps_the_fail_closed_behaviour(fresh_world: GoldenWorld) -> None:
-    with pytest.raises(CompetitionEvidenceError, match="absent from the close-block census"):
+    with pytest.raises(CompetitionEvidenceError, match="do not match their committed hotkeys"):
         guarded_competition_evidence(
-            _builder(fresh_world, "hk-a"),
+            _relabelled_census_builder(fresh_world),
             policy="hold", config=CONFIG, prior=None, now=COMPLETED_AT,
         )
 

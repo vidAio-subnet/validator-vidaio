@@ -403,3 +403,5 @@ class EmissionShares:
     inference: float
     competition: float
     burn: float
+    #: Licensing-treasury share (tokenomics v4); 0.0 under v2/v3.
+    treasury: float = 0.0

@@ -160,11 +160,20 @@ def build_competition_commitment(commitment: CompetitionCommitment) -> Commitmen
 
 def reward_parameter_digest(config: TokenomicsConfig) -> str:
     """Preserve the competition policy commitment across inference-only additions."""
+    excluded = {"payout_min_alpha_stake"}
+    if (
+        config.treasury_hotkey is None
+        and config.idle_treasury_share == 0.0
+        and config.window_treasury_share == 0.0
+    ):
+        # Tokenomics v4 added the licensing-treasury fields; a policy without a
+        # treasury keeps the exact digest it had before they existed.
+        excluded |= {"treasury_hotkey", "idle_treasury_share", "window_treasury_share"}
     policy = {
         "domain": REWARD_POLICY_DOMAIN,
         # This new eligibility knob must not invalidate already-anchored
         # competition policies. Preserve every existing policy field verbatim.
-        "tokenomics": config.model_dump(mode="json", exclude={"payout_min_alpha_stake"}),
+        "tokenomics": config.model_dump(mode="json", exclude=excluded),
         "competition_podium_split": list(config.podium_split),
         "competition_crown_split": list(config.crown_split),
     }

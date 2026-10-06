@@ -231,25 +231,70 @@ def complete_batch(
     contender_id: int,
     outputs: Sequence[BatchOutput],
     now: datetime,
+    *,
+    wall_seconds: float | None = None,
 ) -> None:
     """Atomically record the batch's outputs (append-only event) and mark it
     COMPLETED — a crash between the two can never happen (single transaction),
-    so COMPLETED always implies the outputs are recorded."""
+    so COMPLETED always implies the outputs are recorded. ``wall_seconds`` is the
+    runner-measured ``run.sh`` time of the run that produced these outputs (the
+    speed term sums it per contender)."""
+    payload: dict[str, object] = {
+        "batch_id": batch_id,
+        "contender_id": contender_id,
+        "outputs": [[o.item_id, o.output_sha256, o.output_bytes] for o in outputs],
+    }
+    if wall_seconds is not None:
+        payload["wall_seconds"] = round(float(wall_seconds), 3)
     with txn(conn):
         repo.record_event(
             conn,
             competition_id,
             EVENT_BATCH_OUTPUTS,
             now,
-            payload={
-                "batch_id": batch_id,
-                "contender_id": contender_id,
-                "outputs": [
-                    [o.item_id, o.output_sha256, o.output_bytes] for o in outputs
-                ],
-            },
+            payload=payload,
         )
         set_batch_status(conn, batch_id, "COMPLETED", now, finished=True)
+
+
+def batch_wall_seconds(
+    conn: sqlite3.Connection, competition_id: str, contender_id: int
+) -> dict[int, float | None]:
+    """batch_id -> measured run seconds of the run whose outputs were recorded, in
+    the effective evaluation window (the same window the outputs are read from)."""
+    floor = _effective_batch_event_floor(conn, competition_id)
+    out: dict[int, float | None] = {}
+    for row in conn.execute(
+        "SELECT payload_json FROM events WHERE competition_id = ? AND event_type = ?"
+        " AND event_id > ? AND json_extract(payload_json, '$.contender_id') = ?"
+        " ORDER BY event_id",
+        (competition_id, EVENT_BATCH_OUTPUTS, floor, contender_id),
+    ):
+        payload = json.loads(row["payload_json"] or "{}")
+        out[int(payload["batch_id"])] = payload.get("wall_seconds")
+    return out
+
+
+def requeued_attempt_seconds(
+    conn: sqlite3.Connection, competition_id: str, *, code: str
+) -> dict[int, list[float | None]]:
+    """batch_id -> measured run seconds of every attempt requeued with ``code`` in
+    the effective evaluation window (None = that attempt was not measured)."""
+    floor = _effective_batch_event_floor(conn, competition_id)
+    out: dict[int, list[float | None]] = {}
+    for row in conn.execute(
+        "SELECT payload_json FROM events WHERE competition_id = ? AND event_type = ?"
+        " AND event_id > ? ORDER BY event_id",
+        (competition_id, EVENT_BATCH_REQUEUED, floor),
+    ):
+        payload = json.loads(row["payload_json"] or "{}")
+        if payload.get("code") != code:
+            continue
+        wall = payload.get("wall_seconds")
+        out.setdefault(int(payload["batch_id"]), []).append(
+            None if wall is None else float(wall)
+        )
+    return out
 
 
 def requeue_batch(
@@ -258,14 +303,25 @@ def requeue_batch(
     batch_id: int,
     reason: str,
     now: datetime,
+    *,
+    code: str | None = None,
+    wall_seconds: float | None = None,
 ) -> None:
+    """Requeue one batch. ``code`` tags a rerun that has its own budget (for example
+    ``SANDBOX_TERMINATED``); untagged requeues are the infra budget. ``wall_seconds``
+    is how long the abandoned attempt ran, when the runner measured it."""
+    payload: dict[str, object] = {"batch_id": batch_id, "reason": reason[:500]}
+    if code is not None:
+        payload["code"] = code
+    if wall_seconds is not None:
+        payload["wall_seconds"] = round(float(wall_seconds), 3)
     with txn(conn):
         repo.record_event(
             conn,
             competition_id,
             EVENT_BATCH_REQUEUED,
             now,
-            payload={"batch_id": batch_id, "reason": reason[:500]},
+            payload=payload,
         )
         set_batch_status(conn, batch_id, "REQUEUED", now, failure_code=reason[:200])
 
@@ -311,6 +367,26 @@ def fail_batch_contender_fault(
         )
 
 
+def end_contender_batches(
+    conn: sqlite3.Connection,
+    competition_id: str,
+    contender_id: int,
+    code: str,
+    now: datetime,
+) -> int:
+    """Make every non-terminal batch of one contender FAILED with ``code`` (the
+    contender left the competition), so evaluation can complete without it.
+    Returns how many batches ended."""
+    ts = repo.iso(now)
+    cur = conn.execute(
+        "UPDATE batches SET status = 'FAILED', failure_code = ?, finished_at = ?"
+        " WHERE competition_id = ? AND contender_id = ?"
+        " AND status NOT IN ('COMPLETED', 'FAILED')",
+        (code, ts, competition_id, contender_id),
+    )
+    return int(cur.rowcount)
+
+
 def contender_fault_events(
     conn: sqlite3.Connection, competition_id: str
 ) -> list[sqlite3.Row]:
@@ -320,10 +396,19 @@ def contender_fault_events(
     ).fetchall()
 
 
-def requeue_count(conn: sqlite3.Connection, competition_id: str, batch_id: int) -> int:
+def requeue_count(
+    conn: sqlite3.Connection,
+    competition_id: str,
+    batch_id: int,
+    *,
+    code: str | None = None,
+) -> int:
     """How many times this batch has been requeued (derived from the event log —
     survives ordinary restarts; a full Modal runtime reset starts a new effective
-    attempt window because every batch is rerun)."""
+    attempt window because every batch is rerun).
+
+    Counts only the requeues tagged ``code``; the default ``None`` counts the
+    untagged infra requeues."""
     floor = _requeue_budget_floor(conn, competition_id)
     rows = conn.execute(
         "SELECT payload_json FROM events WHERE competition_id = ? AND event_type = ?"
@@ -333,7 +418,7 @@ def requeue_count(conn: sqlite3.Connection, competition_id: str, batch_id: int) 
     count = 0
     for row in rows:
         payload = json.loads(row["payload_json"] or "{}")
-        if payload.get("batch_id") == batch_id:
+        if payload.get("batch_id") == batch_id and payload.get("code") == code:
             count += 1
     return count
 

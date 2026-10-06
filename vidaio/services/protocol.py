@@ -250,6 +250,8 @@ SCORER_REQUIRED_PAYOUT_BACKENDS = frozenset(
         "numpy",
         # object-removal scoring (competition track): region metrics + LPIPS package
         "removal_metrics",
+        # frame-interpolation scoring (competition track): inserted-frame metrics
+        "interpolation_metrics",
         "lpips",
         "python",
     }

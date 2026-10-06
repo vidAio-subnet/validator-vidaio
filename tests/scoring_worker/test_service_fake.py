@@ -411,6 +411,152 @@ async def test_removal_wrong_geometry_candidate_is_zeroed_without_measuring(worl
     assert item.score == 0.0
 
 
+class FakeInterpolationBackend:
+    """Deterministic interpolation measurement (no media)."""
+
+    def __init__(
+        self,
+        *,
+        psnr: float = 34.0,
+        ssim: float = 0.95,
+        lpips: float = 0.05,
+        kept: float = 0.4,
+        fail: str | None = None,
+        input_fail: str | None = None,
+    ) -> None:
+        self.psnr, self.ssim, self.lpips, self.kept = psnr, ssim, lpips, kept
+        self.fail, self.input_fail = fail, input_fail
+        self.calls: list[dict] = []
+
+    def version(self) -> str:
+        return "fake-interpolation/1"
+
+    def measure(self, **kwargs):
+        from vidaio.scoring.interpolation_formula import InsertedFrameMetrics, best_baseline
+        from vidaio.scoring_worker.interpolation_backend import (
+            InterpolationInputError,
+            InterpolationMeasurement,
+            InterpolationMeasurementError,
+        )
+
+        self.calls.append(kwargs)
+        if self.input_fail:
+            raise InterpolationInputError(self.input_fail)
+        if self.fail:
+            raise InterpolationMeasurementError(self.fail)
+        hold = InsertedFrameMetrics(psnr_db=28.0, ssim=0.91, lpips_vgg=0.12, inserted_frames=29)
+        blend = InsertedFrameMetrics(psnr_db=30.0, ssim=0.90, lpips_vgg=0.20, inserted_frames=29)
+        return InterpolationMeasurement(
+            metrics=InsertedFrameMetrics(
+                psnr_db=self.psnr, ssim=self.ssim, lpips_vgg=self.lpips, inserted_frames=29
+            ),
+            floor=best_baseline(hold, blend),
+            hold=hold,
+            blend=blend,
+            kept_change=self.kept,
+            input_frames=30,
+            lpips_offset=int(kwargs.get("lpips_offset", 0)),
+        )
+
+
+def _interpolation_body(world: FakeWorld, *, frame_factor: int = 2) -> dict:
+    return score_request_body(
+        track="interpolation",
+        reference=world.reference,
+        reference_digest=world.reference_digest,
+        output=world.output,
+        output_digest=world.output_digest,
+        miner_input=world.reference,  # same geometry as the reference
+        miner_input_digest=world.reference_digest,
+        params={"frame_factor": frame_factor},
+    )
+
+
+def _interpolation_backends(world: FakeWorld, interpolation) -> ScoringBackends:
+    return ScoringBackends(
+        probe=world.fake, vmaf_primary=world.fake, vmaf_secondary=world.fake, pieapp=world.fake.pieapp,
+        perceptual=world.fake, canonicalizer=None, versions=world.fake.versions(),
+        interpolation=interpolation,
+    )
+
+
+async def test_interpolation_track_scores_inserted_frames_without_vmaf(world: FakeWorld) -> None:
+    interpolation = FakeInterpolationBackend()
+    async with _client(world, backends=_interpolation_backends(world, interpolation)) as client:
+        resp = await client.post("/score", json=_interpolation_body(world))
+    assert resp.status_code == 200, resp.text
+    item = ItemScore.from_json(resp.json()["item_score_json"])
+    assert item.gate_passed, item.violations
+    assert item.breakdown is not None and item.breakdown.kind == "interpolation"
+    assert item.score == pytest.approx(item.breakdown.final) and item.score > 0.3
+    assert item.metrics["interp_psnr_db"] == 34.0 and item.metrics["interp_floor_psnr_db"] == 30.0
+    assert item.metrics["interp_floor_ssim"] == 0.91 and item.metrics["interp_floor_lpips_vgg"] == 0.12
+    assert item.metrics["interp_hold_psnr_db"] == 28.0 and item.metrics["interp_blend_psnr_db"] == 30.0
+    assert item.metrics["interp_kept_change"] == 0.4
+    assert item.metrics["vmaf"] is None  # no VMAF run on this track
+    assert not any(role == ("reference", "output") for role in world.fake.vmaf_calls)
+    # the LPIPS sampling phase comes from the held-out reference digest
+    assert 0 <= interpolation.calls[0]["lpips_offset"] < ScoringConfig().interpolation_lpips_stride
+    assert item.metrics["lpips_offset"] == interpolation.calls[0]["lpips_offset"]
+    assert any(skip.gate == "tone_manipulation" for skip in item.skips)
+
+
+async def test_interpolation_modified_input_frames_are_zeroed(world: FakeWorld) -> None:
+    backends = _interpolation_backends(world, FakeInterpolationBackend(kept=3.5))
+    async with _client(world, backends=backends) as client:
+        resp = await client.post("/score", json=_interpolation_body(world))
+    item = ItemScore.from_json(resp.json()["item_score_json"])
+    assert not item.gate_passed and item.score == 0.0
+    assert any(v.code is ReasonCode.KEPT_FRAMES_MODIFIED for v in item.violations)
+
+
+async def test_interpolation_free_answers_score_zero(world: FakeWorld) -> None:
+    backends = _interpolation_backends(world, FakeInterpolationBackend(psnr=30.0, ssim=0.91, lpips=0.12))
+    async with _client(world, backends=backends) as client:
+        resp = await client.post("/score", json=_interpolation_body(world))
+    item = ItemScore.from_json(resp.json()["item_score_json"])
+    assert item.gate_passed and item.score == 0.0
+
+
+async def test_interpolation_validator_side_faults_are_refused_not_zeroed(world: FakeWorld) -> None:
+    backends = _interpolation_backends(world, FakeInterpolationBackend(input_fail="not a 2x frame grid"))
+    async with _client(world, backends=backends) as client:
+        resp = await client.post("/score", json=_interpolation_body(world))
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"]["error"] == "interpolation_input_unmeasurable"
+    async with _client(world, backends=_interpolation_backends(world, None)) as client:
+        resp = await client.post("/score", json=_interpolation_body(world))
+    assert resp.status_code == 501
+    backends = _interpolation_backends(world, FakeInterpolationBackend())
+    async with _client(world, backends=backends) as client:
+        resp = await client.post("/score", json=_interpolation_body(world, frame_factor=4))
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"]["error"] == "interpolation_frame_factor_unsupported"
+
+
+async def test_interpolation_candidate_side_faults_are_violations(world: FakeWorld) -> None:
+    backends = _interpolation_backends(world, FakeInterpolationBackend(fail="candidate unreadable"))
+    async with _client(world, backends=backends) as client:
+        resp = await client.post("/score", json=_interpolation_body(world))
+    assert resp.status_code == 200, resp.text
+    item = ItemScore.from_json(resp.json()["item_score_json"])
+    assert not item.gate_passed and any(v.code is ReasonCode.METRIC_MISSING for v in item.violations)
+    assert item.score == 0.0
+
+
+async def test_interpolation_wrong_frame_count_is_zeroed_without_measuring(world: FakeWorld) -> None:
+    interpolation = FakeInterpolationBackend()
+    world.fake.set_media("output", _media(1_000).model_copy(update={"frame_count": 59}))
+    async with _client(world, backends=_interpolation_backends(world, interpolation)) as client:
+        resp = await client.post("/score", json=_interpolation_body(world))
+    assert resp.status_code == 200, resp.text
+    item = ItemScore.from_json(resp.json()["item_score_json"])
+    assert not item.gate_passed
+    assert any(v.code is ReasonCode.FRAME_COUNT_MISMATCH for v in item.violations)
+    assert interpolation.calls == []
+    assert item.score == 0.0
+
+
 async def test_fake_upscaling_full_round_with_derived_start_frame(
     world: FakeWorld,
 ) -> None:
@@ -534,7 +680,7 @@ async def test_missing_file_is_422(world: FakeWorld, tmp_path: Path) -> None:
 
 async def test_unsupported_track_is_422(world: FakeWorld) -> None:
     body = _compression_body(world)
-    body["track"] = "interpolation"
+    body["track"] = "outpainting"
     async with _client(world) as client:
         resp = await client.post("/score", json=body)
     assert resp.status_code == 422

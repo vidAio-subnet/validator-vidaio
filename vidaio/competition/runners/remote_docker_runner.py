@@ -46,7 +46,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from vidaio.core.logging import get_logger, log_fields
-from vidaio.competition.interfaces import BatchItem, BatchOutput, IsolationProbeReport
+from vidaio.competition.interfaces import BatchItem, BatchOutput, BatchOutputs, IsolationProbeReport
 from vidaio.competition.runners.docker_runner import (
     _LABEL,
     _PROBE_SCRIPT,
@@ -546,7 +546,7 @@ class RemoteDockerSandboxRunner(DockerSandboxRunner):
                     runtime_label=self.runtime_label,
                 ),
             )
-            return outputs
+            return BatchOutputs(outputs, wall_seconds=elapsed)
         finally:
             self._watched_volumes.pop(str(watch_dir), None)
             self._volume_remove(vin)

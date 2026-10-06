@@ -18,7 +18,7 @@ from vidaio.epoch import EPOCH_LOG_SCHEMA_VERSION
 from vidaio.services import run_service
 from vidaio.services.artifact_auth import CallableHotkeySigner
 from vidaio.tokenomics.config import TokenomicsConfig
-from vidaio.tokenomics.weights import ensure_locked_levers
+from vidaio.tokenomics.weights import emission_profile, ensure_locked_levers
 from vidaio.weightsetter import WeightSetter
 from vidaio.weightsetter.config import WeightSetterConfig
 from vidaio.weightsetter.shared_snapshot import ChainAdapterAnchorReader, make_snapshot_provider
@@ -55,8 +55,13 @@ def validate_configuration(raw: dict[str, Any]) -> dict[str, Any]:
         problems.append("chain snapshot freshness checking must remain enabled")
     if (raw.get("hotkey_auth") or {}).get("mode") != "enforce":
         problems.append("hotkey authentication must be enforce")
-    if tokenomics.result_window_hours != 168:
-        problems.append("mainnet tokenomics result_window_hours must be168")
+    profile = emission_profile(tokenomics)
+    expected_window = 336 if profile == "v4" else 168
+    if tokenomics.result_window_hours != expected_window:
+        problems.append(
+            f"mainnet tokenomics result_window_hours must be {expected_window} "
+            f"(emission profile {profile})"
+        )
     ensure_locked_levers(tokenomics)
     if audit.backend != "s3" or not audit.s3_bucket or not audit.s3_region or audit.allow_plaintext_holdout:
         problems.append("the mainnet public-evidence S3 store must be configured without plaintext holdouts")

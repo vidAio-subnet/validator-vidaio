@@ -73,7 +73,7 @@ def main() -> int:
                "-color_range", "tv", "-f", "mp4", str(staged))
         name = hashlib.sha256(staged.read_bytes()).hexdigest()
         os.replace(staged, inputs / name)
-        (inputs / f".vidaio-next-upscale-factor-{name}").write_text(
+        (inputs / f".vidaio-next-upscale-task-{name}").write_text(
             json.dumps({"target_height": H, "target_width": W, "upscale_factor": FACTOR},
                        sort_keys=True, separators=(",", ":")) + "\n"
         )

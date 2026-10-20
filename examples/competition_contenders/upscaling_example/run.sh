@@ -2,7 +2,7 @@
 # Competition contract, upscaling track: /bin/sh /app/run.sh INPUT_DIR OUTPUT_DIR
 #   - every regular, non-hidden file in INPUT_DIR is one item, named by its 64-hex
 #     sha256 with no extension: a degraded, downscaled clip (H.264 in MP4);
-#   - the hidden file INPUT_DIR/.vidaio-next-upscale-factor-<name> holds the task as
+#   - the hidden file INPUT_DIR/.vidaio-next-upscale-task-<name> holds the task as
 #     JSON: upscale_factor (2 or 4), target_width, target_height (landscape or portrait);
 #   - write exactly one MP4 per item into OUTPUT_DIR under the SAME name: one H.264
 #     stream at exactly the target size, the input's frame count and frame rate;

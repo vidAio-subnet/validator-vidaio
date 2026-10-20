@@ -3,7 +3,7 @@
 Usage: python3 upscaling_example.py [--max-bytes N] INPUT_PATH OUTPUT_PATH
 
 The input is a degraded, downscaled clip; the hidden file
-``.vidaio-next-upscale-factor-<input name>`` next to it holds the task as JSON
+``.vidaio-next-upscale-task-<input name>`` next to it holds the task as JSON
 (``upscale_factor``, ``target_width``, ``target_height``). The output is the clip at
 exactly the target size with the input's frame count and frame rate.
 
@@ -23,7 +23,7 @@ import subprocess
 import sys
 import tempfile
 
-SIDECAR_PREFIX = ".vidaio-next-upscale-factor-"
+SIDECAR_PREFIX = ".vidaio-next-upscale-task-"
 
 
 def task(input_path: str) -> tuple[int, int, int]:

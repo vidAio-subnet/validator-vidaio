@@ -25,7 +25,7 @@ else.
   downscaled by 2 (to 540p) or by 4 (to 270p), H.264 in MP4, about four seconds at a
   constant frame rate.
 - **Task file**: next to each item, the hidden file
-  `.vidaio-next-upscale-factor-<sha256>` holds the task as JSON, for example
+  `.vidaio-next-upscale-task-<sha256>` holds the task as JSON, for example
   `{"target_height":1080,"target_width":1920,"upscale_factor":2}`. Originals are
   landscape or portrait, so the target is 1920x1080 or 1080x1920: always read it from
   this file.

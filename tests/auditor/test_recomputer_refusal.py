@@ -348,3 +348,129 @@ def test_validator_zero_convention_is_refused_even_with_nonempty_output(
 
     with pytest.raises(RuntimeError, match="not launch-valid economic evidence"):
         recomputer.recompute(bundle, artifacts)
+
+
+def test_from_config_sweeps_stale_scratch_but_views_never_do(tmp_path, monkeypatch) -> None:
+    fake = DeterministicFakeBackend()
+
+    def compose(config, *, scoring_config, pieapp_device):
+        return ScoringBackends(
+            probe=fake, vmaf_primary=fake, vmaf_secondary=fake, pieapp=fake,
+            perceptual=fake, canonicalizer=None, versions={},
+        )
+
+    monkeypatch.setattr("vidaio.auditor.recomputer.real_backends", compose)
+    work = tmp_path / "work"
+    (work / "score-killed" / "nested").mkdir(parents=True)
+    (work / "score-killed" / "nested" / "copy.y4m").write_bytes(b"x" * 1024)
+    (work / "vmaf-orphan").mkdir()
+    (work / "operator-notes.txt").write_text("not ours")
+
+    recomputer = RealScoreRecomputer.from_config(
+        ScoringWorkerConfig(work_dir=work),
+        scoring_config=ScoringConfig(),
+        allow_noncanonical_pre_marker_build_or_test_runtime=True,
+    )
+    assert sorted(p.name for p in work.iterdir()) == ["operator-notes.txt"]
+
+    # A live request's scratch created after composition survives worker and history views.
+    (work / "score-live").mkdir()
+    recomputer._owns_real_backends = False  # fakes carry no runtime attestation to re-check
+    recomputer.for_worker()
+    recomputer.for_epoch_log(object())
+    assert (work / "score-live").is_dir()
+
+
+def _faithful_upscaling_bundle(scoring: object = "faithful"):
+    from vidaio.audit import CompetitionItemBinding, LifecycleStage
+    from vidaio.competition import evaluation_item_commitment
+
+    commitment = evaluation_item_commitment(
+        competition_id="comp-faithful",
+        item_index=0,
+        reference_sha256="2" * 64,
+        input_sha256="1" * 64,
+        upscale_factor=4,
+        target_width=1920,
+        target_height=1080,
+    )
+    bundle = SimpleNamespace(
+        stage=LifecycleStage.COMPETITION_SEALED,
+        competition_item=CompetitionItemBinding(
+            item_index=0,
+            input_sha256="1" * 64,
+            reference_sha256="2" * 64,
+            upscale_factor=4,
+            target_width=1920,
+            target_height=1080,
+            item_commitment=commitment,
+        ),
+    )
+    manifest = {
+        "competition_id": "comp-faithful",
+        "track": "upscaling",
+        "allowed_upscale_factors": [2, 4],
+        "evaluation_item_commitments": [commitment],
+        "upscaling_scoring": scoring,
+    }
+    artifacts = {
+        ArtifactKind.SCORE_PACKET: json.dumps({"track": "upscaling"}).encode(),
+        ArtifactKind.MANIFEST: json.dumps(manifest).encode(),
+    }
+    return bundle, artifacts
+
+
+def test_faithful_upscaling_item_is_recomputable_without_pieapp(tmp_path) -> None:
+    # the faithful scorer measures frames against the sealed original: no PieAPP
+    recomputer = _recomputer_with_unconfigured_pieapp(tmp_path)
+    bundle, artifacts = _faithful_upscaling_bundle()
+    assert recomputer.unsupported_reason(bundle, artifacts) is None
+    assert recomputer.unsupported_reason(bundle, artifacts, track="upscaling") is None
+
+
+def test_faithful_upscaling_selector_comes_from_the_anchored_manifest(tmp_path) -> None:
+    bundle, artifacts = _faithful_upscaling_bundle()
+    # the packet's own params never pick the scorer
+    packet = {"track": "upscaling", "params": {"scoring": "inference"}}
+    params = RealScoreRecomputer._reconstruct_params(bundle, artifacts, packet)
+    assert params == {
+        "upscale_factor": 4,
+        "target_width": 1920,
+        "target_height": 1080,
+        "scoring": "faithful",
+    }
+    bundle, artifacts = _faithful_upscaling_bundle(scoring=None)
+    assert "scoring" not in RealScoreRecomputer._reconstruct_params(bundle, artifacts, packet)
+    bundle, artifacts = _faithful_upscaling_bundle(scoring="generative")
+    with pytest.raises(RuntimeError, match="unknown upscaling scorer"):
+        RealScoreRecomputer._reconstruct_params(bundle, artifacts, packet)
+
+
+def test_streaming_rules_come_from_the_anchored_compression_manifest() -> None:
+    from vidaio.audit import LifecycleStage
+
+    rules = {"bits_per_pixel": 0.05, "max_keyframe_interval_seconds": 2.0, "peak_ratio": 1.5,
+             "peak_window_seconds": 2.0}
+    bundle = SimpleNamespace(stage=LifecycleStage.PRE_REVEAL, competition_item=None)
+
+    def artifacts(**manifest):
+        return {
+            ArtifactKind.SCORE_PACKET: json.dumps({"track": "compression"}).encode(),
+            ArtifactKind.MANIFEST: json.dumps({"track": "compression", "vmaf_threshold": 90.0, **manifest}).encode(),
+        }
+
+    packet = {"track": "compression", "params": {"bits_per_pixel": 9.0}}
+    params = RealScoreRecomputer._reconstruct_params(
+        bundle, artifacts(compression_scoring="streaming", streaming_rules=rules), packet
+    )
+    assert params == {
+        "vmaf_threshold": 90.0, "scoring": "streaming", "bits_per_pixel": 0.05,
+        "max_keyframe_interval_s": 2.0, "peak_ratio": 1.5, "peak_window_s": 2.0,
+    }
+    assert RealScoreRecomputer._reconstruct_params(bundle, artifacts(), packet) == {"vmaf_threshold": 90.0}
+    with pytest.raises(RuntimeError, match="unknown compression scorer"):
+        RealScoreRecomputer._reconstruct_params(bundle, artifacts(compression_scoring="vbr"), packet)
+    with pytest.raises(RuntimeError, match="streaming_rules invalid"):
+        RealScoreRecomputer._reconstruct_params(
+            bundle, artifacts(compression_scoring="streaming", streaming_rules={"bits_per_pixel": 0}), packet
+        )

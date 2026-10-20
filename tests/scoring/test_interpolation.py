@@ -248,12 +248,18 @@ def test_digests_of_earlier_releases_stay_accepted():
     from vidaio.scoring.result import (
         INTERPOLATION_CONFIG_FIELDS,
         REMOVAL_CONFIG_FIELDS,
+        COMP004_RELEASE_CONFIG_FIELDS,
         accepted_config_digests,
     )
 
     config = ScoringConfig()
     accepted = accepted_config_digests(config)
-    for excluded in (INTERPOLATION_CONFIG_FIELDS, INTERPOLATION_CONFIG_FIELDS | REMOVAL_CONFIG_FIELDS):
+    later = COMP004_RELEASE_CONFIG_FIELDS
+    for excluded in (
+        later,
+        later | INTERPOLATION_CONFIG_FIELDS,
+        later | INTERPOLATION_CONFIG_FIELDS | REMOVAL_CONFIG_FIELDS,
+    ):
         legacy = hashlib.sha256(config.model_dump_json(exclude=set(excluded)).encode()).hexdigest()
         assert legacy in accepted
 

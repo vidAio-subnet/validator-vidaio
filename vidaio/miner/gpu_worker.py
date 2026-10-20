@@ -14,14 +14,17 @@ from __future__ import annotations
 
 import base64
 import binascii
+import contextlib
 import json
 import logging
 import math
 import os
+import queue
 import re
 import selectors
 import signal
 import subprocess
+import threading
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -49,6 +52,9 @@ MAX_GPU_METADATA_BYTES = 16 * 1024
 SUPPORTED_TRACKS = ("compression", "upscaling")
 SUPPORTED_VARIANTS = SUPPORTED_GPU_VARIANTS
 SUPPORTED_UPSCALE_FACTORS = (2, 4)
+#: Frame bound per request unless the deployment raises it (product clips run longer
+#: than inference clips did).
+DEFAULT_MAXIMUM_FRAMES = 3600
 SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -58,7 +64,9 @@ class GpuTaskMetadata(BaseModel):
     solution_variant: str
     input_digest: str
     input_size: int = Field(gt=0)
-    deadline_seconds: float = Field(gt=0, le=600)
+    # Product clips can need more than the inference-era 10 minutes; the Modal function
+    # timeout (at most 3600 s) still bounds every request.
+    deadline_seconds: float = Field(gt=0, le=3600)
     params: dict[str, float | int | str] = Field(default_factory=dict)
 
     @field_validator("protocol")
@@ -197,7 +205,10 @@ def _run_capture(command: list[str], *, deadline: float) -> bytes:
     return completed.stdout
 
 
-def _probe(path: Path, *, ffprobe_path: str, deadline: float) -> VideoInfo:
+def _probe(
+    path: Path, *, ffprobe_path: str, deadline: float,
+    maximum_frames: int = DEFAULT_MAXIMUM_FRAMES,
+) -> VideoInfo:
     raw = _run_capture(
         [
             ffprobe_path,
@@ -226,7 +237,7 @@ def _probe(path: Path, *, ffprobe_path: str, deadline: float) -> VideoInfo:
         raise GpuTransformError(f"input dimensions are outside bounds: {width}x{height}")
     if not (math.isfinite(fps) and 0 < fps <= 120):
         raise GpuTransformError(f"input frame rate is outside bounds: {fps}")
-    if not (1 <= frame_count <= 3600):
+    if not (1 <= frame_count <= maximum_frames):
         raise GpuTransformError(f"input frame count is outside bounds: {frame_count}")
     return VideoInfo(width, height, fps, frame_count)
 
@@ -254,16 +265,19 @@ def _positive_int(params: Mapping[str, object], name: str) -> int | None:
 
 def _cfr_info(
     input_path: Path, info: VideoInfo, *, ffmpeg_path: str, deadline: float,
+    maximum_frames: int = DEFAULT_MAXIMUM_FRAMES,
 ) -> VideoInfo:
     """Count the scorer's CFR timeline without allocating a whole raw clip."""
     command = build_canonicalization_plan(str(input_path), "pipe:1")
     command[0] = ffmpeg_path
-    command[-1:-1] = ["-frames:v", "3601", "-c:v", "wrapped_avframe", "-f", "framecrc"]
+    command[-1:-1] = [
+        "-frames:v", str(maximum_frames + 1), "-c:v", "wrapped_avframe", "-f", "framecrc",
+    ]
     lines = _run_capture(command, deadline=deadline).decode("ascii").splitlines()
     timebases = [line.split(":", 1)[1].strip() for line in lines if line.startswith("#tb 0:")]
     frames = [line for line in lines if line and not line.startswith("#")]
     try:
-        if len(timebases) != 1 or not 1 <= len(frames) <= 3600:
+        if len(timebases) != 1 or not 1 <= len(frames) <= maximum_frames:
             raise ValueError("unbounded CFR frame count or missing timebase")
         fps = float(1 / Fraction(timebases[0]))
         if not math.isfinite(fps) or not 0 < fps <= 120:
@@ -383,6 +397,84 @@ def _detail_filter(tensor, amount: float):  # type: ignore[no-untyped-def]
     return torch.clamp(tensor * (1.0 + amount) - amount * blurred, 0.0, 1.0)
 
 
+def _cuda_device(*, recoverable: bool = False, context: str = ""):  # type: ignore[no-untyped-def]
+    """The CUDA device and its attested label.
+
+    The spool path refuses to run without CUDA (CPU fallback is forbidden there). The
+    streaming path only serves clips the spool path could never take, which used to go
+    straight to the CPU fallback, so for it a missing GPU stays recoverable.
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        if recoverable:
+            prefix = f"{context}; " if context else ""
+            raise RecoverableGpuTransformError(
+                f"{prefix}CUDA is unavailable for the streaming GPU path"
+            )
+        raise GpuTransformError("CUDA is unavailable; CPU fallback is forbidden")
+    torch.use_deterministic_algorithms(True)
+    torch.backends.cudnn.benchmark = False
+    device = torch.device("cuda:0")
+    device_name = str(torch.cuda.get_device_name(device)).replace("\r", " ").replace(
+        "\n", " "
+    )
+    return device, f"cuda:0/{device_name}"
+
+
+# Batches in flight between the decoder, the GPU and the encoder. Two per hop keeps
+# all three busy while memory stays a few batches whatever the clip length.
+_STREAM_QUEUE_DEPTH = 2
+_STREAM_END = object()
+
+
+def _batch_size(info: VideoInfo, target: tuple[int, int]) -> int:
+    # Dynamic batching keeps an 8K request from allocating the whole clip on GPU.
+    pixels = max(info.width * info.height, target[0] * target[1])
+    return max(1, min(8, 8_388_608 // pixels))
+
+
+def _transform_batch(host, *, device, metadata: GpuTaskMetadata, info: VideoInfo, target: tuple[int, int]):  # type: ignore[no-untyped-def]
+    """One batch of RGB24 frames (n, h, w, 3) through the CUDA transform, as uint8."""
+    import torch
+    from torch.nn import functional
+
+    variant = _VARIANTS[metadata.solution_variant]
+    target_width, target_height = target
+    tensor = (
+        torch.from_numpy(host)
+        .to(device=device, dtype=torch.float32, non_blocking=False)
+        .permute(0, 3, 1, 2)
+        / 255.0
+    )
+    if metadata.track == "upscaling":
+        tensor = functional.interpolate(
+            tensor,
+            size=(target_height, target_width),
+            mode=variant.upscale_mode,
+            align_corners=False,
+            antialias=variant.upscale_mode == "bicubic",
+        )
+        tensor = _detail_filter(tensor, variant.upscale_detail)
+    else:
+        if (info.width, info.height) != (target_width, target_height):
+            tensor = functional.interpolate(
+                tensor,
+                size=(target_height, target_width),
+                mode="bicubic",
+                align_corners=False,
+                antialias=True,
+            )
+        tensor = _detail_filter(tensor, variant.compression_detail)
+    return (
+        torch.round(tensor * 255.0)
+        .to(torch.uint8)
+        .permute(0, 2, 3, 1)
+        .cpu()
+        .numpy()
+    )
+
+
 def _gpu_frames(
     source_raw: Path,
     transformed_raw: Path,
@@ -395,16 +487,8 @@ def _gpu_frames(
 ) -> tuple[int, str, float]:
     import numpy as np
     import torch
-    from torch.nn import functional
 
-    if not torch.cuda.is_available():
-        raise GpuTransformError("CUDA is unavailable; CPU fallback is forbidden")
-    torch.use_deterministic_algorithms(True)
-    torch.backends.cudnn.benchmark = False
-    device = torch.device("cuda:0")
-    device_name = str(torch.cuda.get_device_name(device)).replace("\r", " ").replace(
-        "\n", " "
-    )
+    device, device_label = _cuda_device()
     frame_bytes = info.width * info.height * 3
     raw_size = source_raw.stat().st_size
     if raw_size % frame_bytes:
@@ -430,55 +514,22 @@ def _gpu_frames(
         mode="w+",
         shape=(frames, target_height, target_width, 3),
     )
-    variant = _VARIANTS[metadata.solution_variant]
     gpu_started = time.perf_counter()
-    # Dynamic batching keeps an 8K request from allocating the whole clip on GPU.
-    pixels = max(info.width * info.height, target_width * target_height)
-    batch_size = max(1, min(8, 8_388_608 // pixels))
+    batch_size = _batch_size(info, target)
     try:
         for start in range(0, frames, batch_size):
             _remaining(deadline)
             end = min(frames, start + batch_size)
             host = np.asarray(source[start:end]).copy()
-            tensor = (
-                torch.from_numpy(host)
-                .to(device=device, dtype=torch.float32, non_blocking=False)
-                .permute(0, 3, 1, 2)
-                / 255.0
+            output[start:end] = _transform_batch(
+                host, device=device, metadata=metadata, info=info, target=target
             )
-            if metadata.track == "upscaling":
-                tensor = functional.interpolate(
-                    tensor,
-                    size=(target_height, target_width),
-                    mode=variant.upscale_mode,
-                    align_corners=False,
-                    antialias=variant.upscale_mode == "bicubic",
-                )
-                tensor = _detail_filter(tensor, variant.upscale_detail)
-            else:
-                if (info.width, info.height) != (target_width, target_height):
-                    tensor = functional.interpolate(
-                        tensor,
-                        size=(target_height, target_width),
-                        mode="bicubic",
-                        align_corners=False,
-                        antialias=True,
-                    )
-                tensor = _detail_filter(tensor, variant.compression_detail)
-            transformed = (
-                torch.round(tensor * 255.0)
-                .to(torch.uint8)
-                .permute(0, 2, 3, 1)
-                .cpu()
-                .numpy()
-            )
-            output[start:end] = transformed
         torch.cuda.synchronize(device)
         output.flush()
     finally:
         del output
         del source
-    return frames, f"cuda:0/{device_name}", time.perf_counter() - gpu_started
+    return frames, device_label, time.perf_counter() - gpu_started
 
 
 def _encode(
@@ -491,6 +542,25 @@ def _encode(
     ffmpeg_path: str,
     deadline: float,
 ) -> None:
+    _run_capture(
+        _encode_command(
+            str(raw_path), output_path, info=info, target=target,
+            metadata=metadata, ffmpeg_path=ffmpeg_path,
+        ),
+        deadline=deadline,
+    )
+
+
+def _encode_command(
+    source: str,
+    output_path: Path,
+    *,
+    info: VideoInfo,
+    target: tuple[int, int],
+    metadata: GpuTaskMetadata,
+    ffmpeg_path: str,
+) -> list[str]:
+    """Encode raw RGB24 frames from `source` (a spool file or ``pipe:0``)."""
     variant = _VARIANTS[metadata.solution_variant]
     if metadata.track == "compression":
         try:
@@ -508,30 +578,229 @@ def _encode(
             "-pix_fmt", "yuv420p",
         ]
     width, height = target
-    _run_capture(
-        [
-            ffmpeg_path,
-            "-y",
-            "-v",
-            "error",
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "rgb24",
-            "-s:v",
-            f"{width}x{height}",
-            "-r",
-            format(info.fps, ".12g"),
-            "-i",
-            str(raw_path),
-            *codec_args,
-            "-movflags",
-            "+faststart",
-            "-an",
-            str(output_path),
-        ],
-        deadline=deadline,
+    return [
+        ffmpeg_path,
+        "-y",
+        "-v",
+        "error",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-s:v",
+        f"{width}x{height}",
+        "-r",
+        format(info.fps, ".12g"),
+        "-i",
+        source,
+        *codec_args,
+        "-movflags",
+        "+faststart",
+        "-an",
+        str(output_path),
+    ]
+
+
+def _read_up_to(stream, size: int) -> bytes:  # type: ignore[no-untyped-def]
+    """Read `size` bytes; fewer only at the end of the stream."""
+    parts: list[bytes] = []
+    remaining = size
+    while remaining:
+        chunk = stream.read(remaining)
+        if not chunk:
+            break
+        parts.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(parts)
+
+
+def _drain_tail(stream, tail: bytearray) -> None:  # type: ignore[no-untyped-def]
+    for chunk in iter(lambda: stream.read(65536), b""):
+        tail.extend(chunk)
+        del tail[:-8192]
+
+
+def _gpu_stream(
+    input_path: Path,
+    output_path: Path,
+    *,
+    info: VideoInfo,
+    target: tuple[int, int],
+    metadata: GpuTaskMetadata,
+    ffmpeg_path: str,
+    deadline: float,
+    reason: str = "",
+) -> tuple[int, str, float]:
+    """Decode -> CUDA transform -> encode as one pipeline, for clips too long to spool.
+
+    Frames flow through in small batches, so memory and disk stay bounded whatever
+    the clip length, and the encoder sees one continuous stream (one rate-control
+    pass, no segment joins). Reading, the transform and writing run on separate
+    threads with bounded queues between them, so decode, GPU and encode overlap
+    instead of taking turns. A CUDA fault is recoverable (CPU fallback); a decode or
+    encode failure means the media itself is the problem.
+    """
+    import numpy as np
+
+    device, device_label = _cuda_device(recoverable=True, context=reason)
+    decode = build_canonicalization_plan(str(input_path), "pipe:1")
+    decode[0] = ffmpeg_path
+    decode[-1:-1] = ["-f", "rawvideo", "-pix_fmt", "rgb24"]
+    encode = _encode_command(
+        "pipe:0", output_path, info=info, target=target,
+        metadata=metadata, ffmpeg_path=ffmpeg_path,
     )
+    frame_bytes = info.width * info.height * 3
+    batch = _batch_size(info, target)
+    budget = _remaining(deadline)
+    decoder = subprocess.Popen(
+        decode, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+    )
+    encoder = subprocess.Popen(
+        encode, stdin=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+    )
+    assert decoder.stdout is not None and decoder.stderr is not None
+    assert encoder.stdin is not None and encoder.stderr is not None
+    decode_tail, encode_tail = bytearray(), bytearray()
+    drains = [
+        threading.Thread(target=_drain_tail, args=(decoder.stderr, decode_tail), daemon=True),
+        threading.Thread(target=_drain_tail, args=(encoder.stderr, encode_tail), daemon=True),
+    ]
+    for drain in drains:
+        drain.start()
+    expired = threading.Event()
+
+    def expire() -> None:
+        expired.set()
+        _kill_group(decoder)
+        _kill_group(encoder)
+
+    watchdog = threading.Timer(budget, expire)
+    watchdog.daemon = True
+    watchdog.start()
+    stop = threading.Event()
+    decoded: queue.Queue = queue.Queue(maxsize=_STREAM_QUEUE_DEPTH)
+    transformed_batches: queue.Queue = queue.Queue(maxsize=_STREAM_QUEUE_DEPTH)
+    write_failures: list[BaseException] = []
+
+    def put(target_queue: queue.Queue, item: object) -> bool:
+        while not stop.is_set():
+            try:
+                target_queue.put(item, timeout=0.25)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def get(source_queue: queue.Queue) -> object:
+        while True:
+            try:
+                return source_queue.get(timeout=0.25)
+            except queue.Empty:
+                if stop.is_set():
+                    return _STREAM_END
+
+    def read_batches() -> None:
+        decoded_frames = 0
+        try:
+            while not stop.is_set():
+                data = _read_up_to(decoder.stdout, frame_bytes * batch)
+                if not data:
+                    break
+                if len(data) % frame_bytes:
+                    raise GpuTransformError("decoded frame stream ended mid-frame")
+                decoded_frames += len(data) // frame_bytes
+                if decoded_frames > info.frame_count:
+                    raise GpuTransformError(
+                        f"decoded more than the {info.frame_count} committed frames"
+                    )
+                if not put(decoded, data):
+                    return
+            put(decoded, _STREAM_END)
+        except BaseException as exc:  # handed to the transform loop, which raises it
+            put(decoded, exc)
+
+    def write_batches() -> None:
+        try:
+            while True:
+                item = get(transformed_batches)
+                if item is _STREAM_END:
+                    break
+                encoder.stdin.write(item)
+            if not stop.is_set():
+                encoder.stdin.close()
+        except BaseException as exc:  # BrokenPipeError when the encoder exits early
+            write_failures.append(exc)
+            stop.set()
+
+    reader = threading.Thread(target=read_batches, daemon=True)
+    writer = threading.Thread(target=write_batches, daemon=True)
+    reader.start()
+    writer.start()
+    frames = 0
+    gpu_seconds = 0.0
+    try:
+        while True:
+            item = get(decoded)
+            if item is _STREAM_END:
+                break
+            if isinstance(item, BaseException):
+                raise item
+            assert isinstance(item, bytes)
+            count = len(item) // frame_bytes
+            frames += count
+            host = np.frombuffer(item, dtype=np.uint8).reshape(
+                count, info.height, info.width, 3
+            ).copy()
+            started = time.perf_counter()
+            try:
+                transformed = _transform_batch(
+                    host, device=device, metadata=metadata, info=info, target=target
+                )
+            except Exception as exc:  # a CUDA/torch fault mid-stream
+                raise RecoverableGpuTransformError(
+                    f"{reason}; GPU stream transform failed: {type(exc).__name__}: {exc}"
+                ) from exc
+            gpu_seconds += time.perf_counter() - started
+            if not put(transformed_batches, transformed.tobytes()):
+                break
+        put(transformed_batches, _STREAM_END)
+        writer.join(timeout=_remaining(deadline))
+        if write_failures or writer.is_alive():
+            if expired.is_set() or writer.is_alive():
+                raise GpuTransformError("GPU transform deadline exceeded")
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                encoder.wait(timeout=5)
+            drains[1].join(timeout=5)
+            raise GpuTransformError("ffmpeg encode stopped early: " + bytes(encode_tail).decode(
+                "utf-8", errors="replace").strip()) from write_failures[0]
+        decode_rc = decoder.wait(timeout=_remaining(deadline))
+        encode_rc = encoder.wait(timeout=_remaining(deadline))
+        if expired.is_set():
+            raise GpuTransformError("GPU transform deadline exceeded")
+        if decode_rc != 0:
+            detail = bytes(decode_tail).decode("utf-8", errors="replace").strip()
+            raise GpuTransformError(f"ffmpeg decode failed rc={decode_rc}: {detail}")
+        if encode_rc != 0:
+            detail = bytes(encode_tail).decode("utf-8", errors="replace").strip()
+            raise GpuTransformError(f"ffmpeg encode failed rc={encode_rc}: {detail}")
+        if frames != info.frame_count:
+            raise GpuTransformError(
+                f"decoded {frames} frames but ffprobe committed {info.frame_count}"
+            )
+        return frames, device_label, gpu_seconds
+    finally:
+        stop.set()
+        watchdog.cancel()
+        _kill_group(decoder)
+        _kill_group(encoder)
+        for thread in (reader, writer, *drains):
+            thread.join(timeout=5)
+        for pipe in (decoder.stdout, decoder.stderr, encoder.stdin, encoder.stderr):
+            try:
+                pipe.close()
+            except (BrokenPipeError, OSError):
+                pass
 
 
 def transform_media(
@@ -544,6 +813,7 @@ def transform_media(
     maximum_raw_bytes: int = 4 * 1024 * 1024 * 1024,
     maximum_output_bytes: int = 4 * 1024 * 1024 * 1024,
     allow_cpu_fallback: bool = False,
+    maximum_frames: int = DEFAULT_MAXIMUM_FRAMES,
 ) -> TransformResult:
     """Bounded decode -> CUDA transform -> software encode per the task codec params.
 
@@ -565,7 +835,10 @@ def transform_media(
             )
         except PremiumEncodeError as exc:
             raise GpuTransformError(str(exc)) from None
-        out_info = _probe(output_path, ffprobe_path=ffprobe_path, deadline=deadline)
+        out_info = _probe(
+            output_path, ffprobe_path=ffprobe_path, deadline=deadline,
+            maximum_frames=maximum_frames,
+        )
         return TransformResult(
             output_path=output_path,
             frames=out_info.frame_count,
@@ -574,53 +847,74 @@ def transform_media(
             device=f"{DEVICE_PREFIX}{encoder}",
             gpu_seconds=0.0,
         )
-    info = _probe(input_path, ffprobe_path=ffprobe_path, deadline=deadline)
+    info = _probe(
+        input_path, ffprobe_path=ffprobe_path, deadline=deadline,
+        maximum_frames=maximum_frames,
+    )
     target = _target(info, metadata)
-    info = _cfr_info(input_path, info, ffmpeg_path=ffmpeg_path, deadline=deadline)
+    info = _cfr_info(
+        input_path, info, ffmpeg_path=ffmpeg_path, deadline=deadline,
+        maximum_frames=maximum_frames,
+    )
     input_raw = output_path.with_suffix(".input.rgb")
     transformed_raw = output_path.with_suffix(".gpu.rgb")
     expected_input_raw = info.frame_count * info.width * info.height * 3
+    expected_output_raw = info.frame_count * target[0] * target[1] * 3
     try:
-        if expected_input_raw > maximum_raw_bytes:
-            raise RecoverableGpuTransformError(
+        if max(expected_input_raw, expected_output_raw) > maximum_raw_bytes:
+            # Too long to spool as raw frames: stream them through the GPU instead.
+            reason = (
                 f"decoded input projects to {expected_input_raw} bytes, cap is "
                 f"{maximum_raw_bytes}"
+                if expected_input_raw > maximum_raw_bytes
+                else f"transformed raw video projects to {expected_output_raw} bytes, "
+                f"cap is {maximum_raw_bytes}"
             )
-        expected_output_raw = info.frame_count * target[0] * target[1] * 3
-        if expected_output_raw > maximum_raw_bytes:
-            raise RecoverableGpuTransformError(
-                f"transformed raw video projects to {expected_output_raw} bytes, cap is "
-                f"{maximum_raw_bytes}"
+            LOGGER.info(
+                "GPU streaming path track=%s variant=%s input=%s frames=%s reason=%s",
+                metadata.track, metadata.solution_variant, metadata.input_digest[:12],
+                info.frame_count, reason,
             )
-        decoded = _decode_bounded(
-            input_path,
-            input_raw,
-            ffmpeg_path=ffmpeg_path,
-            maximum_bytes=maximum_raw_bytes,
-            deadline=deadline,
-        )
-        if decoded != expected_input_raw:
-            raise RecoverableGpuTransformError(
-                f"decoded byte count {decoded} != projected {expected_input_raw}"
+            frames, device, gpu_seconds = _gpu_stream(
+                input_path,
+                output_path,
+                info=info,
+                target=target,
+                metadata=metadata,
+                ffmpeg_path=ffmpeg_path,
+                deadline=deadline,
+                reason=reason,
             )
-        frames, device, gpu_seconds = _gpu_frames(
-            input_raw,
-            transformed_raw,
-            info=info,
-            target=target,
-            metadata=metadata,
-            maximum_output_raw_bytes=maximum_raw_bytes,
-            deadline=deadline,
-        )
-        _encode(
-            transformed_raw,
-            output_path,
-            info=info,
-            target=target,
-            metadata=metadata,
-            ffmpeg_path=ffmpeg_path,
-            deadline=deadline,
-        )
+        else:
+            decoded = _decode_bounded(
+                input_path,
+                input_raw,
+                ffmpeg_path=ffmpeg_path,
+                maximum_bytes=maximum_raw_bytes,
+                deadline=deadline,
+            )
+            if decoded != expected_input_raw:
+                raise RecoverableGpuTransformError(
+                    f"decoded byte count {decoded} != projected {expected_input_raw}"
+                )
+            frames, device, gpu_seconds = _gpu_frames(
+                input_raw,
+                transformed_raw,
+                info=info,
+                target=target,
+                metadata=metadata,
+                maximum_output_raw_bytes=maximum_raw_bytes,
+                deadline=deadline,
+            )
+            _encode(
+                transformed_raw,
+                output_path,
+                info=info,
+                target=target,
+                metadata=metadata,
+                ffmpeg_path=ffmpeg_path,
+                deadline=deadline,
+            )
         if not output_path.is_file() or output_path.stat().st_size < 1:
             raise GpuTransformError("encoder produced no output")
         if output_path.stat().st_size > maximum_output_bytes:
@@ -650,6 +944,7 @@ def transform_media(
             input_path, output_path, metadata, info=info, target=target,
             ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path,
             maximum_output_bytes=maximum_output_bytes, deadline=deadline,
+            maximum_frames=maximum_frames,
         )
     except BaseException:
         output_path.unlink(missing_ok=True)
@@ -670,6 +965,7 @@ def _stream_cpu_fallback(
     ffprobe_path: str,
     maximum_output_bytes: int,
     deadline: float,
+    maximum_frames: int = DEFAULT_MAXIMUM_FRAMES,
 ) -> TransformResult:
     """Stream validated media without raw spools, under the original deadline."""
     variant = _VARIANTS[metadata.solution_variant]
@@ -712,7 +1008,10 @@ def _stream_cpu_fallback(
         )
         if not output_path.is_file() or not 0 < output_path.stat().st_size <= maximum_output_bytes:
             raise GpuTransformError("CPU fallback output is empty or exceeded its byte cap")
-        result = _probe(output_path, ffprobe_path=ffprobe_path, deadline=deadline)
+        result = _probe(
+            output_path, ffprobe_path=ffprobe_path, deadline=deadline,
+            maximum_frames=maximum_frames,
+        )
         if (result.width, result.height) != target or result.frame_count != info.frame_count:
             raise GpuTransformError("CPU fallback changed the required geometry or frame count")
         if not math.isclose(result.fps, info.fps, rel_tol=0.001):

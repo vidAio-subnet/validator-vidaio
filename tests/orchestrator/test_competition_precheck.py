@@ -30,11 +30,12 @@ def test_tag_plus_digest_add_and_user_are_reported() -> None:
 
 
 def test_the_shipped_examples_pass() -> None:
-    for example in ("removal_example", "interpolation_example", "cpu_compression"):
+    for example in ("removal_example", "interpolation_example", "upscaling_example", "streaming_example", "cpu_compression"):
         assert precheck.main([str(ROOT / "examples" / "competition_contenders" / example)]) == 0
-    # the interpolation example is a valid start for a commercial-use competition
-    interpolation = ROOT / "examples" / "competition_contenders" / "interpolation_example"
-    assert precheck.main([str(interpolation), "--commercial"]) == 0
+    # the interpolation and upscaling examples are valid starts for a commercial-use competition
+    for example in ("interpolation_example", "upscaling_example", "streaming_example"):
+        path = ROOT / "examples" / "competition_contenders" / example
+        assert precheck.main([str(path), "--commercial"]) == 0
 
 
 def test_symlinks_and_missing_run_sh_are_blocking(tmp_path: Path) -> None:

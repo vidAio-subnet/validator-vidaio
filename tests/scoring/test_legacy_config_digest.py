@@ -23,6 +23,9 @@ from vidaio.scoring.gates import ReasonCode, ValidityViolation
 from vidaio.scoring.result import (
     INTERPOLATION_CONFIG_FIELDS,
     REMOVAL_CONFIG_FIELDS,
+    COMP004_RELEASE_CONFIG_FIELDS,
+    STREAMING_CONFIG_FIELDS,
+    UPSCALING_FAITHFUL_CONFIG_FIELDS,
     accepted_config_digests,
     compose_item_score,
     config_digest,
@@ -33,7 +36,7 @@ def _legacy(config: ScoringConfig) -> str:
     """The digest the pre-removal release computed (it had neither later field set)."""
     return hashlib.sha256(
         config.model_dump_json(
-            exclude=set(REMOVAL_CONFIG_FIELDS | INTERPOLATION_CONFIG_FIELDS)
+            exclude=set(REMOVAL_CONFIG_FIELDS | INTERPOLATION_CONFIG_FIELDS | COMP004_RELEASE_CONFIG_FIELDS)
         ).encode("utf-8")
     ).hexdigest()
 
@@ -41,7 +44,17 @@ def _legacy(config: ScoringConfig) -> str:
 def _pre_interpolation(config: ScoringConfig) -> str:
     """The digest the removal release computed (before the interpolation fields)."""
     return hashlib.sha256(
-        config.model_dump_json(exclude=set(INTERPOLATION_CONFIG_FIELDS)).encode("utf-8")
+        config.model_dump_json(
+            exclude=set(INTERPOLATION_CONFIG_FIELDS | COMP004_RELEASE_CONFIG_FIELDS)
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _pre_upscaling_faithful(config: ScoringConfig) -> str:
+    """The digest the interpolation release computed (before the comp 004 release fields:
+    faithful upscaling and streaming compression)."""
+    return hashlib.sha256(
+        config.model_dump_json(exclude=set(COMP004_RELEASE_CONFIG_FIELDS)).encode("utf-8")
     ).hexdigest()
 
 
@@ -64,11 +77,27 @@ def test_interpolation_field_set_is_the_frozen_history():
     assert INTERPOLATION_CONFIG_FIELDS <= set(ScoringConfig.model_fields)
 
 
-def test_accepted_digests_are_current_pre_interpolation_and_pre_removal():
+def test_upscaling_faithful_field_set_is_the_frozen_history():
+    assert UPSCALING_FAITHFUL_CONFIG_FIELDS == {
+        "upscaling_faithful_weights", "upscaling_faithful_psnr_span_db",
+        "upscaling_faithful_lpips_stride", "upscaling_faithful_lpips_max_side",
+    }
+    assert UPSCALING_FAITHFUL_CONFIG_FIELDS <= set(ScoringConfig.model_fields)
+
+
+def test_streaming_field_set_is_the_frozen_history():
+    assert STREAMING_CONFIG_FIELDS == {"streaming_vmaf_floor", "streaming_rate_tolerance"}
+    assert COMP004_RELEASE_CONFIG_FIELDS == UPSCALING_FAITHFUL_CONFIG_FIELDS | STREAMING_CONFIG_FIELDS
+    assert STREAMING_CONFIG_FIELDS <= set(ScoringConfig.model_fields)
+
+
+def test_accepted_digests_are_current_and_every_earlier_release():
     config = ScoringConfig()
-    assert len({_legacy(config), _pre_interpolation(config), config_digest(config)}) == 3
+    digests = {_legacy(config), _pre_interpolation(config), _pre_upscaling_faithful(config), config_digest(config)}
+    assert len(digests) == 4
     assert accepted_config_digests(config) == {
         config_digest(config),
+        _pre_upscaling_faithful(config),
         _pre_interpolation(config),
         _legacy(config),
     }

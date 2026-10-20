@@ -13,6 +13,10 @@ GPU is contender execution only. Every batch gets a new GPU Sandbox and a fresh,
 content-bound input Image. Modal exposes a sandbox-local writable overlay when an
 Image is mounted, so the isolation probe destroys its writer and remounts the same
 Image in a second fresh CPU Sandbox to prove that writes did not reach the base.
+Modal adds its own directories (``__modal``, ``dev``, ``etc``, ``proc``, ``sys``,
+``tmp``) to the root of every Image, so the inputs sit in a ``clips/`` subdirectory of
+the input Image and ``run.sh`` receives that subdirectory: the folder a solution lists
+holds exactly the batch's input files.
 An upscaling input has only its low-resolution bytes and a hidden digest-bound
 sidecar containing the committed 2x/4x factor; no reference identifier or bytes
 enter the image. Output is watched, frozen into a short-lived image, then copied
@@ -87,6 +91,9 @@ _RESOURCE_RE = re.compile(r"^vidaio-next-[a-zA-Z0-9._-]{6,52}$")
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _IMAGE_OBJECT_ID_RE = re.compile(r"^im-[A-Za-z0-9_-]{1,128}$")
 _REMOTE_INPUT = "/evaluation-inputs"
+#: The input Image's subdirectory holding the batch inputs; ``run.sh`` gets this path.
+_INPUT_SUBDIR = "clips"
+_REMOTE_INPUT_DIR = f"{_REMOTE_INPUT}/{_INPUT_SUBDIR}"
 _REMOTE_OUTPUT = "/output"
 _COLLECTED_OUTPUT = "/collected-output"
 _TAIL_BYTES = 2000
@@ -119,7 +126,7 @@ elif command -v getent >/dev/null 2>&1; then
   getent hosts example.com >/dev/null 2>&1 && net=1 || net=0
 fi
 echo "NETWORK_ATTEMPT=$net"
-w=0; ( : > /evaluation-inputs/.probe-write ) 2>/dev/null && w=1
+w=0; ( : > /evaluation-inputs/clips/.probe-write ) 2>/dev/null && w=1
 echo "INPUT_WRITE=$w"
 m=0
 for d in /reference /references /holdout /evaluation-reference; do
@@ -127,7 +134,7 @@ for d in /reference /references /holdout /evaluation-reference; do
 done
 echo "REF_MOUNTS=$m"
 i=0
-for f in /evaluation-inputs/index.json /index.json /app/index.json; do
+for f in /evaluation-inputs/clips/index.json /evaluation-inputs/index.json /index.json /app/index.json; do
   [ -e "$f" ] && i=1
 done
 echo "INDEX_LEAK=$i"
@@ -140,7 +147,7 @@ echo "PROBE_DONE=1"
 _INPUT_OVERLAY_CHECK_SCRIPT = """\
 #!/bin/sh
 mutated=0
-[ -e /evaluation-inputs/.probe-write ] && mutated=1
+[ -e /evaluation-inputs/clips/.probe-write ] && mutated=1
 echo "INPUT_BASE_MUTATED=$mutated"
 echo "OVERLAY_CHECK_DONE=1"
 """
@@ -779,7 +786,9 @@ class ModalSandboxRunner:
         image = self._resolve_image(image_digest)
         probe_dir = self._new_scratch("modal-probe", image_digest, 0)
         empty_inputs = probe_dir / "inputs"
-        empty_inputs.mkdir()
+        # the probe writes into the (empty) input folder a batch would get
+        (empty_inputs / _INPUT_SUBDIR).mkdir(parents=True)
+        (empty_inputs / _INPUT_SUBDIR / ".keep").write_bytes(b"")
         lease: ModalSandboxLease | None = None
         overlay_lease: ModalSandboxLease | None = None
         attestation: SandboxRequestAttestation | None = None
@@ -897,14 +906,15 @@ class ModalSandboxRunner:
 
         run_dir = self._new_scratch("modal-run", image_digest, batch_index)
         in_dir = run_dir / "inputs"
+        clips_dir = in_dir / _INPUT_SUBDIR
         collected_dir = run_dir / "collected"
-        in_dir.mkdir()
+        clips_dir.mkdir(parents=True)
         collected_dir.mkdir()
         lease: ModalSandboxLease | None = None
         collector: ModalSandboxLease | None = None
         try:
             for item in items:
-                self._stage_input(item, in_dir)
+                self._stage_input(item, clips_dir)
             try:
                 input_image = self._runtime.build_input_image(in_dir)
             except Exception as exc:
@@ -930,7 +940,7 @@ class ModalSandboxRunner:
             self._assert_request_isolation(lease, _REMOTE_INPUT, gpu=True)
             result = self._execute_watched(
                 lease,
-                ["/bin/sh", "/app/run.sh", _REMOTE_INPUT, _REMOTE_OUTPUT],
+                ["/bin/sh", "/app/run.sh", _REMOTE_INPUT_DIR, _REMOTE_OUTPUT],
                 timeout_seconds=self._cfg.batch_timeout_seconds,
                 output_root=_REMOTE_OUTPUT,
                 what=f"batch {batch_index} ({image_digest[:16]})",

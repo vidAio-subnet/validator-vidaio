@@ -55,7 +55,7 @@ def test_gpu_metadata_accepts_both_tracks_and_all_rank_variants() -> None:
         ("solution_variant", "secret-fourth-profile", "variant"),
         ("input_digest", "ABC", "sha256"),
         ("input_size", 0, "greater than 0"),
-        ("deadline_seconds", 601, "less than or equal to 600"),
+        ("deadline_seconds", 3601, "less than or equal to 3600"),
     ],
 )
 def test_gpu_metadata_fails_closed(field: str, value: object, message: str) -> None:

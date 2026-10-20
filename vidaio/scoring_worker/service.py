@@ -101,6 +101,28 @@ from prometheus_client import CollectorRegistry, Counter, Histogram
 from vidaio.audit.canonical import canonical_json_bytes, sha256_hex
 from vidaio.core import log_fields, section
 from vidaio.scoring.interpolation_formula import INTERPOLATION_FRAME_FACTOR
+from vidaio.scoring.streaming import (
+    StreamingRules,
+    score_streaming,
+    streaming_target_kbps,
+    streaming_violations,
+)
+from vidaio.scoring_worker.streaming_backend import (
+    FfprobeStreamingBackend,
+    StreamingMeasurementError,
+    StreamingPacketBackend,
+)
+from vidaio.scoring_worker.upscaling_faithful_backend import (
+    CpuUpscalingFaithfulBackend,
+    UpscalingFaithfulCancelled,
+    UpscalingFaithfulInputError,
+    UpscalingFaithfulMeasurementError,
+    UpscalingFaithfulMetricsBackend,
+)
+from vidaio.scoring.upscaling_faithful_formula import (
+    UPSCALING_FAITHFUL_FACTORS,
+    score_upscaling_faithful,
+)
 from vidaio.scoring_worker.interpolation_backend import (
     CpuInterpolationBackend,
     InterpolationCancelled,
@@ -130,6 +152,7 @@ from vidaio.scoring import (
     ValidityViolation,
     VmafBackend,
     build_canonicalization_plan,
+    untagged_color_fill,
     compose_item_score,
     score_removal,
     score_interpolation,
@@ -238,6 +261,12 @@ class ScoringBackends:
     #: Frame-interpolation metrics (vidaio/scoring_worker/interpolation_backend.py);
     #: None = track not configured (an interpolation request then gets an honest 501).
     interpolation: InterpolationMetricsBackend | None = None
+    #: Faithful upscaling metrics (vidaio/scoring_worker/upscaling_faithful_backend.py), used for
+    #: upscaling requests with ``params["scoring"] == "faithful"``; None = not configured (501).
+    upscaling_faithful: UpscalingFaithfulMetricsBackend | None = None
+    #: Streaming compression packet measurement (vidaio/scoring_worker/streaming_backend.py),
+    #: used for compression requests with ``params["scoring"] == "streaming"``; None = 501.
+    streaming: StreamingPacketBackend | None = None
     #: Stamped into every packet (probed once at composition time, spec §08).
     versions: Mapping[str, str] = field(default_factory=dict)
     #: Complete executable-runtime preimage for the ``versions["runtime"]``
@@ -297,6 +326,7 @@ def real_backends(
     removal_backend = CpuRemovalBackend(config.ffmpeg_path)
     # one LPIPS-VGG network per worker thread, shared by the removal and interpolation tracks
     interpolation_backend = CpuInterpolationBackend(lpips_loader=removal_backend.lpips_net)
+    upscaling_faithful_backend = CpuUpscalingFaithfulBackend(lpips_loader=removal_backend.lpips_net)
     versions = complete_payout_backend_versions(
         versions,
         pieapp=pieapp,
@@ -317,6 +347,8 @@ def real_backends(
         perceptual=perceptual,
         removal=removal_backend,
         interpolation=interpolation_backend,
+        upscaling_faithful=upscaling_faithful_backend,
+        streaming=FfprobeStreamingBackend(config.ffprobe_path, timeout=config.subprocess_timeout),
         canonicalizer=CanonicalizeExecutor(
             config.ffmpeg_path, timeout=config.subprocess_timeout
         ),
@@ -606,11 +638,18 @@ def _score_in_dir(
             candidate=cand_info,
             model_delta_input=delta_input_info,
         )
-        ref_plan = build_canonicalization_plan(reference_path, canon_ref)
-        cand_plan = build_canonicalization_plan(output_path, canon_cand)
+        # A stream that does not state its colour matrix/range is read as the
+        # canonical BT.709/tv (untagged_color_fill), never converted from BT.601.
+        ref_plan = build_canonicalization_plan(
+            reference_path, canon_ref, **untagged_color_fill(ref_info)
+        )
+        cand_plan = build_canonicalization_plan(
+            output_path, canon_cand, **untagged_color_fill(cand_info)
+        )
         input_plan = build_canonicalization_plan(
             miner_input_path,
             canon_input,
+            **untagged_color_fill(input_info),
             scale_width=(
                 cand_info.width
                 if (input_info.width, input_info.height)
@@ -703,9 +742,13 @@ def _score_in_dir(
 
     # 5) Metrics per track.
     params = request.params
+    # Competition upscaling is scored "faithful" (vidaio/scoring/upscaling_faithful.py): the
+    # output against the sealed original, credited over a Lanczos upscale of the served input.
+    # Every other upscaling request keeps the PieAPP/VMAF formula.
+    upscaling_faithful = request.track == TRACK_UPSCALING and str(params.get("scoring", "")) == "faithful"
     pieapp_value: float | None = None
     start_frame: int | None = None
-    if request.track == TRACK_UPSCALING and dims_match:
+    if request.track == TRACK_UPSCALING and dims_match and not upscaling_faithful:
         window = usable_frames(
             canon_ref_info.frame_count, scoring_config.pieapp_sample_window
         )
@@ -719,7 +762,7 @@ def _score_in_dir(
             pieapp_value = backends.pieapp.compute(
                 canon_ref, canon_cand, start_frame=start_frame
             )
-    if request.track == TRACK_UPSCALING and pieapp_value is None:
+    if request.track == TRACK_UPSCALING and pieapp_value is None and not upscaling_faithful:
         extra_violations = extra_violations + [
             ValidityViolation(
                 code=ReasonCode.METRIC_MISSING,
@@ -730,7 +773,7 @@ def _score_in_dir(
     vmaf_primary: float | None = None
     vmaf_delta_primary: float | None = None
     vmaf_delta_secondary: float | None = None
-    if dims_match and request.track not in (TRACK_REMOVAL, TRACK_INTERPOLATION):
+    if dims_match and request.track not in (TRACK_REMOVAL, TRACK_INTERPOLATION) and not upscaling_faithful:
         # Round-4 an internal review: each VMAF run's JSON log is hard-bounded to the
         # per-run share of the metric-log reservation taken above — the same
         # watchdog that bounds a canonicalization kills the run past it. Blown
@@ -956,6 +999,106 @@ def _score_in_dir(
                 ),
             ]
 
+    # 5f) Faithful upscaling: every output frame vs the sealed original, and the Lanczos floor
+    #     (the canonical served input, already Lanczos-upscaled to the candidate geometry).
+    faithful_measurement = None
+    faithful_factor: int | None = None
+    if upscaling_faithful:
+        faithful_factor = _param_int(params, "upscale_factor")
+        if faithful_factor not in UPSCALING_FAITHFUL_FACTORS:
+            raise ScoreRejected(
+                422,
+                {
+                    "error": "upscaling_factor_unsupported",
+                    "detail": f"upscale_factor {faithful_factor} (supported: {list(UPSCALING_FAITHFUL_FACTORS)})",
+                },
+            )
+    if upscaling_faithful and dims_match:
+        if backends.upscaling_faithful is None:
+            raise NotConfiguredError("faithful upscaling metrics backend is not configured")
+        lpips_stride = max(1, int(scoring_config.upscaling_faithful_lpips_stride))
+        # which frames LPIPS samples is derived from the HELD-OUT reference digest
+        lpips_offset = (
+            derive_pieapp_start_frame(snapshot.reference.digest, request.challenge_id, lpips_stride)
+            if lpips_stride > 1
+            else 0
+        )
+        frame_count_ok = not any(
+            v.code == ReasonCode.FRAME_COUNT_MISMATCH for v in extra_violations
+        )
+        scope = current_process_scope()
+        if frame_count_ok:
+            try:
+                faithful_measurement = backends.upscaling_faithful.measure(
+                    canonical_reference=canon_ref,
+                    canonical_candidate=canon_cand,
+                    canonical_upscaled_input=canon_input,
+                    config=scoring_config,
+                    lpips_offset=lpips_offset,
+                    cancelled=(lambda: scope.cancelled) if scope else None,
+                    # the floor depends only on the verified original + served input
+                    floor_key=(snapshot.reference.digest, snapshot.miner_input.digest),
+                )
+            except UpscalingFaithfulCancelled as exc:
+                raise MediaWorkCancelled(str(exc)) from exc
+            except UpscalingFaithfulInputError as exc:
+                # validator-side: original / served input unusable — refuse, never a zero
+                raise ScoreRejected(
+                    422, {"error": "upscaling_input_unmeasurable", "detail": str(exc)[:300]}
+                ) from exc
+            except UpscalingFaithfulMeasurementError as exc:
+                extra_violations = [
+                    *extra_violations,
+                    ValidityViolation(code=ReasonCode.METRIC_MISSING, detail=str(exc)[:300]),
+                ]
+
+    # 5g) Streaming compression: the candidate's packets against the clip's bitrate budget
+    #     and the delivery rules (vidaio/scoring/streaming.py). The budget comes from the
+    #     reference's own geometry and frame rate under the anchored rule.
+    streaming = request.track == TRACK_COMPRESSION and str(params.get("scoring", "")) == "streaming"
+    streaming_measurement = None
+    streaming_target: float | None = None
+    if streaming:
+        if backends.streaming is None:
+            raise NotConfiguredError("streaming packet backend is not configured")
+        try:
+            rules = StreamingRules(
+                bits_per_pixel=_param_float(params, "bits_per_pixel"),
+                max_keyframe_interval_seconds=_param_float(params, "max_keyframe_interval_s"),
+                peak_ratio=_param_float(params, "peak_ratio"),
+                peak_window_seconds=_param_float(params, "peak_window_s"),
+            )
+        except ValueError as exc:
+            raise ScoreRejected(
+                422, {"error": "streaming_rules_invalid", "detail": str(exc)[:300]}
+            ) from exc
+        fps, frames = canon_ref_info.fps, canon_ref_info.frame_count
+        try:
+            streaming_target = streaming_target_kbps(
+                width=canon_ref_info.width, height=canon_ref_info.height, fps=fps,
+                bits_per_pixel=rules.bits_per_pixel,
+            )
+        except ValueError as exc:
+            # validator-side: the sealed reference has no usable timing — refuse, never a zero
+            raise ScoreRejected(422, {"error": "streaming_reference_unmeasurable", "detail": str(exc)}) from exc
+        try:
+            streaming_measurement = backends.streaming.measure(
+                output_path, fps=fps, frames=frames, peak_window_seconds=rules.peak_window_seconds
+            )
+        except StreamingMeasurementError as exc:
+            extra_violations = [
+                *extra_violations,
+                ValidityViolation(code=ReasonCode.METRIC_MISSING, detail=str(exc)[:300]),
+            ]
+        else:
+            extra_violations = [
+                *extra_violations,
+                *streaming_violations(
+                    streaming_measurement, target_kbps=streaming_target, rules=rules, fps=fps,
+                    config=scoring_config,
+                ),
+            ]
+
     # 6) Gates, then composition (gates-first zeroing lives in compose_item_score).
     #    perceptual_checks="skip" swaps the three backend-driven perceptual gates
     #    for auditable GateSkip records (config.py); "required" runs them for real
@@ -982,6 +1125,8 @@ def _score_in_dir(
         vmaf_delta_secondary=vmaf_delta_secondary,
         upscale_factor=_param_int(params, "upscale_factor"),
         extra_violations=extra_violations,
+        upscaling_faithful=upscaling_faithful,
+        streaming=streaming,
     )
     passed, violations = gate_pipeline.run(ctx)
 
@@ -1014,8 +1159,26 @@ def _score_in_dir(
         metrics["psnr_uv_input"] = chroma.psnr_uv_input
         metrics["chroma_residual"] = chroma.residual
         metrics["source_proximity_basis"] = "pristine_minus_miner_input"
-    if (
+    if streaming and vmaf_scored is not None and streaming_measurement is not None:
+        breakdown = score_streaming(
+            vmaf=vmaf_scored,
+            measurement=streaming_measurement,
+            target_kbps=streaming_target,
+            config=scoring_config,
+        )
+        metrics.update(
+            {
+                "stream_target_kbps": streaming_target,
+                "stream_avg_kbps": streaming_measurement.avg_kbps,
+                "stream_peak_kbps": streaming_measurement.peak_kbps,
+                "stream_max_keyframe_interval_s": streaming_measurement.max_keyframe_interval_seconds,
+                "stream_keyframes": streaming_measurement.keyframes,
+                "final_score": breakdown.final,
+            }
+        )
+    elif (
         request.track == TRACK_COMPRESSION
+        and not streaming
         and vmaf_scored is not None
         and input_info.byte_size > 0
     ):
@@ -1083,7 +1246,26 @@ def _score_in_dir(
                 "final_score": breakdown.final,
             }
         )
-    elif request.track == TRACK_UPSCALING and pieapp_value is not None:
+    elif upscaling_faithful and faithful_measurement is not None and faithful_factor is not None:
+        measured = faithful_measurement
+        breakdown = score_upscaling_faithful(
+            metrics=measured.metrics, floor=measured.floor, upscale_factor=faithful_factor, config=scoring_config
+        )
+        metrics.update(
+            {
+                "upscale_psnr_db": breakdown.psnr_db,
+                "upscale_ssim": breakdown.ssim,
+                "upscale_lpips_vgg": breakdown.lpips_vgg,
+                "upscale_floor_psnr_db": breakdown.floor_psnr_db,
+                "upscale_floor_ssim": breakdown.floor_ssim,
+                "upscale_floor_lpips_vgg": breakdown.floor_lpips_vgg,
+                "upscale_frames": breakdown.frames,
+                "upscale_factor": breakdown.upscale_factor,
+                "lpips_offset": measured.lpips_offset,
+                "final_score": breakdown.final,
+            }
+        )
+    elif request.track == TRACK_UPSCALING and pieapp_value is not None and not upscaling_faithful:
         content_length = _param_float(params, "content_length")
         if content_length is None:
             content_length = canon_ref_info.duration

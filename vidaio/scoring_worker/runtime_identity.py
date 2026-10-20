@@ -83,6 +83,8 @@ _REQUIRED_PAYOUT_BACKENDS = frozenset(
         "numpy",
         "removal_metrics",
         "interpolation_metrics",
+        "upscaling_faithful_metrics",
+        "streaming_packets",
         "lpips",
         "python",
     }
@@ -106,6 +108,8 @@ def _distribution_version(*names: str) -> str:
 
 REMOVAL_METRICS_VERSION = "removal-metrics/2"
 INTERPOLATION_METRICS_VERSION = "interpolation-metrics/1"
+UPSCALING_FAITHFUL_METRICS_VERSION = "upscaling-faithful-metrics/1"
+STREAMING_PACKETS_VERSION = "streaming-packets/1"
 
 
 def complete_payout_backend_versions(
@@ -142,6 +146,9 @@ def complete_payout_backend_versions(
             # frame-interpolation track: inserted-frame metrics implementation (same
             # LPIPS package and OpenCV pins as removal)
             "interpolation_metrics": INTERPOLATION_METRICS_VERSION,
+            # faithful upscaling (competitions): frame metrics vs the sealed original
+            "upscaling_faithful_metrics": UPSCALING_FAITHFUL_METRICS_VERSION,
+            "streaming_packets": STREAMING_PACKETS_VERSION,
             "lpips": f"lpips/{_distribution_version('lpips')}",
             "python": (
                 f"{platform.python_implementation().lower()}/"

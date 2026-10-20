@@ -57,6 +57,10 @@ def test_modal_runner_config_rejects_nonfinite_provider_limits(
         ModalRunnerConfig(**{field: value})
 
 
+#: Directories Modal adds to the root of every Image (verified on Modal 2026-10-19).
+MODAL_IMAGE_ROOT_DIRS = ("__modal", "dev", "etc", "proc", "sys", "tmp")
+
+
 @dataclass
 class _Image:
     files: dict[str, tuple[str, bytes]]
@@ -101,8 +105,15 @@ class _Lease:
         assert isinstance(image, _Image)
         self.mounts.append(path)
         self.directories.add(path)
+        # like Modal: every Image root also carries the platform's own directories
+        for name in MODAL_IMAGE_ROOT_DIRS:
+            self.directories.add(f"{path}/{name}")
         for relative, value in image.files.items():
-            self.files[f"{path}/{relative.lstrip('/')}"] = value
+            remote = f"{path}/{relative.lstrip('/')}"
+            self.files[remote] = value
+            for parent in PurePosixPath(remote).parents:
+                if PurePosixPath(path) in PurePosixPath(parent).parents:
+                    self.directories.add(str(parent))
 
     def make_directory(self, path: str) -> None:
         self.directories.add(path)
@@ -139,11 +150,15 @@ class _Lease:
         assert list(args) == [
             "/bin/sh",
             "/app/run.sh",
-            "/evaluation-inputs",
+            "/evaluation-inputs/clips",
             "/output",
         ]
+        # what a solution sees when it lists its <input_dir>
+        self.runtime.listed_inputs.append(
+            sorted(PurePosixPath(entry.path).name for entry in self.list_files(args[2]))
+        )
         for path, (kind, data) in list(self.files.items()):
-            if PurePosixPath(path).parent != PurePosixPath("/evaluation-inputs"):
+            if PurePosixPath(path).parent != PurePosixPath("/evaluation-inputs/clips"):
                 continue
             if PurePosixPath(path).name.startswith("."):
                 continue
@@ -226,6 +241,7 @@ class _Runtime:
         self.image_bytes = 5_000_000_000
         self.du_returncode = 0
         self.du_calls: list[tuple[str, ...]] = []
+        self.listed_inputs: list[list[str]] = []
 
     def available(self) -> bool:
         return not self.closed
@@ -242,8 +258,9 @@ class _Runtime:
 
     def build_input_image(self, staged_inputs: Path) -> object:
         files = {
-            path.name: ("file", path.read_bytes())
-            for path in sorted(staged_inputs.iterdir())
+            path.relative_to(staged_inputs).as_posix(): ("file", path.read_bytes())
+            for path in sorted(staged_inputs.rglob("*"))
+            if path.is_file()
         }
         image = _Image(files)
         self.input_images.append(image)
@@ -371,11 +388,14 @@ def test_build_probe_run_rolls_fresh_sandboxes_and_collects_bytes(tmp_path: Path
         for call in runtime.create_calls
         if call["role"] in {"probe-overlay-check", "collector"}
     )
-    # Probe got an empty image; each batch got only its digest-named sealed file.
-    assert runtime.input_images[0].files == {}
+    # Probe got an empty input folder; each batch got only its digest-named sealed file,
+    # and run.sh's <input_dir> lists exactly that file (none of Modal's root dirs).
+    assert runtime.input_images[0].files == {"clips/.keep": ("file", b"")}
     assert all(
-        set(image.files) == {item.input_sha256} for image in runtime.input_images[1:]
+        set(image.files) == {f"clips/{item.input_sha256}"}
+        for image in runtime.input_images[1:]
     )
+    assert runtime.listed_inputs == [[item.input_sha256], [item.input_sha256]]
 
 
 def test_repeated_spec_reuses_exact_image_from_same_fresh_modal_run(
@@ -544,11 +564,13 @@ def test_mixed_upscale_factors_are_digest_bound_without_reference_material(
     sidecar_two = upscale_task_sidecar_name(two_x.input_sha256)
     sidecar_four = upscale_task_sidecar_name(four_x.input_sha256)
     assert set(image.files) == {
-        two_x.input_sha256,
-        four_x.input_sha256,
-        sidecar_two,
-        sidecar_four,
+        f"clips/{name}"
+        for name in (two_x.input_sha256, four_x.input_sha256, sidecar_two, sidecar_four)
     }
+    assert runtime.listed_inputs[-1] == sorted(
+        [two_x.input_sha256, four_x.input_sha256, sidecar_two, sidecar_four]
+    )
+    image = _Image({name.removeprefix("clips/"): value for name, value in image.files.items()})
     assert image.files[sidecar_two] == (
         "file",
         b'{"target_height":1080,"target_width":1920,"upscale_factor":2}\n',

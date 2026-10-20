@@ -135,6 +135,21 @@ at deploy time with `VIDAIO_NEXT_MODAL_GPU`,
 other named GPU types through the `gpu=` Function argument. A worker that cannot
 see CUDA exits; it never falls back to CPU while claiming GPU execution.
 
+Product clips are longer than inference clips, so four more values are fixed at
+deploy time:
+
+- `VIDAIO_NEXT_MODAL_TIMEOUT_SECONDS` (default 600, 60..3600) bounds one request
+  end to end. Modal answers a web request that outlives 150 s with a redirect to
+  poll; the miner follows it until its own deadline.
+- `VIDAIO_NEXT_GPU_MAX_FRAMES` (default 3600) and
+  `VIDAIO_NEXT_GPU_INGRESS_TIMEOUT_SECONDS` (default 120) bound the accepted
+  clip length and the upload window.
+- `VIDAIO_NEXT_MODAL_CPU_CORES` (default 8, 0.125..64) reserves CPU for the
+  decoder and encoder, which run on the container's CPU.
+
+Clips whose raw frames exceed the in-memory spool stream through the GPU in
+batches instead of falling back to CPU.
+
 ## Wire fresh CPU miner ingresses
 
 One hotkey belongs to one inference pool. For each solution profile, run two new

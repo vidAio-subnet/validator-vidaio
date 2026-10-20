@@ -6,6 +6,7 @@ import hashlib
 import json
 
 import httpx
+import pytest
 
 from vidaio.competition import LifecycleEngine, evaluation_item_commitment, migrate
 from vidaio.competition import repository as repo
@@ -24,7 +25,10 @@ TARGET_WIDTH = 1920
 TARGET_HEIGHT = 1080
 
 
-def test_upscaling_request_uses_committed_reference_input_and_factor(tmp_path) -> None:
+@pytest.mark.parametrize("upscaling_scoring", [None, "faithful"])
+def test_upscaling_request_uses_committed_reference_input_and_factor(
+    tmp_path, upscaling_scoring
+) -> None:
     input_digest = "1" * 64
     reference_digest = "2" * 64
     output_digest = "3" * 64
@@ -43,6 +47,7 @@ def test_upscaling_request_uses_committed_reference_input_and_factor(tmp_path) -
         track="upscaling",
         allowed_upscale_factors=[2, 4],
         evaluation_item_commitments=[commitment],
+        **({} if upscaling_scoring is None else {"upscaling_scoring": upscaling_scoring}),
     )
     conn = connect(":memory:")
     migrate(conn)
@@ -137,10 +142,12 @@ def test_upscaling_request_uses_committed_reference_input_and_factor(tmp_path) -
         assert body.reference_digest != body.miner_input_digest
         assert body.reference_path == str(tmp_path / "in" / reference_digest)
         assert body.miner_input_path == str(tmp_path / "in" / input_digest)
+        # the anchored manifest, not the item row, selects the scorer
         assert body.params == {
             "upscale_factor": 4,
             "target_width": TARGET_WIDTH,
             "target_height": TARGET_HEIGHT,
+            **({} if upscaling_scoring is None else {"scoring": "faithful"}),
         }
         return httpx.Response(
             200,

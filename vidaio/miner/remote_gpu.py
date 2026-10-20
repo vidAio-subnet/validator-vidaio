@@ -3,7 +3,9 @@
 The chain-facing miner remains the protocol authority: it validates the signed
 validator request, stages and hashes the input, applies its own deadline and
 output cap, then signs the returned bytes. This client is only the private
-transform hop. It never follows redirects, never places credentials in a URL,
+transform hop. It follows no redirect except the worker platform's own result
+poll (a same-origin 303 that carries a Modal attempt token, issued when a
+request outlives Modal's 150 s web limit), never places credentials in a URL,
 and requires the worker to bind its response to input digest, track, solution
 variant and a CUDA execution assertion.
 
@@ -15,15 +17,18 @@ CPU auditor can recompute every awarded score.
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import json
 import logging
 import math
 import os
+import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from pathlib import Path
-from urllib.parse import urlsplit
+from typing import BinaryIO
+from urllib.parse import parse_qs, urljoin, urlsplit
 
 import httpx
 
@@ -42,6 +47,11 @@ MAX_ERROR_BODY_BYTES = 4 * 1024
 MAX_HEALTH_BODY_BYTES = 64 * 1024
 SUPPORTED_GPU_VARIANTS = ("quality", "balanced", "compact", "premium")
 CPU_FALLBACK_DEVICE = "cpu:ffmpeg-fallback"
+#: Query parameters that mark Modal's result-poll redirect (see
+#: RemoteGpuBackend._result_poll_url); live web endpoints send the attempt token.
+MODAL_POLL_PARAMS = ("__modal_attempt_token", "__modal_function_call_id")
+#: Each poll waits up to Modal's 150 s web limit; this bounds a broken redirect loop.
+MAX_RESULT_POLLS = 40
 LOGGER = logging.getLogger(__name__)
 
 
@@ -194,6 +204,7 @@ class RemoteGpuBackend:
         partial = destination.with_name(
             f".{destination.name}.vidaio-next-{uuid.uuid4().hex}.part"
         )
+        deadline = time.monotonic() + effective_timeout
         try:
             with (
                 source_path.open("rb") as source,
@@ -202,12 +213,7 @@ class RemoteGpuBackend:
                     follow_redirects=False,
                     timeout=self._timeout(effective_timeout),
                 ) as client,
-                client.stream(
-                    "POST",
-                    f"{self.endpoint_url}/process",
-                    headers=headers,
-                    content=source,
-                ) as response,
+                self._transform_response(client, source, headers, deadline=deadline) as response,
             ):
                 if response.status_code != 200:
                     detail = _response_error(response).replace(
@@ -278,6 +284,66 @@ class RemoteGpuBackend:
             raise BackendError(f"remote GPU transport failed: {exc}") from exc
         finally:
             partial.unlink(missing_ok=True)
+
+    @contextlib.contextmanager
+    def _transform_response(
+        self,
+        client: httpx.Client,
+        source: BinaryIO,
+        headers: Mapping[str, str],
+        *,
+        deadline: float,
+    ) -> Iterator[httpx.Response]:
+        """POST the transform, then follow the worker platform's result polling.
+
+        Modal answers a web request that is still running after 150 s with a 303 to
+        the same endpoint plus an attempt token; a GET there waits for the result
+        (again up to 150 s, then another 303). Long clips and slow GPU cold starts
+        both take that path. Only that same-origin poll is followed, with the same
+        bearer token and nothing else, until the transform deadline.
+        """
+        response = client.send(
+            client.build_request(
+                "POST", f"{self.endpoint_url}/process", headers=headers, content=source
+            ),
+            stream=True,
+        )
+        try:
+            polls = 0
+            while response.status_code == 303:
+                target = self._result_poll_url(response.headers.get("location", ""))
+                response.close()
+                polls += 1
+                if polls > MAX_RESULT_POLLS or time.monotonic() >= deadline:
+                    raise BackendTimeoutError(
+                        f"remote GPU result was not ready within the deadline ({polls} polls)"
+                    )
+                response = client.send(
+                    client.build_request(
+                        "GET", target, headers={"Authorization": f"Bearer {self._auth_token}"}
+                    ),
+                    stream=True,
+                )
+            yield response
+        finally:
+            response.close()
+
+    def _result_poll_url(self, location: str) -> str:
+        """The redirect target, only if it is this worker's own result poll."""
+        target = urljoin(f"{self.endpoint_url}/process", location)
+        parts = urlsplit(target)
+        base = urlsplit(self.endpoint_url)
+        if (
+            not location
+            or (parts.scheme, parts.netloc) != (base.scheme, base.netloc)
+            or parts.username
+            or parts.password
+            or not any(param in parse_qs(parts.query) for param in MODAL_POLL_PARAMS)
+        ):
+            raise BackendError(
+                "remote GPU redirected somewhere other than its own result poll"
+            )
+        return target
 
     def _validate_binding(self, response: httpx.Response, input_digest: str) -> None:
         device = response.headers.get(GPU_DEVICE_HEADER, "")

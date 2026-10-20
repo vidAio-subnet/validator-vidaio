@@ -94,6 +94,16 @@ if _IS_LOCAL:
         )
     if not 1 <= SCALEDOWN_WINDOW_SECONDS <= 3600:
         raise ValueError("Modal scaledown window must be between 1 and 3600 seconds")
+    # Product clips run longer than inference clips: the function timeout bounds one
+    # request end to end (the miner polls past Modal's 150 s web limit).
+    FUNCTION_TIMEOUT_SECONDS = int(os.environ.get("VIDAIO_NEXT_MODAL_TIMEOUT_SECONDS", "600"))
+    if not 60 <= FUNCTION_TIMEOUT_SECONDS <= 3600:
+        raise ValueError("Modal function timeout must be between 60 and 3600 seconds")
+    # Decode and encode run on the container's CPU; Modal's default reservation
+    # (a fraction of one core) makes the encoder, not the GPU, the bottleneck.
+    CPU_CORES = float(os.environ.get("VIDAIO_NEXT_MODAL_CPU_CORES", "8"))
+    if not 0.125 <= CPU_CORES <= 64:
+        raise ValueError("Modal CPU cores must be between 0.125 and 64")
     _AUTH_SECRET = modal.Secret.from_name(SECRET_NAME)
 else:
     # Function decorators are re-evaluated when Modal imports the source remotely.
@@ -106,6 +116,8 @@ else:
     GPU_TYPE = "L4"
     MAX_CONTAINERS = 1
     SCALEDOWN_WINDOW_SECONDS = 120
+    FUNCTION_TIMEOUT_SECONDS = 600
+    CPU_CORES = 8.0
     _AUTH_SECRET = modal.Secret.from_dict({})
 
 APP_NAME = DEPLOYMENT_LABEL
@@ -113,6 +125,10 @@ _RUNTIME_ENV = {
     "VIDAIO_NEXT_DEPLOYMENT_LABEL": DEPLOYMENT_LABEL,
     "VIDAIO_NEXT_SOLUTION_VARIANT": SOLUTION_VARIANT,
 }
+# Optional runtime bounds, fixed at deploy time (the defaults keep inference-era limits).
+for _name in ("VIDAIO_NEXT_GPU_MAX_FRAMES", "VIDAIO_NEXT_GPU_INGRESS_TIMEOUT_SECONDS"):
+    if _IS_LOCAL and os.environ.get(_name, "").strip():
+        _RUNTIME_ENV[_name] = os.environ[_name].strip()
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
@@ -155,9 +171,10 @@ app = modal.App(APP_NAME)
     name="vidaio-next-gpu-miner-worker",
     image=image,
     gpu=GPU_TYPE,
+    cpu=CPU_CORES,
     secrets=[_AUTH_SECRET],
     env=_RUNTIME_ENV,
-    timeout=600,
+    timeout=FUNCTION_TIMEOUT_SECONDS,
     min_containers=0,
     max_containers=MAX_CONTAINERS,
     buffer_containers=0,
@@ -225,6 +242,12 @@ def gpu_miner_app():  # type: ignore[no-untyped-def]
     )
     if min(max_input_bytes, max_output_bytes, max_raw_bytes) < 1:
         raise RuntimeError("GPU worker byte bounds must all be positive")
+    max_frames = int(os.environ.get("VIDAIO_NEXT_GPU_MAX_FRAMES", "3600"))
+    ingress_timeout_seconds = float(
+        os.environ.get("VIDAIO_NEXT_GPU_INGRESS_TIMEOUT_SECONDS", "120")
+    )
+    if not 1 <= max_frames <= 108_000 or not 1 <= ingress_timeout_seconds <= 3600:
+        raise RuntimeError("GPU worker frame and ingress bounds are out of range")
     fallback_setting = os.environ.get("VIDAIO_NEXT_GPU_ALLOW_CPU_FALLBACK", "false").lower()
     if fallback_setting not in {"true", "false"}:
         raise RuntimeError("VIDAIO_NEXT_GPU_ALLOW_CPU_FALLBACK must be true or false")
@@ -360,7 +383,7 @@ def gpu_miner_app():  # type: ignore[no-untyped-def]
         digest = hashlib.sha256()
         try:
             try:
-                async with asyncio.timeout(min(metadata.deadline_seconds, 120.0)):
+                async with asyncio.timeout(min(metadata.deadline_seconds, ingress_timeout_seconds)):
                     with input_path.open("xb") as sink:
                         os.chmod(input_path, 0o600)
                         async for chunk in request.stream():
@@ -397,6 +420,7 @@ def gpu_miner_app():  # type: ignore[no-untyped-def]
                     maximum_raw_bytes=max_raw_bytes,
                     maximum_output_bytes=max_output_bytes,
                     allow_cpu_fallback=allow_cpu_fallback,
+                    maximum_frames=max_frames,
                 )
             except GpuTransformError as exc:
                 requests_total.labels(

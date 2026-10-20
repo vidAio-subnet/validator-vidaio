@@ -31,6 +31,7 @@ from vidaio.scoring.backends import (
 from vidaio.scoring.canonicalize import (
     SecondaryDecoderBackend,
     build_canonicalization_plan,
+    untagged_color_fill,
     cross_check_decoders,
     plan_digest,
     plan_template_digest,
@@ -116,6 +117,22 @@ from vidaio.scoring.removal_formula import (
     RemovalBreakdown,
     score_removal,
 )
+from vidaio.scoring.streaming import (
+    StreamingBreakdown,
+    StreamingMeasurement,
+    StreamingPacket,
+    StreamingRules,
+    measure_streaming,
+    score_streaming,
+    streaming_target_kbps,
+    streaming_violations,
+)
+from vidaio.scoring.upscaling_faithful_formula import (
+    UPSCALING_FAITHFUL_FACTORS,
+    UpscaledFrameMetrics,
+    UpscalingFaithfulBreakdown,
+    score_upscaling_faithful,
+)
 from vidaio.scoring.upscaling import (
     UpscalingBreakdown,
     final_from_pre,
@@ -155,6 +172,7 @@ __all__ = [
     "chroma_uv_result",
     # canonicalize
     "build_canonicalization_plan",
+    "untagged_color_fill",
     "plan_digest",
     "plan_template_digest",
     "validate_stream",
@@ -190,12 +208,24 @@ __all__ = [
     "RegionMetrics",
     "RemovalBreakdown",
     "UpscalingBreakdown",
+    "UPSCALING_FAITHFUL_FACTORS",
+    "UpscaledFrameMetrics",
+    "UpscalingFaithfulBreakdown",
     "quality_from_pieapp",
     "length_score",
     "final_from_pre",
     "score_interpolation",
     "score_removal",
     "score_upscaling",
+    "score_upscaling_faithful",
+    "StreamingBreakdown",
+    "StreamingMeasurement",
+    "StreamingPacket",
+    "StreamingRules",
+    "measure_streaming",
+    "score_streaming",
+    "streaming_target_kbps",
+    "streaming_violations",
     # aggregation
     "worst_decile_score",
     "worst_decile_from_config",

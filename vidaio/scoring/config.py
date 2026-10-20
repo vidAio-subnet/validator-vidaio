@@ -117,6 +117,24 @@ class InterpolationWeights(BaseModel):
         return self
 
 
+
+class UpscalingFaithfulWeights(BaseModel):
+    """Weights of the three scored terms of the faithful upscaling formula (0.3 / 0.3 / 0.4)."""
+
+    psnr: float = 0.3
+    ssim: float = 0.3
+    lpips: float = 0.4
+
+    @model_validator(mode="after")
+    def _finite(self) -> "UpscalingFaithfulWeights":
+        _require_unit_interval("upscaling_faithful_weights.psnr", self.psnr)
+        _require_unit_interval("upscaling_faithful_weights.ssim", self.ssim)
+        _require_unit_interval("upscaling_faithful_weights.lpips", self.lpips)
+        total = self.psnr + self.ssim + self.lpips
+        if abs(total - 1.0) > _WEIGHT_SUM_TOLERANCE:
+            raise ValueError(f"upscaling_faithful_weights must sum to 1.0, got {total!r}")
+        return self
+
 class ScoringConfig(BaseModel):
     # --- gates -------------------------------------------------------------
     #: Upscaling VMAF pass/fail gate on the vmaf/100 scale (< 0.5 -> score 0).
@@ -182,6 +200,22 @@ class ScoringConfig(BaseModel):
     #: frames are downscaled (INTER_AREA, all sides identically) so the long side is at
     #: most this before LPIPS-VGG; bounds the per-candidate cost at 1080p+; 0 disables
     interpolation_lpips_max_side: int = 512
+    # --- faithful upscaling (competitions; vidaio/scoring/upscaling_faithful.py) -------
+    #: Used when a request asks for ``params["scoring"] = "faithful"`` on the upscaling track;
+    #: the PieAPP/VMAF upscaling formula above stays for every other upscaling request.
+    upscaling_faithful_weights: UpscalingFaithfulWeights = Field(default_factory=UpscalingFaithfulWeights)
+    #: dB of PSNR above the Lanczos floor that maps to s_psnr = 1
+    upscaling_faithful_psnr_span_db: float = 6.0
+    #: LPIPS is evaluated on every k-th frame (cost control; PSNR/SSIM on all frames)
+    upscaling_faithful_lpips_stride: int = 4
+    #: frames are downscaled (INTER_AREA) so the long side is at most this before LPIPS-VGG
+    upscaling_faithful_lpips_max_side: int = 512
+    # --- streaming compression (competitions; vidaio/scoring/streaming.py) ----------------
+    #: Used when a compression request asks for ``params["scoring"] = "streaming"``: VMAF at
+    #: or below this scores 0, 100 scores 1 (linear between).
+    streaming_vmaf_floor: float = 60.0
+    #: the average bitrate may exceed the clip's budget by this fraction (rounding slack)
+    streaming_rate_tolerance: float = 0.01
     #: Width (in VMAF points) of the sub-threshold band the compression spec calls out
     #: (``vmaf < threshold - 5 -> 0``). See vidaio/scoring/compression.py for the
     #: documented reading of scores inside the band.
@@ -229,6 +263,9 @@ class ScoringConfig(BaseModel):
             "removal_outside_tolerance": self.removal_outside_tolerance,
             "interpolation_psnr_span_db": self.interpolation_psnr_span_db,
             "interpolation_kept_tolerance": self.interpolation_kept_tolerance,
+            "upscaling_faithful_psnr_span_db": self.upscaling_faithful_psnr_span_db,
+            "streaming_vmaf_floor": self.streaming_vmaf_floor,
+            "streaming_rate_tolerance": self.streaming_rate_tolerance,
         }
         for name, value in scalars.items():
             _require_finite_config(name, value)
@@ -261,6 +298,24 @@ class ScoringConfig(BaseModel):
         if self.interpolation_lpips_max_side < 0:
             raise ValueError(
                 f"interpolation_lpips_max_side must be >= 0, got {self.interpolation_lpips_max_side!r}"
+            )
+        if self.upscaling_faithful_psnr_span_db <= 0.0:
+            raise ValueError(
+                f"upscaling_faithful_psnr_span_db must be > 0, got {self.upscaling_faithful_psnr_span_db!r}"
+            )
+        if self.upscaling_faithful_lpips_stride < 1:
+            raise ValueError(
+                f"upscaling_faithful_lpips_stride must be >= 1, got {self.upscaling_faithful_lpips_stride!r}"
+            )
+        if self.upscaling_faithful_lpips_max_side < 0:
+            raise ValueError(
+                f"upscaling_faithful_lpips_max_side must be >= 0, got {self.upscaling_faithful_lpips_max_side!r}"
+            )
+        if not 0.0 <= self.streaming_vmaf_floor < 100.0:
+            raise ValueError(f"streaming_vmaf_floor must be in [0, 100), got {self.streaming_vmaf_floor!r}")
+        if not 0.0 <= self.streaming_rate_tolerance <= 0.25:
+            raise ValueError(
+                f"streaming_rate_tolerance must be in [0, 0.25], got {self.streaming_rate_tolerance!r}"
             )
         if self.removal_lpips_stride < 1:
             raise ValueError(f"removal_lpips_stride must be >= 1, got {self.removal_lpips_stride!r}")

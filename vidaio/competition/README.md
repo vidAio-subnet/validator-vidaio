@@ -476,7 +476,11 @@ inputs mounted read-only at `/evaluation-inputs` as a **per-batch staging subdir
 (never the whole sealed pool, never `index.json`), no env injected beyond the
 image's own. Solution image contract: `/bin/sh /app/run.sh <input_dir>
 <output_dir>`, one output per input under the same digest-named filename, plain
-regular files only, exit 0. Build binding: `image_digest` is
+regular files only, exit 0. On Modal (`ModalSandboxRunner`) the inputs are the
+`clips/` subdirectory of a fresh input Image mounted at `/evaluation-inputs`, and
+`<input_dir>` is `/evaluation-inputs/clips`: Modal adds its own directories
+(`__modal`, `dev`, `etc`, `proc`, `sys`, `tmp`) to every Image root, and a solution
+that lists its input folder must see only the batch's inputs. Build binding: `image_digest` is
 `sha256(canonical_json({scheme, repo_url, commit_sha, tree_sha}))` under the
 versioned `vidaio.competition.logical-build.v1` domain, with a digest-derived
 local tag so builds are resumable across restarts. It identifies the pinned

@@ -14,9 +14,11 @@ a few seconds per 1080p, 5-second item on a laptop.
 
 ## The interpolation track contract
 
-The evaluator runs `/bin/sh /app/run.sh /evaluation-inputs /output` in a sandbox with no
+The evaluator runs `/bin/sh /app/run.sh <input_dir> /output` in a sandbox with no
 network, a read-only root filesystem (only `/tmp` and the output directory are writable)
 and no injected environment variables.
+Read the input folder from the first argument: on the live evaluator it is
+`/evaluation-inputs/clips`, and it holds only the items, nothing else.
 
 - **Input**: every regular file in the input directory is one item, named by its 64-hex
   sha256 with no extension. It is a Matroska file with one video stream (FFV1, yuv420p,

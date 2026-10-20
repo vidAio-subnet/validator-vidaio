@@ -69,11 +69,14 @@ from vidaio.scoring import (
     is_duplicate_identity,
 )
 from vidaio.scoring.backends_real import NotConfiguredError
+from vidaio.scoring.streaming import StreamingRules
+from vidaio.core.logging import get_logger, log_fields
 from vidaio.scoring_worker import (
     ScoringBackends,
     ScoringWorkerConfig,
     effective_scorer_version,
     real_backends,
+    sweep_work_dir,
 )
 from vidaio.scoring_worker.inputs import ScoreRejected, ScratchBudget
 from vidaio.scoring_worker.runtime_identity import (
@@ -96,6 +99,9 @@ def _is_validator_zero_identity(identity: object) -> bool:
     return value == _VALIDATOR_ZERO_SCORER_NAME or value.startswith(
         f"{_VALIDATOR_ZERO_SCORER_NAME}+"
     )
+
+
+_LOG = get_logger(__name__)
 
 
 class RecomputeUnavailable(Exception):
@@ -210,6 +216,14 @@ class RealScoreRecomputer:
             ),
         )
         recomputer._owns_real_backends = True
+        # A recompute killed mid-request (container restart, roll) leaves its private
+        # scratch behind, and nothing else reclaims it: the own auditor's work dir held
+        # 56 GB of such leftovers by 2026-10-07. Sweep our own prefixes once, at process
+        # composition and before any audit runs, exactly as the scoring worker does at
+        # startup. Worker and history views are copies and never sweep.
+        swept = sweep_work_dir(config.work_dir)
+        if swept:
+            _LOG.info("swept stale audit scratch", extra=log_fields(removed=swept))
         return recomputer
 
     def for_worker(self) -> "RealScoreRecomputer":
@@ -265,6 +279,19 @@ class RealScoreRecomputer:
         return getattr(self._backends.pieapp, "version", "") != _UNCONFIGURED
 
     @staticmethod
+    def _faithful_upscaling(artifacts: Mapping[ArtifactKind, ArtifactPayload]) -> bool:
+        """The committed competition manifest selects the faithful upscaling scorer, which
+        needs no PieAPP (frame metrics against the sealed original)."""
+        raw = artifacts.get(ArtifactKind.MANIFEST)
+        if raw is None or isinstance(raw, Path):
+            return False
+        try:
+            manifest = json.loads(raw)
+        except (TypeError, ValueError):
+            return False
+        return isinstance(manifest, dict) and manifest.get("upscaling_scoring") == "faithful"
+
+    @staticmethod
     def _track(artifacts: Mapping[ArtifactKind, ArtifactPayload]) -> str:
         """The item's declared track, read from the recorded packet (else "")."""
         packet_bytes = artifacts.get(ArtifactKind.SCORE_PACKET)
@@ -309,7 +336,11 @@ class RealScoreRecomputer:
         ):
             return None
         track = track if track is not None else self._track(artifacts)
-        if track == TRACK_UPSCALING and not self._pieapp_available():
+        if (
+            track == TRACK_UPSCALING
+            and not self._pieapp_available()
+            and not self._faithful_upscaling(artifacts)
+        ):
             return (
                 "upscaling item requires the PieAPP perceptual backend, which is "
                 "not installed or has no cached model weights — cannot recompute "
@@ -865,7 +896,7 @@ class RealScoreRecomputer:
         bundle: object,
         artifacts: Mapping[ArtifactKind, ArtifactPayload],
         packet: dict,
-    ) -> dict[str, float | int]:
+    ) -> dict[str, float | int | str]:
         """The scoring params the recompute uses — DELIBERATELY NOT the packet's (#9).
 
         The gate parameters must come from a source the AUTHORITY cannot dial, not
@@ -938,7 +969,7 @@ class RealScoreRecomputer:
                         "upscaling factor/reference/input do not match the committed "
                         "manifest item"
                     )
-                params = {"upscale_factor": binding.upscale_factor}
+                params: dict[str, float | int | str] = {"upscale_factor": binding.upscale_factor}
                 if binding.target_width is not None:
                     params.update(
                         {
@@ -946,6 +977,14 @@ class RealScoreRecomputer:
                             "target_height": binding.target_height,
                         }
                     )
+                scoring = manifest.get("upscaling_scoring")
+                if scoring is not None:
+                    # The scorer selector comes from the anchored manifest, never the packet.
+                    if scoring != "faithful":
+                        raise RuntimeError(
+                            f"competition manifest names an unknown upscaling scorer {scoring!r}"
+                        )
+                    params["scoring"] = scoring
                 return params
             if packet_track == TRACK_REMOVAL:
                 binding = getattr(bundle, "competition_item", None)
@@ -1001,7 +1040,20 @@ class RealScoreRecomputer:
                 and isinstance(threshold, numbers.Real)
                 and not isinstance(threshold, bool)
             ):
-                return {"vmaf_threshold": float(threshold)}
+                params: dict[str, float | int | str] = {"vmaf_threshold": float(threshold)}
+                scoring = manifest.get("compression_scoring")
+                if scoring is not None:
+                    # The streaming budget and rules come from the anchored manifest only.
+                    if scoring != "streaming":
+                        raise RuntimeError(
+                            f"competition manifest names an unknown compression scorer {scoring!r}"
+                        )
+                    try:
+                        rules = StreamingRules.model_validate(manifest.get("streaming_rules"))
+                    except ValueError as exc:
+                        raise RuntimeError(f"competition manifest streaming_rules invalid: {exc}") from exc
+                    params.update(rules.as_params())
+                return params
             if packet_track != TRACK_UPSCALING:
                 raise RuntimeError(
                     "competition manifest has no numeric VMAF threshold"

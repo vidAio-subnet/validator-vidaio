@@ -21,7 +21,11 @@ from vidaio.scoring.gates import ReasonCode, ValidityViolation
 #: Canonical normalization targets. Changing any of these changes the plan digest.
 CANONICAL_PIX_FMT = "yuv420p"
 CANONICAL_COLOR = "bt709"
+CANONICAL_RANGE = "tv"
 CANONICAL_TIMESCALE = 90000
+
+#: Probe values meaning "the file does not say".
+_UNSPECIFIED_TAGS = frozenset({"", "unknown", "unspecified", "reserved"})
 
 #: Tokens substituted for the concrete paths when computing the *template* digest,
 #: so one digest identifies the normalization recipe independent of file names.
@@ -39,6 +43,8 @@ def build_canonicalization_plan(
     fps: float | None = None,
     scale_width: int | None = None,
     scale_height: int | None = None,
+    fill_color_space: bool = False,
+    fill_color_range: bool = False,
 ) -> list[str]:
     """Pure builder: the ffmpeg argv that canonicalizes one file. No execution here.
 
@@ -47,12 +53,25 @@ def build_canonicalization_plan(
     container timescale — the classic container/colorspace/timebase mismatch surface.
     Output should use a lossless-friendly container (the .y4m/.mkv choice belongs to
     the executing backend; the plan pins the stream-level normalization).
+
+    ``fill_color_space`` / ``fill_color_range`` (see :func:`untagged_color_fill`) tag
+    a stream that does not state its matrix / range as the canonical BT.709 / tv
+    before anything converts it. ffmpeg reads an unstated matrix as BT.601 and would
+    convert it to the BT.709 output tags, moving every pixel of an untagged output a
+    few levels away from the same pixels with tags. A stated tag is never overridden.
     """
     if (scale_width is None) != (scale_height is None):
         raise ValueError("scale_width and scale_height must be supplied together")
     if scale_width is not None and (scale_width < 1 or scale_height < 1):
         raise ValueError("canonical scale dimensions must be positive")
     vf = []
+    fill = []
+    if fill_color_space:
+        fill.append(f"colorspace={color}")
+    if fill_color_range:
+        fill.append(f"range={CANONICAL_RANGE}")
+    if fill:
+        vf.append("setparams=" + ":".join(fill))
     if scale_width is not None:
         # The measured VMAF-delta calibration used this exact rescale for
         # Downscale challenges: compare what the miner added at output geometry.
@@ -88,6 +107,22 @@ def build_canonicalization_plan(
         "-y",
         output_path,
     ]
+
+
+def untagged_color_fill(info: MediaInfo) -> dict[str, bool]:
+    """Which colour tags of a probed YUV stream the plan fills with the canonical
+    ones (keyword arguments for :func:`build_canonicalization_plan`).
+
+    Only YUV streams: an RGB stream has no YUV matrix to read. A probe that does not
+    report colour tags (``None``) fills nothing."""
+    if not info.pix_fmt.startswith("yuv"):
+        return {}
+    fill = {}
+    if info.color_space is not None and info.color_space in _UNSPECIFIED_TAGS:
+        fill["fill_color_space"] = True
+    if info.color_range is not None and info.color_range in _UNSPECIFIED_TAGS:
+        fill["fill_color_range"] = True
+    return fill
 
 
 def plan_digest(argv: Sequence[str]) -> str:

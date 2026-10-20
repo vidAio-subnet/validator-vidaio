@@ -257,13 +257,17 @@ class HttpScoringClient:
         reference_sha256 = str(item_row["reference_sha256"])
         reference_path = self._inputs_dir / reference_sha256
         output_path = self._outputs_dir / output.output_sha256
-        params: dict[str, float | int]
+        params: dict[str, float | int | str]
         if manifest.track == "upscaling":
             params = {
                 "upscale_factor": int(item_row["upscale_factor"]),
                 "target_width": int(item_row["target_width"]),
                 "target_height": int(item_row["target_height"]),
             }
+            if manifest.upscaling_scoring is not None:
+                # The anchored manifest picks the scorer (faithful: the frames against
+                # the sealed original, credited over the Lanczos upscale).
+                params["scoring"] = manifest.upscaling_scoring
         elif manifest.track == "removal":
             # The mask stream index is fixed by the item commitment preimage.
             params = {"mask_stream_index": REMOVAL_MASK_STREAM_INDEX}
@@ -272,6 +276,9 @@ class HttpScoringClient:
             params = {"frame_factor": INTERPOLATION_FRAME_FACTOR}
         else:
             params = {"vmaf_threshold": manifest.vmaf_threshold}
+            if manifest.streaming_rules is not None:
+                # streaming compression: the anchored budget rule and delivery rules
+                params.update(manifest.streaming_rules.as_params())
         request = ScoreRequest(
             track=manifest.track,
             challenge_id=item_row["challenge_id"],

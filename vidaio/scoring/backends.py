@@ -34,6 +34,10 @@ class MediaInfo(BaseModel):
     byte_size: int
     bit_depth: int = 8
     pix_fmt: str = "yuv420p"
+    #: Colour tags of the stream as probed: ``"unknown"`` when the file does not carry
+    #: the tag; ``None`` when the probe does not report colour tags at all.
+    color_space: str | None = None
+    color_range: str | None = None
 
 
 class PerceptualCheckResult(BaseModel):

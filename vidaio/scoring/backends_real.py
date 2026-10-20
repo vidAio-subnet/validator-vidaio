@@ -615,6 +615,8 @@ class FfprobeBackend:
             byte_size=byte_size,
             bit_depth=bit_depth,
             pix_fmt=pix_fmt,
+            color_space=stream.get("color_space") or "unknown",
+            color_range=stream.get("color_range") or "unknown",
         )
 
     def _count_frames(self, path: str) -> int:

@@ -252,6 +252,10 @@ SCORER_REQUIRED_PAYOUT_BACKENDS = frozenset(
         "removal_metrics",
         # frame-interpolation scoring (competition track): inserted-frame metrics
         "interpolation_metrics",
+        # faithful upscaling scoring (competition track): frame metrics vs the sealed original
+        "upscaling_faithful_metrics",
+        # streaming compression (competition track): packet sizes, timestamps, keyframes
+        "streaming_packets",
         "lpips",
         "python",
     }

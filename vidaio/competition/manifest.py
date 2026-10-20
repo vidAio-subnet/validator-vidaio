@@ -28,6 +28,8 @@ from pydantic import (
 )
 
 from vidaio.competition.config import CompetitionConfig
+from vidaio.scoring.streaming import StreamingRules
+from vidaio.scoring.upscaling_faithful_formula import UPSCALING_FAITHFUL_FACTORS
 from vidaio.competition.item_commitment import (
     evaluation_item_commitment as evaluation_item_commitment,
 )
@@ -133,20 +135,22 @@ class ResultRules(BaseModel):
     #: A result with no qualifying contender closes the running window (burn until
     #: the next result) instead of leaving the previous window untouched.
     no_qualifier_closes_window: bool | None = None
-    # ---- speed term (frame interpolation): a contender's score is its mean item
-    # quality times ``1 - speed_weight + speed_weight * speed_score``, where
-    # ``speed_score = clamp(log(speed_slow_spf / spf) / log(speed_slow_spf /
+    # ---- speed term (frame interpolation, faithful upscaling): a contender's score is
+    # its mean item quality times ``1 - speed_weight + speed_weight * speed_score``,
+    # where ``speed_score = clamp(log(speed_slow_spf / spf) / log(speed_slow_spf /
     # speed_fast_spf), 0, 1)`` and ``spf`` is the contender's measured ``run.sh`` wall
     # time summed over every batch, divided by ``speed_inserted_frames`` (all four
     # fields together, or none). A batch the contender failed counts its full
     # ``batch_timeout_seconds``. See vidaio/competition/economic_result.py.
     #: Share of the score that depends on speed: the slowest keep ``1 - weight``.
     speed_weight: float | None = Field(default=None, gt=0, le=1, allow_inf_nan=False)
-    #: Seconds per inserted frame at (or under) which the speed score is 1.
+    #: Seconds per produced frame at (or under) which the speed score is 1.
     speed_fast_spf: float | None = Field(default=None, gt=0, allow_inf_nan=False)
-    #: Seconds per inserted frame at (or over) which the speed score is 0.
+    #: Seconds per produced frame at (or over) which the speed score is 0.
     speed_slow_spf: float | None = Field(default=None, gt=0, allow_inf_nan=False)
-    #: Inserted frames over the whole hidden item matrix (sum of N - 1 per item).
+    #: Frames the contender produces over the whole hidden item matrix: interpolation
+    #: = inserted frames (sum of N - 1 per item); faithful upscaling and streaming
+    #: compression = output frames.
     speed_inserted_frames: int | None = Field(default=None, ge=1)
 
     _SPEED_FIELDS = ("speed_weight", "speed_fast_spf", "speed_slow_spf", "speed_inserted_frames")
@@ -244,6 +248,18 @@ class CompetitionManifest(BaseModel):
     #: from legacy compression canonical JSON so loading a pre-migration manifest
     #: does not change its already-anchored digest.
     allowed_upscale_factors: list[Literal[2, 4]] | None = None
+    #: Upscaling-only scorer selector. ``"faithful"``: every output frame is compared
+    #: with the sealed original and credited only for its gain over the Lanczos upscale
+    #: of the served input (vidaio/scoring/upscaling_faithful.py) — no PieAPP, VMAF or
+    #: file-size gate. Absent = the inference upscaling scorer, and omitted from the
+    #: canonical JSON so every anchored digest is unchanged.
+    upscaling_scoring: Literal["faithful"] | None = None
+    #: Compression-only scorer selector. ``"streaming"``: quality at a bitrate budget under
+    #: streaming delivery rules (vidaio/scoring/streaming.py) instead of the smallest file
+    #: over the VMAF threshold; the budget and rules are ``streaming_rules``. Absent = the
+    #: classic compression formula; both fields are omitted from the canonical JSON then.
+    compression_scoring: Literal["streaming"] | None = None
+    streaming_rules: StreamingRules | None = None
     #: Ordered by ``item_index``.  Each digest commits the high-resolution reference,
     #: low-resolution miner input, and factor via ``evaluation_item_commitment``.
     #: The list itself is inside the canonical manifest digest anchored before
@@ -331,9 +347,28 @@ class CompetitionManifest(BaseModel):
             raise ValueError(
                 "allowed_upscale_factors is valid only for the upscaling track"
             )
+        if self.upscaling_scoring is not None and self.track != "upscaling":
+            raise ValueError("upscaling_scoring is valid only for the upscaling track")
+        if self.compression_scoring is not None and self.track != "compression":
+            raise ValueError("compression_scoring is valid only for the compression track")
+        if (self.compression_scoring == "streaming") != (self.streaming_rules is not None):
+            raise ValueError("streaming_rules is set exactly when compression_scoring is \"streaming\"")
+        if self.upscaling_scoring == "faithful" and any(
+            factor not in UPSCALING_FAITHFUL_FACTORS for factor in self.allowed_upscale_factors or ()
+        ):
+            raise ValueError(
+                f"faithful upscaling scores the factors {list(UPSCALING_FAITHFUL_FACTORS)} only"
+            )
         if self.result_rules is not None and self.result_rules.has_speed_term:
-            if self.track != "interpolation":
-                raise ValueError("the speed term is defined for the interpolation track only")
+            if not (
+                self.track == "interpolation"
+                or self.upscaling_scoring == "faithful"
+                or self.compression_scoring == "streaming"
+            ):
+                raise ValueError(
+                    "the speed term is defined for the interpolation track, faithful "
+                    "upscaling and streaming compression only"
+                )
             if self.sandbox_resources is None:
                 raise ValueError(
                     "the speed term requires anchored sandbox_resources (every contender "
@@ -365,6 +400,9 @@ class CompetitionManifest(BaseModel):
             "evaluation_item_commitments",
             "result_rules",
             "sandbox_resources",
+            "upscaling_scoring",
+            "compression_scoring",
+            "streaming_rules",
         ):
             if payload[field] is None:
                 del payload[field]

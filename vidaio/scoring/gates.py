@@ -79,6 +79,10 @@ class ReasonCode(StrEnum):
     WARP_ERROR_EXCEEDED = "WARP_ERROR_EXCEEDED"
     # frame-interpolation track
     KEPT_FRAMES_MODIFIED = "KEPT_FRAMES_MODIFIED"
+    # streaming compression (vidaio/scoring/streaming.py)
+    STREAMING_BITRATE_EXCEEDED = "STREAMING_BITRATE_EXCEEDED"
+    STREAMING_PEAK_EXCEEDED = "STREAMING_PEAK_EXCEEDED"
+    STREAMING_KEYFRAME_INTERVAL = "STREAMING_KEYFRAME_INTERVAL"
 
 
 class ValidityViolation(BaseModel):
@@ -144,6 +148,13 @@ class GateContext:
     vmaf_delta_primary: float | None = None
     vmaf_delta_secondary: float | None = None
     upscale_factor: int | None = None
+    #: Faithful competition upscaling (vidaio/scoring/upscaling_faithful.py): the output is
+    #: measured against the sealed original, so the VMAF, size-cap and perceptual gates of
+    #: the PieAPP upscaling formula do not apply.
+    upscaling_faithful: bool = False
+    #: Streaming compression (vidaio/scoring/streaming.py): quality at a bitrate budget. The
+    #: budget and delivery rules replace the compression VMAF floor and size-ratio gates.
+    streaming: bool = False
     #: Violations produced upstream (e.g. canonicalize.validate_stream) — folded in.
     extra_violations: list[ValidityViolation] = field(default_factory=list)
     #: Informational skips appended by gates whose check a config flag disabled —
@@ -216,8 +227,8 @@ class FileSizeCapGate:
     name = "file_size_cap"
 
     def check(self, ctx: GateContext) -> list[ValidityViolation]:
-        if ctx.track != TRACK_UPSCALING:
-            return []
+        if ctx.track != TRACK_UPSCALING or ctx.upscaling_faithful:
+            return []  # faithful scoring compares with the original; output size is free
         caps = ctx.config.file_size_caps
         if ctx.upscale_factor is None:
             return [
@@ -262,7 +273,7 @@ class CompressionRateGate:
     name = "compression_rate"
 
     def check(self, ctx: GateContext) -> list[ValidityViolation]:
-        if ctx.track != TRACK_COMPRESSION:
+        if ctx.track != TRACK_COMPRESSION or ctx.streaming:
             return []
         input_bytes = ctx.effective_input.byte_size
         if input_bytes <= 0:
@@ -295,8 +306,12 @@ class VmafFloorGate:
     name = "vmaf_floor"
 
     def check(self, ctx: GateContext) -> list[ValidityViolation]:
-        if ctx.track in (TRACK_REMOVAL, TRACK_INTERPOLATION):
-            return []  # region / inserted-frame metrics, no VMAF term
+        if ctx.track in (TRACK_REMOVAL, TRACK_INTERPOLATION) or ctx.upscaling_faithful:
+            return []  # region / inserted-frame / faithful-upscale metrics, no VMAF term
+        if ctx.streaming:
+            # quality at the budget is the score itself; a missing VMAF is caught by the
+            # model-delta gate and leaves no breakdown
+            return []
         if ctx.vmaf_primary is None:
             return [
                 ValidityViolation(
@@ -338,8 +353,8 @@ class VmafModelDeltaGate:
     name = "vmaf_model_delta"
 
     def check(self, ctx: GateContext) -> list[ValidityViolation]:
-        if ctx.track in (TRACK_REMOVAL, TRACK_INTERPOLATION):
-            return []  # no VMAF runs on the removal and interpolation tracks
+        if ctx.track in (TRACK_REMOVAL, TRACK_INTERPOLATION) or ctx.upscaling_faithful:
+            return []  # no VMAF runs on the removal, interpolation and faithful-upscaling tracks
         violations: list[ValidityViolation] = []
         delta_pair_supplied = (
             ctx.vmaf_delta_primary is not None or ctx.vmaf_delta_secondary is not None
@@ -423,6 +438,16 @@ class _PerceptualGate:
                 GateSkip(
                     gate=self.name,
                     detail="removal track: the outside-mask identity check applies instead",
+                )
+            )
+            return []
+        if ctx.upscaling_faithful:
+            # Every output frame is measured against the sealed original the input was degraded
+            # from; a tone, grayscale or chroma manipulation costs PSNR/SSIM/LPIPS directly.
+            ctx.skips.append(
+                GateSkip(
+                    gate=self.name,
+                    detail="faithful upscaling: the comparison with the original applies instead",
                 )
             )
             return []

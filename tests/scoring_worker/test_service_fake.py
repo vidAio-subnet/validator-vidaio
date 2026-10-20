@@ -557,6 +557,245 @@ async def test_interpolation_wrong_frame_count_is_zeroed_without_measuring(world
     assert item.score == 0.0
 
 
+class FakeUpscalingFaithfulBackend:
+    """Deterministic faithful upscaling measurement (no media)."""
+
+    def __init__(
+        self,
+        *,
+        psnr: float = 33.0,
+        ssim: float = 0.95,
+        lpips: float = 0.10,
+        fail: str | None = None,
+        input_fail: str | None = None,
+    ) -> None:
+        self.psnr, self.ssim, self.lpips = psnr, ssim, lpips
+        self.fail, self.input_fail = fail, input_fail
+        self.calls: list[dict] = []
+
+    def version(self) -> str:
+        return "fake-upscaling-faithful/1"
+
+    def measure(self, **kwargs):
+        from vidaio.scoring.upscaling_faithful_formula import UpscaledFrameMetrics
+        from vidaio.scoring_worker.upscaling_faithful_backend import (
+            UpscalingFaithfulInputError,
+            UpscalingFaithfulMeasurement,
+            UpscalingFaithfulMeasurementError,
+        )
+
+        self.calls.append(kwargs)
+        if self.input_fail:
+            raise UpscalingFaithfulInputError(self.input_fail)
+        if self.fail:
+            raise UpscalingFaithfulMeasurementError(self.fail)
+        return UpscalingFaithfulMeasurement(
+            metrics=UpscaledFrameMetrics(psnr_db=self.psnr, ssim=self.ssim, lpips_vgg=self.lpips, frames=60),
+            floor=UpscaledFrameMetrics(psnr_db=30.0, ssim=0.90, lpips_vgg=0.20, frames=60),
+            lpips_offset=int(kwargs.get("lpips_offset", 0)),
+        )
+
+
+def _faithful_body(world: FakeWorld, *, upscale_factor: int = 2) -> dict:
+    world.fake.set_media("miner_input", _media(1_000, width=160, height=120))
+    return score_request_body(
+        track="upscaling",
+        reference=world.reference,
+        reference_digest=world.reference_digest,
+        output=world.output,
+        output_digest=world.output_digest,
+        miner_input=world.miner_input,
+        miner_input_digest=world.miner_input_digest,
+        params={"upscale_factor": upscale_factor, "scoring": "faithful"},
+        challenge_id="chal-up-faithful",
+    )
+
+
+def _faithful_backends(world: FakeWorld, faithful, *, pieapp=None) -> ScoringBackends:
+    return ScoringBackends(
+        probe=world.fake, vmaf_primary=world.fake, vmaf_secondary=world.fake,
+        pieapp=pieapp if pieapp is not None else world.fake.pieapp,
+        perceptual=world.fake, canonicalizer=None, versions=world.fake.versions(),
+        upscaling_faithful=faithful,
+    )
+
+
+async def test_faithful_upscaling_scores_frames_without_pieapp_vmaf_or_size_cap(world: FakeWorld) -> None:
+    faithful = FakeUpscalingFaithfulBackend()
+    # far over the 8x file-size cap: the comparison with the original replaces that gate
+    world.fake.set_media("output", _media(100_000))
+    # PieAPP is not installed: the faithful scorer does not need it
+    backends = _faithful_backends(
+        world, faithful, pieapp=PieAppTorchBackend(_backend_version="not-configured")
+    )
+    async with _client(world, backends=backends) as client:
+        resp = await client.post("/score", json=_faithful_body(world))
+    assert resp.status_code == 200, resp.text
+    item = ItemScore.from_json(resp.json()["item_score_json"])
+    assert item.gate_passed, item.violations
+    assert item.breakdown is not None and item.breakdown.kind == "upscaling_faithful"
+    assert item.breakdown.upscale_factor == 2
+    assert item.score == pytest.approx(item.breakdown.final) and item.score > 0.3
+    assert item.metrics["upscale_psnr_db"] == 33.0 and item.metrics["upscale_floor_psnr_db"] == 30.0
+    assert item.metrics["upscale_frames"] == 60 and item.metrics["upscale_factor"] == 2
+    assert item.metrics["vmaf"] is None
+    assert world.fake.pieapp_calls == []
+    assert not any(role == ("reference", "output") for role in world.fake.vmaf_calls)
+    # the floor is the canonical served input (Lanczos-upscaled to the candidate geometry)
+    assert len(faithful.calls) == 1
+    assert faithful.calls[0]["floor_key"] == (world.reference_digest, world.miner_input_digest)
+    assert 0 <= faithful.calls[0]["lpips_offset"] < ScoringConfig().upscaling_faithful_lpips_stride
+    assert item.metrics["lpips_offset"] == faithful.calls[0]["lpips_offset"]
+    assert any(skip.gate == "tone_manipulation" for skip in item.skips)
+
+
+async def test_faithful_upscaling_free_answer_scores_zero(world: FakeWorld) -> None:
+    backends = _faithful_backends(world, FakeUpscalingFaithfulBackend(psnr=30.0, ssim=0.90, lpips=0.20))
+    async with _client(world, backends=backends) as client:
+        resp = await client.post("/score", json=_faithful_body(world))
+    item = ItemScore.from_json(resp.json()["item_score_json"])
+    assert item.gate_passed and item.score == 0.0
+
+
+async def test_faithful_upscaling_validator_side_faults_are_refused_not_zeroed(world: FakeWorld) -> None:
+    backends = _faithful_backends(world, FakeUpscalingFaithfulBackend(input_fail="served input has 59 frames"))
+    async with _client(world, backends=backends) as client:
+        resp = await client.post("/score", json=_faithful_body(world))
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"]["error"] == "upscaling_input_unmeasurable"
+    async with _client(world, backends=_faithful_backends(world, None)) as client:
+        resp = await client.post("/score", json=_faithful_body(world))
+    assert resp.status_code == 501
+    backends = _faithful_backends(world, FakeUpscalingFaithfulBackend())
+    async with _client(world, backends=backends) as client:
+        resp = await client.post("/score", json=_faithful_body(world, upscale_factor=3))
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"]["error"] == "upscaling_factor_unsupported"
+
+
+async def test_faithful_upscaling_candidate_side_faults_are_violations(world: FakeWorld) -> None:
+    backends = _faithful_backends(world, FakeUpscalingFaithfulBackend(fail="candidate unreadable"))
+    async with _client(world, backends=backends) as client:
+        resp = await client.post("/score", json=_faithful_body(world))
+    assert resp.status_code == 200, resp.text
+    item = ItemScore.from_json(resp.json()["item_score_json"])
+    assert not item.gate_passed and any(v.code is ReasonCode.METRIC_MISSING for v in item.violations)
+    assert item.score == 0.0
+
+
+async def test_faithful_upscaling_wrong_frame_count_is_zeroed_without_measuring(world: FakeWorld) -> None:
+    faithful = FakeUpscalingFaithfulBackend()
+    world.fake.set_media("output", _media(5_000).model_copy(update={"frame_count": 59}))
+    async with _client(world, backends=_faithful_backends(world, faithful)) as client:
+        resp = await client.post("/score", json=_faithful_body(world))
+    assert resp.status_code == 200, resp.text
+    item = ItemScore.from_json(resp.json()["item_score_json"])
+    assert not item.gate_passed
+    assert any(v.code is ReasonCode.FRAME_COUNT_MISMATCH for v in item.violations)
+    assert faithful.calls == []
+    assert item.score == 0.0
+
+
+async def test_faithful_upscaling_wrong_geometry_is_zeroed_without_measuring(world: FakeWorld) -> None:
+    faithful = FakeUpscalingFaithfulBackend()
+    world.fake.set_media("output", _media(5_000, width=318, height=240))
+    async with _client(world, backends=_faithful_backends(world, faithful)) as client:
+        resp = await client.post("/score", json=_faithful_body(world))
+    assert resp.status_code == 200, resp.text
+    item = ItemScore.from_json(resp.json()["item_score_json"])
+    assert not item.gate_passed and item.score == 0.0
+    assert any(v.code is ReasonCode.STREAM_DIMENSIONS_MISMATCH for v in item.violations)
+    assert faithful.calls == []
+
+
+class FakeStreamingBackend:
+    """Deterministic packet measurement (no media)."""
+
+    def __init__(self, *, avg=1000.0, peak=1500.0, gop=2.0, first_key=True, fail: str | None = None) -> None:
+        self.avg, self.peak, self.gop, self.first_key, self.fail = avg, peak, gop, first_key, fail
+        self.calls: list[tuple[str, dict]] = []
+
+    def version(self) -> str:
+        return "fake-streaming/1"
+
+    def measure(self, candidate_path, **kwargs):
+        from vidaio.scoring.streaming import StreamingMeasurement
+        from vidaio.scoring_worker.streaming_backend import StreamingMeasurementError
+
+        self.calls.append((RoleKeyedBackend.role(candidate_path), kwargs))
+        if self.fail:
+            raise StreamingMeasurementError(self.fail)
+        return StreamingMeasurement(
+            avg_kbps=self.avg, peak_kbps=self.peak, max_keyframe_interval_seconds=self.gop,
+            first_frame_is_keyframe=self.first_key, keyframes=1, packets=60,
+        )
+
+
+def _streaming_body(world: FakeWorld, **rules) -> dict:
+    from vidaio.scoring import StreamingRules
+
+    params = {"vmaf_threshold": 90.0, **StreamingRules(bits_per_pixel=0.5, **rules).as_params()}
+    return score_request_body(
+        track="compression",
+        reference=world.reference,
+        reference_digest=world.reference_digest,
+        output=world.output,
+        output_digest=world.output_digest,
+        params=params,
+    )
+
+
+def _streaming_backends(world: FakeWorld, streaming) -> ScoringBackends:
+    return ScoringBackends(
+        probe=world.fake, vmaf_primary=world.fake, vmaf_secondary=world.fake, pieapp=world.fake.pieapp,
+        perceptual=world.fake, canonicalizer=None, versions=world.fake.versions(), streaming=streaming,
+    )
+
+
+async def test_streaming_compression_scores_quality_within_the_budget(world: FakeWorld) -> None:
+    streaming = FakeStreamingBackend()
+    # VMAF 72 would fail the classic compression floor (threshold 90 - 5): streaming has none
+    world.fake._vmaf[("reference", "output")] = 72.0
+    async with _client(world, backends=_streaming_backends(world, streaming)) as client:
+        resp = await client.post("/score", json=_streaming_body(world))
+    assert resp.status_code == 200, resp.text
+    item = ItemScore.from_json(resp.json()["item_score_json"])
+    assert item.gate_passed, item.violations
+    assert item.breakdown is not None and item.breakdown.kind == "streaming"
+    assert item.score == pytest.approx((72.0 - 60.0) / 40.0)
+    # budget from the reference: 0.5 bpp x 320x240 at 30 fps
+    assert item.metrics["stream_target_kbps"] == pytest.approx(0.5 * 320 * 240 * 30 / 1000)
+    assert item.metrics["stream_avg_kbps"] == 1000.0
+    assert streaming.calls[0][0] == "output"
+    assert streaming.calls[0][1] == {"fps": 30.0, "frames": 60, "peak_window_seconds": 2.0}
+
+
+async def test_streaming_delivery_rules_zero_the_item(world: FakeWorld) -> None:
+    # budget: 0.5 bpp x 320x240 at 30 fps = 1152 kbps (+1 % slack), peak 1.5x = 1728 kbps
+    for backend, code in (
+        (FakeStreamingBackend(avg=1200.0), ReasonCode.STREAMING_BITRATE_EXCEEDED),
+        (FakeStreamingBackend(peak=1800.0), ReasonCode.STREAMING_PEAK_EXCEEDED),
+        (FakeStreamingBackend(gop=3.0), ReasonCode.STREAMING_KEYFRAME_INTERVAL),
+        (FakeStreamingBackend(fail="no packets"), ReasonCode.METRIC_MISSING),
+    ):
+        async with _client(world, backends=_streaming_backends(world, backend)) as client:
+            resp = await client.post("/score", json=_streaming_body(world))
+        item = ItemScore.from_json(resp.json()["item_score_json"])
+        assert not item.gate_passed and item.score == 0.0, (code, item.violations)
+        assert any(v.code is code for v in item.violations), (code, item.violations)
+
+
+async def test_streaming_needs_its_backend_and_valid_rules(world: FakeWorld) -> None:
+    async with _client(world, backends=_streaming_backends(world, None)) as client:
+        resp = await client.post("/score", json=_streaming_body(world))
+    assert resp.status_code == 501
+    body = _streaming_body(world)
+    body["params"]["peak_ratio"] = 0.5
+    async with _client(world, backends=_streaming_backends(world, FakeStreamingBackend())) as client:
+        resp = await client.post("/score", json=body)
+    assert resp.status_code == 422 and resp.json()["detail"]["error"] == "streaming_rules_invalid"
+
+
 async def test_fake_upscaling_full_round_with_derived_start_frame(
     world: FakeWorld,
 ) -> None:

@@ -75,6 +75,8 @@ def _attestation() -> dict:
             "numpy": "numpy/2.2.6",
             "removal_metrics": "removal-metrics/2",
             "interpolation_metrics": "interpolation-metrics/1",
+            "upscaling_faithful_metrics": "upscaling-faithful-metrics/1",
+            "streaming_packets": "streaming-packets/1",
             "lpips": "lpips/0.1.4",
             "python": "cpython/3.13.15",
         },

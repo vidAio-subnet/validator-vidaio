@@ -44,6 +44,8 @@ PAYOUT_BACKENDS = {
     "numpy": "numpy/2.2.6",
     "removal_metrics": "removal-metrics/2",
     "interpolation_metrics": "interpolation-metrics/1",
+    "upscaling_faithful_metrics": "upscaling-faithful-metrics/1",
+    "streaming_packets": "streaming-packets/1",
     "lpips": "lpips/0.1.4",
     "python": "cpython/3.13.15",
 }
@@ -485,3 +487,43 @@ def test_failed_health_refresh_clears_prior_runtime_contract(seeded_conn, tmp_pa
         client.score_item(cid, contender_id, item, output)
     assert health_calls == 3
     assert score_called is False
+
+
+def test_streaming_compression_request_carries_the_anchored_rules(tmp_path):
+    rules = {"bits_per_pixel": 0.05, "max_keyframe_interval_seconds": 2.0, "peak_ratio": 1.5,
+             "peak_window_seconds": 2.0}
+    conn = connect(":memory:")
+    migrate(conn)
+    engine = LifecycleEngine()
+    manifest = build_manifest("comp-streaming-client", compression_scoring="streaming", streaming_rules=rules)
+    engine.create_competition(conn, manifest, T0)
+    engine.mark_commitment_anchored(conn, manifest.competition_id, COMMITMENT_ROOT, T0)
+    engine.tick(conn, START)
+    contender_id = repo.enroll_contender(
+        conn, manifest.competition_id, hotkey="hk-a", repo_url="local://hk-a",
+        commit_sha="1a" * 20, tree_sha="2a" * 20, stake=1000.0, now=START,
+    )
+    item_id = repo.add_evaluation_item(
+        conn, manifest.competition_id, item_index=0, input_sha256="0" * 64, input_bytes=4096,
+        threshold_commitment="f" * 64, challenge_id="chal-x", length_seconds=10.0, now=START,
+    )
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/healthz":
+            return httpx.Response(200, json=_health_payload())
+        seen["params"] = ScoreRequest.model_validate_json(request.content).params
+        return httpx.Response(500)
+
+    client = HttpScoringClient(
+        "http://scoring.test", conn, inputs_dir=tmp_path / "in", outputs_dir=tmp_path / "out",
+        transport=httpx.MockTransport(handler), expected_runtime_contract=EXPECTED_RUNTIME_CONTRACT,
+    )
+    item = BatchItem(item_id=item_id, item_index=0, input_sha256="0" * 64, input_bytes=4096)
+    output = BatchOutput(item_id=item_id, output_sha256="1" * 64, output_bytes=512)
+    with pytest.raises(ScoringClientError):
+        client.score_item(manifest.competition_id, contender_id, item, output)
+    assert seen["params"] == {
+        "vmaf_threshold": 90.0, "scoring": "streaming", "bits_per_pixel": 0.05,
+        "max_keyframe_interval_s": 2.0, "peak_ratio": 1.5, "peak_window_s": 2.0,
+    }

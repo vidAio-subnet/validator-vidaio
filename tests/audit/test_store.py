@@ -501,6 +501,114 @@ def test_real_s3_does_not_hide_non_precondition_failures() -> None:
         _real_s3_transport(ConcurrentWriteClient()).put_bytes("key", b"payload")
 
 
+class ReadTimeoutError(Exception):
+    """Named like botocore's: the request was sent, its response timed out."""
+
+
+class SlowAckS3Client(ConditionalS3Client):
+    """Commits the object (or not) but never answers the PUT in time."""
+
+    def __init__(self, *, lands: bool = True, landed_payload: bytes | None = None) -> None:
+        super().__init__()
+        self.lands = lands
+        self.landed_payload = landed_payload
+        self.heads = 0
+
+    def put_object(self, **kwargs: object) -> None:
+        body = kwargs["Body"]
+        payload = body.read() if hasattr(body, "read") else body
+        assert isinstance(payload, bytes)
+        if self.lands:
+            stored = self.landed_payload if self.landed_payload is not None else payload
+            self.objects[str(kwargs["Key"])] = stored
+        raise ReadTimeoutError("Read timeout on endpoint URL")
+
+    def head_object(self, **kwargs: object) -> dict[str, object]:
+        import hashlib as _hashlib
+
+        self.heads += 1
+        payload = self.objects.get(str(kwargs["Key"]))
+        if payload is None:
+            raise RuntimeError("404 Not Found")
+        return {"ContentLength": len(payload), "ETag": f'"{_hashlib.md5(payload).hexdigest()}"'}
+
+
+@pytest.fixture
+def fast_late_ack(monkeypatch: pytest.MonkeyPatch) -> None:
+    import vidaio.audit.store as store_mod
+
+    monkeypatch.setattr(store_mod, "_S3_LATE_ACK_GRACE_SECONDS", 0.0)
+    monkeypatch.setattr(store_mod.time, "sleep", lambda _s: None)
+
+
+@pytest.mark.parametrize("as_file", [False, True])
+def test_real_s3_write_accepted_when_the_object_landed_after_a_read_timeout(
+    tmp_path: Path, fast_late_ack: None, *, as_file: bool
+) -> None:
+    client = SlowAckS3Client()
+    transport = _real_s3_transport(client)
+    if as_file:
+        src = tmp_path / "out.mkv"
+        src.write_bytes(b"lossless-output")
+        transport.put_file("miner_output/ab/cd/abcd", src)
+    else:
+        transport.put_bytes("miner_output/ab/cd/abcd", b"lossless-output")
+
+    assert client.objects["launch/miner_output/ab/cd/abcd"] == b"lossless-output"
+    assert client.heads == 1
+
+
+@pytest.mark.parametrize("landed_payload", [None, b"other-bytes!!!!"])
+def test_real_s3_read_timeout_still_fails_without_the_exact_object(
+    fast_late_ack: None, *, landed_payload: bytes | None
+) -> None:
+    # absent within the grace period, or a different object at the key
+    client = SlowAckS3Client(lands=landed_payload is not None, landed_payload=landed_payload)
+    with pytest.raises(ReadTimeoutError):
+        _real_s3_transport(client).put_bytes("miner_output/ab/cd/abcd", b"lossless-output")
+
+
+def test_real_s3_same_size_wrong_md5_is_not_accepted(fast_late_ack: None) -> None:
+    client = SlowAckS3Client(landed_payload=b"lossless-outpuX")
+    with pytest.raises(ReadTimeoutError):
+        _real_s3_transport(client).put_bytes("k", b"lossless-output")
+
+
+def test_real_s3_large_writes_use_the_long_ack_client_lazily() -> None:
+    import vidaio.audit.store as store_mod
+
+    small, large = ConditionalS3Client(), ConditionalS3Client()
+    built: list[object] = []
+    transport = _real_s3_transport(small)
+
+    def factory() -> object:
+        built.append(large)
+        return large
+
+    transport._large_write_client_factory = factory  # type: ignore[attr-defined]
+    transport._large_write_client = None  # type: ignore[attr-defined]
+    transport.put_bytes("small", b"x" * 10)
+    assert built == []
+    big = b"y" * store_mod._S3_LARGE_WRITE_MIN_BYTES
+    transport.put_bytes("big1", big)
+    transport.put_bytes("big2", big)
+    assert built == [large]
+    assert set(small.objects) == {"launch/small"}
+    assert set(large.objects) == {"launch/big1", "launch/big2"}
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"), [("", 180), ("600", 600), ("5", 30), ("99999", 900), ("junk", 180)]
+)
+def test_large_write_read_timeout_env_is_bounded(
+    monkeypatch: pytest.MonkeyPatch, *, raw: str, expected: int
+) -> None:
+    from vidaio.audit.store import _large_write_read_timeout
+
+    monkeypatch.setenv("VIDAIO_S3_LARGE_WRITE_READ_TIMEOUT_SECONDS", raw)
+    assert _large_write_read_timeout() == expected
+
+
 @pytest.mark.parametrize("read_to_file", [False, True])
 def test_real_s3_stream_timeout_closes_body_and_discards_partial_download(
     tmp_path: Path, *, read_to_file: bool

@@ -11,7 +11,7 @@
 #     external model files are needed — verified empirically (a real 2-clip VMAF
 #     computes for both models). Debian's own ffmpeg does NOT ship libvmaf, which
 #     is why the static build is copied in rather than apt-installed.
-#     VERSION MATTERS: pinned to 9.0 to match the developers' host ffmpeg (9.x).
+#     VERSION MATTERS: pinned to 9.0.x to match the developers' host ffmpeg (9.x).
 #     ffmpeg 7.1's `-fps_mode cfr` with no explicit rate defaults the y4m output to
 #     25fps, inflating a 20fps source's canonicalized frame count (120 -> 150) past
 #     the scoring worker's scratch projection -> every /score 413s
@@ -44,7 +44,9 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 # ffmpeg + ffprobe (static, libvmaf + models built in) and the docker CLI client.
-COPY --from=mwader/static-ffmpeg:9.0@sha256:b90574a4e2ae62b763c39c384526689e7eb435da6398f4fb3f6c3f1c6a14ce33 /ffmpeg /ffprobe /usr/local/bin/
+# 9.0.2 build of 2026-11-01 (libvmaf 3.2.1, Alpine 3.24.3 with Brotli 1.2.1): replaces the 2026-08-04 9.0
+# build whose bundled Brotli predates the CVE-2026-111497 fix. Scores measured unchanged on the same encodes.
+COPY --from=mwader/static-ffmpeg@sha256:041de6c902d5ab44083bdb342253415dec05b9e548847ad79b2085e2c780c455 /ffmpeg /ffprobe /usr/local/bin/
 COPY --from=docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c /usr/local/bin/docker /usr/local/bin/docker
 COPY --from=uv-bin /uv /uvx /usr/local/bin/
 

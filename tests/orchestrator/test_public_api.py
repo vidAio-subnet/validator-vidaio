@@ -250,3 +250,27 @@ def test_limiter_window_and_key_flood() -> None:
     assert limiter.allow("a")
     assert limiter.allow("b")
     assert not limiter.allow("c")  # key table full of live keys: fail closed
+
+
+async def test_enrollment_reads_closed_after_the_deadline_while_the_phase_is_enrolling(
+    orchestrator_factory, fixture_repos
+):
+    from datetime import timedelta
+
+    now = [START + 5 * M]
+    orch = orchestrator_factory(repos=fixture_repos, clock=lambda: now[0])
+    cid = await start_and_enroll(orch, build_manifest("comp-public"), [])
+    app = create_public_app(
+        orch,
+        hotkey_guard=_guard({HK_A: 750.0}),
+        min_enroll_alpha_stake=500.0,
+        allowed_repo_hosts=("github.com",),
+    )
+    client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://public")
+    async with client:
+        entry = (await client.get("/v1/competitions")).json()["competitions"][0]
+        assert entry["enrollment_open"] is True
+        now[0] = repo.get_competition(orch.conn, cid).enrollment_deadline + timedelta(seconds=1)
+        entry = (await client.get("/v1/competitions")).json()["competitions"][0]
+        assert entry["status"] == "ENROLLING"
+        assert entry["enrollment_open"] is False

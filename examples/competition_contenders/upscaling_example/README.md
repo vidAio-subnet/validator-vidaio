@@ -81,7 +81,10 @@ everything you ship must allow commercial use, your own code is Apache-2.0 or MI
 `LICENSE` file at the repository root, every third-party component is listed in
 `LICENSES.md`, and every download is pinned by content. Weights published by a model's
 authors from its repository take that repository's licence; a file your solution never
-loads at run time is not judged.
+loads at run time is not judged. Everything you train, fine-tune or tune on must allow
+training a model for commercial use ("Training data" in `docs/MINING.md`). In
+`practice-pack-004` that means p01–p07 only: p08–p10 were generated with LTX-2.5, whose
+licence restricts training on its outputs, so use them only to evaluate your entry.
 
 This example ships its own `LICENSE` (MIT) and `LICENSES.md`; keep both up to date when
 you build on it. `python scripts/competition_precheck.py <repo> --commit <sha>

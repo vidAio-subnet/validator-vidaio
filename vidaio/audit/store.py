@@ -32,12 +32,14 @@ import binascii
 import hashlib
 import io
 import os
+import re
 import tempfile
 import threading
+import time
 import uuid
 from enum import StrEnum
 from pathlib import Path
-from typing import BinaryIO, Callable, Protocol, runtime_checkable
+from typing import Any, BinaryIO, Callable, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -48,6 +50,16 @@ _CHUNK = 1 << 20
 _S3_CONNECT_TIMEOUT_SECONDS = 10
 _S3_READ_TIMEOUT_SECONDS = 30
 _S3_TOTAL_MAX_ATTEMPTS = 3
+# Some providers (Hippius) acknowledge a large PUT only after committing it, which can
+# take well over the 30 s bound above: competition evidence uploads of 70-150 MB outputs
+# timed out three times in a row and HALTED a competition (2026-11-02), although the
+# objects landed seconds later. Large writes therefore wait longer for the response,
+# and a write whose response timed out is accepted once the object is verifiably there.
+_S3_LARGE_WRITE_MIN_BYTES = 32 << 20
+_S3_LARGE_WRITE_READ_TIMEOUT_DEFAULT = 180
+_S3_LARGE_WRITE_READ_TIMEOUT_ENV = "VIDAIO_S3_LARGE_WRITE_READ_TIMEOUT_SECONDS"
+_S3_LATE_ACK_GRACE_SECONDS = 60.0
+_S3_LATE_ACK_POLL_SECONDS = 5.0
 # Large objects are fetched as concurrent byte ranges. One TCP stream collapses to
 # a few MB/s on a lossy path, which turned reference release and release
 # verification into 10+ minute steps; N ranges restore the link's throughput. The
@@ -1413,6 +1425,23 @@ def _is_s3_precondition_failure(exc: BaseException) -> bool:
     return status == 412 or str(code) in {"412", "PreconditionFailed"}
 
 
+def _is_s3_read_timeout(exc: BaseException) -> bool:
+    """Whether the request was sent but its response timed out (botocore's
+    ``ReadTimeoutError``), so the object may still have been committed. Matched by
+    class name to stay independent of ``botocore``, like the precondition check."""
+
+    return any(cls.__name__ == "ReadTimeoutError" for cls in type(exc).__mro__)
+
+
+def _large_write_read_timeout() -> int:
+    raw = os.environ.get(_S3_LARGE_WRITE_READ_TIMEOUT_ENV, "").strip()
+    try:
+        value = int(raw) if raw else _S3_LARGE_WRITE_READ_TIMEOUT_DEFAULT
+    except ValueError:
+        value = _S3_LARGE_WRITE_READ_TIMEOUT_DEFAULT
+    return max(_S3_READ_TIMEOUT_SECONDS, min(value, 900))
+
+
 def _parallel_streams() -> int:
     raw = os.environ.get(_S3_PARALLEL_STREAMS_ENV, "").strip()
     if not raw:
@@ -1476,24 +1505,59 @@ class _RealS3Transport:
         kwargs["config"] = Config(**config_kwargs)
         self._bucket = bucket
         self._prefix = prefix.strip("/")
-        self._client = boto3.client(
-            "s3",
+        client_kwargs = dict(
             region_name=region or None,
             endpoint_url=endpoint,
             aws_access_key_id=access_key,
             aws_secret_access_key=secret_key,
-            **kwargs,
         )
+        self._client = boto3.client("s3", **client_kwargs, **kwargs)
+
+        def large_write_client() -> object:
+            large = {**config_kwargs, "read_timeout": _large_write_read_timeout()}
+            return boto3.client("s3", **client_kwargs, config=Config(**large))
+
+        self._large_write_client_factory = large_write_client
+        self._large_write_client: object | None = None
 
     def _full(self, key: str) -> str:  # pragma: no cover - needs boto3
         return f"{self._prefix}/{key}" if self._prefix else key
+
+    def _write_client(self, size: int) -> Any:
+        """The client for a PUT of ``size`` bytes: large bodies wait longer for the
+        provider's acknowledgement; everything else keeps the bounded default."""
+        factory = getattr(self, "_large_write_client_factory", None)
+        if size < _S3_LARGE_WRITE_MIN_BYTES or factory is None:
+            return self._client
+        if self._large_write_client is None:
+            self._large_write_client = factory()
+        return self._large_write_client
+
+    def _landed_after_timeout(self, key: str, size: int, md5_hex: str) -> bool:
+        """After a PUT whose response timed out: True once the object is present with
+        exactly this size (and this MD5 when the ETag is a plain MD5). A different
+        object at the key, or none within the grace period, keeps the failure."""
+        deadline = time.monotonic() + _S3_LATE_ACK_GRACE_SECONDS
+        while True:
+            try:
+                resp = self._client.head_object(Bucket=self._bucket, Key=self._full(key))
+            except Exception:  # noqa: BLE001 - absent (404) or transiently unreadable
+                resp = None
+            if resp is not None:
+                etag = str(resp.get("ETag", "")).strip('"').lower()
+                md5_ok = not re.fullmatch(r"[0-9a-f]{32}", etag) or etag == md5_hex
+                return int(resp.get("ContentLength", -1)) == size and md5_ok
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(_S3_LATE_ACK_POLL_SECONDS)
 
     def put_bytes(self, key: str, payload: bytes) -> None:
         import base64
         import hashlib as _hashlib
 
+        md5 = _hashlib.md5(payload, usedforsecurity=False)
         try:
-            self._client.put_object(
+            self._write_client(len(payload)).put_object(
                 Bucket=self._bucket,
                 Key=self._full(key),
                 Body=payload,
@@ -1501,9 +1565,7 @@ class _RealS3Transport:
                 # refuses to commit a corrupted transfer (BadDigest) — without
                 # it, a bit-flipped sealed object is only discovered when its
                 # release attempt HOLDS epoch finalization.
-                ContentMD5=base64.b64encode(
-                    _hashlib.md5(payload, usedforsecurity=False).digest()
-                ).decode(),
+                ContentMD5=base64.b64encode(md5.digest()).decode(),
                 IfNoneMatch="*",
             )
         except Exception as exc:  # noqa: BLE001 - optional SDK error type
@@ -1511,6 +1573,10 @@ class _RealS3Transport:
                 raise WriteOnceConflictError(
                     f"conditional S3 create lost for {key!r}"
                 ) from exc
+            if _is_s3_read_timeout(exc) and self._landed_after_timeout(
+                key, len(payload), md5.hexdigest()
+            ):
+                return
             raise
 
     def put_file(self, key: str, path: Path) -> None:
@@ -1524,13 +1590,14 @@ class _RealS3Transport:
         with path.open("rb") as source:
             while chunk := source.read(_CHUNK):
                 md5.update(chunk)
+        size = path.stat().st_size
         with path.open("rb") as source:
             try:
-                self._client.put_object(
+                self._write_client(size).put_object(
                     Bucket=self._bucket,
                     Key=self._full(key),
                     Body=source,
-                    ContentLength=path.stat().st_size,
+                    ContentLength=size,
                     # Server-side transfer verification — see put_bytes.
                     ContentMD5=base64.b64encode(md5.digest()).decode(),
                     IfNoneMatch="*",
@@ -1540,6 +1607,10 @@ class _RealS3Transport:
                     raise WriteOnceConflictError(
                         f"conditional S3 create lost for {key!r}"
                     ) from exc
+                if _is_s3_read_timeout(exc) and self._landed_after_timeout(
+                    key, size, md5.hexdigest()
+                ):
+                    return
                 raise
 
     def get_bytes(self, key: str) -> bytes:  # pragma: no cover - needs boto3

@@ -65,6 +65,8 @@ enter (the sandbox injects no environment variables).
 
 The same rules as the other competition tracks (`docs/MINING.md`):
 - everything you ship must allow commercial use;
+- everything you train or tune on must allow training a model for commercial use
+  ("Training data" in `docs/MINING.md`);
 - your own code is Apache-2.0 or MIT, with a `LICENSE` file at the repository root;
 - every third-party component is listed in `LICENSES.md`;
 - every download is pinned by content.

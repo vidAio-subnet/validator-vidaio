@@ -78,7 +78,11 @@ be usable commercially end to end:
   allows commercial use (Apache-2.0, MIT, BSD, ISC, MPL-2.0, CC0/Unlicense, CC-BY-4.0, or
   GPL/LGPL such as ffmpeg). Non-commercial, research-only, no-derivatives, AGPL/SSPL or
   unlicensed components are refused, including fine-tuned, merged, adapted or distilled
-  versions of such models. Licences are judged on what you ship, not on training data;
+  versions of such models. Licences are judged on what you ship;
+- everything you train, fine-tune or tune your entry on must allow training a model for
+  commercial use (see "Training data" in `docs/MINING.md`): no non-commercial or
+  research-only datasets, and no outputs of models whose licence restricts training on
+  them, such as LTX-2.x. You may still use such material to evaluate your entry;
 - your own code must be released under Apache-2.0 or MIT (a `LICENSE` file at the
   repository root at the commit you enroll);
 - list every third-party component in a `LICENSES.md` at the repository root: name,

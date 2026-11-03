@@ -17,6 +17,9 @@ What happens on `enroll`:
 
 Pin exactly what you want evaluated:
     git rev-parse HEAD 'HEAD^{tree}'
+(--commit takes the first line, --tree the second). Add --repo <your clone> and the
+client checks that the tree belongs to the commit before anything is signed: an
+enrollment cannot be edited, and a mismatch loses the entry at finalization.
 The repository must be reachable over https on an allowed host (see `list`). A private
 repository works when the competition's read-only reader account has been granted
 access; ask in the subnet Discord for that account name.
@@ -26,6 +29,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -87,7 +92,37 @@ def cmd_list(args: argparse.Namespace) -> int:
     return 0
 
 
+_SHA = re.compile(r"[0-9a-f]{40}")
+
+
+def check_shas(commit: str, tree: str, repo: str | None) -> None:
+    """Refuse the mistakes that lose an entry at finalization, before anything is signed:
+    a malformed SHA, the commit SHA given as the tree, or (with --repo) a tree that is not
+    the commit's. An enrollment cannot be edited afterwards."""
+    for name, value in (("--commit", commit), ("--tree", tree)):
+        if not _SHA.fullmatch(value):
+            raise SystemExit(f"{name} must be a full 40-character lowercase SHA, got {value!r}")
+    if commit == tree:
+        raise SystemExit(
+            "--tree is the commit SHA; it must be the commit's TREE: git rev-parse <commit>^{tree}"
+        )
+    if repo is None:
+        return
+
+    def rev_parse(spec: str) -> str:
+        done = subprocess.run(["git", "-C", repo, "rev-parse", "--verify", spec],
+                              capture_output=True, text=True)
+        if done.returncode != 0:
+            raise SystemExit(f"git rev-parse {spec} failed in {repo}: {done.stderr.strip()}")
+        return done.stdout.strip()
+
+    actual = rev_parse(f"{commit}^{{tree}}")
+    if actual != tree:
+        raise SystemExit(f"--tree {tree} is not the tree of commit {commit} in {repo} (it is {actual})")
+
+
 def cmd_enroll(args: argparse.Namespace) -> int:
+    check_shas(args.commit, args.tree, args.repo)
     from vidaio.services.hotkey_auth import sign_request_headers
 
     try:
@@ -130,6 +165,7 @@ def main(argv: list[str] | None = None) -> int:
     enroll.add_argument("--wallet-name", required=True)
     enroll.add_argument("--wallet-hotkey", required=True)
     enroll.add_argument("--wallet-path")
+    enroll.add_argument("--repo", help="local clone: check that --tree is the tree of --commit before signing")
     enroll.set_defaults(func=cmd_enroll)
     args = parser.parse_args(argv)
     return int(args.func(args))

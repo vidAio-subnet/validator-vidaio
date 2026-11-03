@@ -119,7 +119,10 @@ def _public_competition(orch: "Orchestrator", comp: repo.CompetitionRecord) -> d
         "enrollment_deadline": comp.enrollment_deadline.isoformat(),
         "finalization_time": comp.finalization_time.isoformat(),
         "end_time": comp.end_time.isoformat(),
-        "enrollment_open": comp.status is Phase.ENROLLING,
+        # The phase stays ENROLLING until finalization_time; enrollment itself closes at
+        # the deadline (repository.enroll refuses later requests), so say so here too.
+        "enrollment_open": comp.status is Phase.ENROLLING
+        and orch.now() <= comp.enrollment_deadline,
         "manifest": manifest.model_dump(mode="json", exclude_none=True),
         "enrolled": [
             {

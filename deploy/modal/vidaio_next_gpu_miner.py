@@ -132,7 +132,9 @@ for _name in ("VIDAIO_NEXT_GPU_MAX_FRAMES", "VIDAIO_NEXT_GPU_INGRESS_TIMEOUT_SEC
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
-    .apt_install("ffmpeg", "curl", "xz-utils", "zstd")
+    # ca-certificates: upgrade the base image's bundle (2026-10 drops the roots behind the compromised
+    # eMudhra intermediates); certifi below is pinned for the same reason.
+    .apt_install("ca-certificates", "ffmpeg", "curl", "xz-utils", "zstd")
     # Premium (P1.1a) toolchain, baked at build time (cold starts may not
     # download anything): pinned ab-av1 release + BtbN static ffmpeg n9.0 —
     # libvmaf (ab-av1's scorer) + libsvtav1/libx264/libx265/libvpx; Debian's
@@ -152,6 +154,7 @@ image = (
         " && ffmpeg -hide_banner -filters 2>/dev/null | grep -q libvmaf",
     )
     .uv_pip_install(
+        "certifi==2026.10.23",
         "fastapi==0.116.1",
         "httpx==0.28.1",
         "numpy==2.2.6",

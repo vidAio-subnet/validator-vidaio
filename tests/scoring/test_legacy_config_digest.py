@@ -24,19 +24,32 @@ from vidaio.scoring.result import (
     INTERPOLATION_CONFIG_FIELDS,
     REMOVAL_CONFIG_FIELDS,
     COMP004_RELEASE_CONFIG_FIELDS,
+    COMP006_RELEASE_CONFIG_FIELDS,
     STREAMING_CONFIG_FIELDS,
     UPSCALING_FAITHFUL_CONFIG_FIELDS,
+    UPSCALING_GENERATIVE_CONFIG_FIELDS,
     accepted_config_digests,
     compose_item_score,
     config_digest,
 )
 
 
+#: ``config_digest(ScoringConfig())`` as computed by the competition-004/005 release (main
+#: before the generative fields), recomputed from that release's own config module. Packets
+#: and witness evidence minted by it must stay verifiable after the roll.
+COMP005_RELEASE_DEFAULT_DIGEST = "61f6f780924fed0b75c10c55ec66416e4ee28ce2df01ed5029de2bfabcf7cedb"
+
+
 def _legacy(config: ScoringConfig) -> str:
     """The digest the pre-removal release computed (it had neither later field set)."""
     return hashlib.sha256(
         config.model_dump_json(
-            exclude=set(REMOVAL_CONFIG_FIELDS | INTERPOLATION_CONFIG_FIELDS | COMP004_RELEASE_CONFIG_FIELDS)
+            exclude=set(
+                REMOVAL_CONFIG_FIELDS
+                | INTERPOLATION_CONFIG_FIELDS
+                | COMP004_RELEASE_CONFIG_FIELDS
+                | COMP006_RELEASE_CONFIG_FIELDS
+            )
         ).encode("utf-8")
     ).hexdigest()
 
@@ -45,7 +58,9 @@ def _pre_interpolation(config: ScoringConfig) -> str:
     """The digest the removal release computed (before the interpolation fields)."""
     return hashlib.sha256(
         config.model_dump_json(
-            exclude=set(INTERPOLATION_CONFIG_FIELDS | COMP004_RELEASE_CONFIG_FIELDS)
+            exclude=set(
+                INTERPOLATION_CONFIG_FIELDS | COMP004_RELEASE_CONFIG_FIELDS | COMP006_RELEASE_CONFIG_FIELDS
+            )
         ).encode("utf-8")
     ).hexdigest()
 
@@ -54,7 +69,16 @@ def _pre_upscaling_faithful(config: ScoringConfig) -> str:
     """The digest the interpolation release computed (before the comp 004 release fields:
     faithful upscaling and streaming compression)."""
     return hashlib.sha256(
-        config.model_dump_json(exclude=set(COMP004_RELEASE_CONFIG_FIELDS)).encode("utf-8")
+        config.model_dump_json(
+            exclude=set(COMP004_RELEASE_CONFIG_FIELDS | COMP006_RELEASE_CONFIG_FIELDS)
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _pre_upscaling_generative(config: ScoringConfig) -> str:
+    """The digest the comp 004/005 release computed (before the generative fields)."""
+    return hashlib.sha256(
+        config.model_dump_json(exclude=set(COMP006_RELEASE_CONFIG_FIELDS)).encode("utf-8")
     ).hexdigest()
 
 
@@ -91,16 +115,37 @@ def test_streaming_field_set_is_the_frozen_history():
     assert STREAMING_CONFIG_FIELDS <= set(ScoringConfig.model_fields)
 
 
+def test_upscaling_generative_field_set_is_the_frozen_history():
+    assert UPSCALING_GENERATIVE_CONFIG_FIELDS == {
+        "upscaling_generative_weights", "upscaling_generative_anchors",
+        "upscaling_generative_fr_frames", "upscaling_generative_fr_max_side",
+        "upscaling_generative_temporal_max_side", "upscaling_generative_warp_floor",
+        "upscaling_generative_nr_cap", "upscaling_generative_lowres_psnr_min_db",
+        "upscaling_generative_lowres_psnr_floor_db", "upscaling_generative_lowres_blur_sigma",
+        "upscaling_generative_color_delta_e_max", "upscaling_generative_color_max_side",
+        "upscaling_generative_delivery_encode", "upscaling_generative_delivery_crf",
+    }
+    assert COMP006_RELEASE_CONFIG_FIELDS == UPSCALING_GENERATIVE_CONFIG_FIELDS
+    assert UPSCALING_GENERATIVE_CONFIG_FIELDS <= set(ScoringConfig.model_fields)
+
+
+def test_comp005_release_default_digest_is_still_accepted():
+    # The anchored scorer identity of running competitions binds this digest: the roll that
+    # adds the generative fields changes the current digest but must keep accepting it.
+    config = ScoringConfig()
+    assert _pre_upscaling_generative(config) == COMP005_RELEASE_DEFAULT_DIGEST
+    assert COMP005_RELEASE_DEFAULT_DIGEST in accepted_config_digests(config)
+    assert config_digest(config) != COMP005_RELEASE_DEFAULT_DIGEST
+
+
 def test_accepted_digests_are_current_and_every_earlier_release():
     config = ScoringConfig()
-    digests = {_legacy(config), _pre_interpolation(config), _pre_upscaling_faithful(config), config_digest(config)}
-    assert len(digests) == 4
-    assert accepted_config_digests(config) == {
-        config_digest(config),
-        _pre_upscaling_faithful(config),
-        _pre_interpolation(config),
-        _legacy(config),
+    digests = {
+        _legacy(config), _pre_interpolation(config), _pre_upscaling_faithful(config),
+        _pre_upscaling_generative(config), config_digest(config),
     }
+    assert len(digests) == 5
+    assert accepted_config_digests(config) == digests
 
 
 def test_compose_accepts_only_accepted_digests():

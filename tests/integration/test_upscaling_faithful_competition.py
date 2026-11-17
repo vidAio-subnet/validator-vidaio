@@ -368,7 +368,7 @@ def test_manifest_selector_is_fenced_and_validated() -> None:
             {**data, "track": "interpolation", "allowed_upscale_factors": None}
         )
     with pytest.raises(ValueError):
-        CompetitionManifest.model_validate({**data, "upscaling_scoring": "generative"})
+        CompetitionManifest.model_validate({**data, "upscaling_scoring": "inference"})
 
 
 def test_speed_term_needs_faithful_upscaling_and_a_sandbox_envelope() -> None:

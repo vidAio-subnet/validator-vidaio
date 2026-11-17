@@ -57,6 +57,10 @@ elif "fetch" in args:
     if {mode!r} == "timeout":
         time.sleep(2)
     (repo / ".git" / "fetched").write_bytes(b"objects")
+    if {mode!r} == "bigobjects":
+        (repo / ".git" / "pack.pack").write_bytes(b"o" * 1500)
+    elif {mode!r} == "gitflood":
+        (repo / ".git" / "pack.pack").write_bytes(b"o" * 5000)
 elif "rev-parse" in args:
     target = args[-1]
     if "tree" in target:
@@ -71,6 +75,8 @@ elif "checkout" in args:
         os.symlink("/etc/passwd", repo / "leak")
     elif {mode!r} == "oversize":
         (repo / "large.bin").write_bytes(b"x" * 4096)
+    elif {mode!r} == "bigobjects":
+        (repo / "weights.bin").write_bytes(b"w" * 500)
     elif {mode!r} == "submodule":
         (repo / ".gitmodules").write_text("[submodule \'x\']\\n", encoding="utf-8")
 """,
@@ -158,6 +164,43 @@ def test_unsafe_oversize_and_submodule_trees_fail_closed(
         provider.checkout_pinned(
             "https://git.example.test/org/solution.git", COMMIT, TREE
         )
+
+
+def test_checkout_cap_counts_the_source_tree_not_git_metadata(tmp_path: Path):
+    """The documented cap is on the SOURCE TREE. Git's packed objects next to it used
+    to count too, so an entry well under the cap could be lost at finalization."""
+    from vidaio.competition.runners import safeio
+
+    fake, _audit = _fake_git(tmp_path, mode="bigobjects")
+    provider = _provider(tmp_path, fake, max_checkout_bytes=1024)
+    checkout = provider.checkout_pinned(
+        "https://git.example.test/org/solution.git", COMMIT, TREE
+    )
+    assert (checkout / "weights.bin").stat().st_size == 500
+    assert not (checkout / ".git").exists()
+    worktree = safeio.worktree_bytes(checkout)
+    assert worktree <= 1024 < worktree + 1500  # the old total would have refused it
+    # the submission archive is exactly the source tree, under the same cap
+    archive = safeio.deterministic_tarball(checkout, max_bytes=1024)
+    assert archive
+    provider.release(checkout)
+
+
+def test_git_metadata_is_still_bounded_separately(tmp_path: Path):
+    fake, _audit = _fake_git(tmp_path, mode="gitflood")
+    provider = _provider(tmp_path, fake, max_checkout_bytes=1024)
+    with pytest.raises(CheckoutRejectedError, match="for Git metadata") as caught:
+        provider.checkout_pinned(
+            "https://git.example.test/org/solution.git", COMMIT, TREE
+        )
+    assert classify_failure(caught.value) is Fault.CONTENDER
+    assert list((tmp_path / "checkouts").iterdir()) == []
+    roomy = _provider(
+        tmp_path, fake, max_checkout_bytes=1024, max_git_metadata_bytes=8192
+    )
+    roomy.release(
+        roomy.checkout_pinned("https://git.example.test/org/solution.git", COMMIT, TREE)
+    )
 
 
 def test_timeout_is_bounded_infrastructure_failure_and_kills_child(tmp_path: Path):

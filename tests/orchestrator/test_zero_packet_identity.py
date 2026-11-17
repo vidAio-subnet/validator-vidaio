@@ -344,6 +344,10 @@ async def test_orchestrator_zero_strictly_recomputes_on_cpu_end_to_end(
     archived = _archived_rows(orch, cid)
     bundles = [AuditBundle.model_validate(raw) for _contender, raw, _packet in archived]
     leaves = [bundle.score_packet.digest for bundle in bundles]
+    # Auditors recompute after the result: the hidden inputs and the outputs reach the
+    # public store only then (and before COMPLETED).
+    await orch.step(END + M)
+    assert phase(orch, cid) is Phase.COMPLETED
     zero_bundle = next(
         bundle
         for bundle in bundles
@@ -373,8 +377,6 @@ async def test_orchestrator_zero_strictly_recomputes_on_cpu_end_to_end(
 
     # Completion does not drop the silent contender after seeing its zeros. The
     # exact zero packets remain in the economic mean/result worklist.
-    await orch.step(END + M)
-    assert phase(orch, cid) is Phase.COMPLETED
     evidence = build_competition_epoch_evidence(
         orch.conn,
         competition_id=cid,
@@ -417,6 +419,9 @@ async def test_orchestrator_zero_cpu_audit_rejects_measurement_or_output_injecti
     )
     zero_bundle = AuditBundle.model_validate(zero_raw)
     packet = json.loads(orch.store.get(zero_bundle.score_packet))
+    # Publish the result's public artifacts first, so only the tamper can fail the
+    # recompute (a missing hidden input would fail it for the wrong reason).
+    assert orch._publish_due_competition_artifacts(cid, END + M)
     update = {}
     if tamper == "metric":
         packet["metrics"] = {"claimed_measurement": 1.0}

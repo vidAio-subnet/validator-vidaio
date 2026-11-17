@@ -4257,15 +4257,24 @@ def _is_ambiguous_transport_error(error: BaseException) -> bool:
     if isinstance(error, (TypeError, ValueError, AssertionError)):
         return False  # definite local validation/encoding failure, before gossip
 
+    message = str(error).lower()
+    # "Transaction Already Imported" (pool error 1013) names THIS exact signed
+    # extrinsic: the node already holds it in its pool or has just included it.
+    # It is the answer to a replayed submit (the substrate layer re-sends the same
+    # bytes after a slow or dropped response), so it says nothing against the
+    # first copy, which usually lands. Production 2026-11-16/17: three CRv4
+    # commits answered this way were each on chain at the reported block, yet
+    # were abandoned as rejections. Read the chain back instead.
+    if "already imported" in message:
+        return True
+
     mro_names = {base.__name__ for base in type(error).__mro__}
     if "ChainTransactionError" in mro_names:
         return False
     if "ChainConnectionError" in mro_names:
         return True
 
-    message = str(error).lower()
     explicit_pool_markers = (
-        "already imported",
         "priority is too low",
         "invalid transaction",
         "transaction is outdated",

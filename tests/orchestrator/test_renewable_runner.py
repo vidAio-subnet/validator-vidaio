@@ -83,6 +83,32 @@ def test_acquire_is_idempotent_and_release_respects_grace_and_in_flight() -> Non
     assert [inner.sequence for inner in made] == [1, 2]  # never the same generation
 
 
+def test_discard_drops_the_generation_now_but_never_mid_operation() -> None:
+    import threading
+
+    runner, made, log, _now = _runner(idle_grace_seconds=3600.0)
+    assert runner.discard() is False  # nothing to drop
+    runner.acquire()
+    entered, release = threading.Event(), threading.Event()
+
+    def slow_build(contender) -> str:
+        entered.set()
+        release.wait(5)
+        return "digest-slow"
+
+    made[0].build = slow_build
+    worker = threading.Thread(target=runner.build, args=(object(),))
+    worker.start()
+    entered.wait(5)
+    assert runner.discard("busy") is False and runner.active  # in flight: kept
+    release.set()
+    worker.join(5)
+    assert runner.discard("trial build could not run") is True  # no idle grace
+    assert not runner.active and log == ["close:1"]
+    runner.acquire()
+    assert [inner.sequence for inner in made] == [1, 2]
+
+
 def test_dead_remote_runtime_is_replaced_on_next_acquire() -> None:
     runner, made, log, _now = _runner()
     runner.acquire()

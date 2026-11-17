@@ -32,6 +32,7 @@ limitation is explicit in ``IsolationProbeReport.details``.
 
 from __future__ import annotations
 
+import collections
 import hashlib
 import importlib
 import json
@@ -186,7 +187,7 @@ class ModalRunnerConfig:
     gpu: str = "L4"
     cpu: float = 2.0
     memory_mb: int = 8192
-    build_timeout_seconds: float = 1200.0
+    build_timeout_seconds: float = 1800.0
     batch_timeout_seconds: float = 900.0
     probe_timeout_seconds: float = 120.0
     sandbox_lifetime_seconds: int = 23 * 3600 + 30 * 60
@@ -202,7 +203,8 @@ class ModalRunnerConfig:
     #: The competition's anchored ``container_size_limit_gb`` in bytes (None = not
     #: measured). A built image over it fails the contender's build.
     max_image_bytes: int | None = None
-    image_measure_timeout_seconds: float = 600.0
+    #: Bound on the trusted image-size walk (orchestrator.image_measure_timeout_seconds).
+    image_measure_timeout_seconds: float = 1200.0
 
     def __post_init__(self) -> None:
         if not self.gpu.strip():
@@ -1897,6 +1899,7 @@ class ModalSdkRuntime:
         self, checkout: Path, dockerfile: Path
     ) -> tuple[object, str]:
         self._assert_active()
+        image: Any = None
         try:
             image = (
                 self._modal.Image.from_dockerfile(
@@ -1911,9 +1914,13 @@ class ModalSdkRuntime:
             )
             image.build(self._app)
         except self._modal.exception.ImageBuildError as exc:
-            raise _ModalContenderImageBuildError(
-                f"contender Dockerfile was rejected by Modal: {_modal_error_text(exc)}"
-            ) from exc
+            message = f"contender Dockerfile was rejected by Modal: {_modal_error_text(exc)}"
+            # Modal's own message names only a build id the entrant cannot open; the
+            # failed layer's log tail is what tells them which step broke.
+            tail = _build_log_tail(image)
+            if tail:
+                message += f"\nbuild log (last {len(tail)} characters):\n{tail}"
+            raise _ModalContenderImageBuildError(message) from exc
         return image, str(image.object_id)
 
     def restore_contender_image(self, image_object_id: str) -> tuple[object, str]:
@@ -2046,6 +2053,75 @@ class ModalSdkRuntime:
     def _assert_active(self) -> None:
         if not self._active:
             raise RunnerUnavailableError("the fresh Modal App context is closed")
+
+
+#: Bounds on reading a failed build's log: the newest characters kept, and how
+#: long the read may take before the failure is reported without it.
+_BUILD_LOG_TAIL_CHARS = 1800
+_BUILD_LOG_TIMEOUT_SECONDS = 30.0
+_BUILD_LOG_SETTLE_SECONDS = 3.0
+
+
+def _build_log_tail(
+    image: Any,
+    *,
+    limit: int = _BUILD_LOG_TAIL_CHARS,
+    timeout_seconds: float = _BUILD_LOG_TIMEOUT_SECONDS,
+    settle_seconds: float = _BUILD_LOG_SETTLE_SECONDS,
+) -> str:
+    """The newest ``limit`` characters of a FAILED image build's last layer log.
+
+    Modal records the failed attempt on the image object itself, and
+    ``image.logs.fetch(layers=1)`` reads that layer's builder log (the SDK's
+    ``modal image logs`` path). The log is eventually consistent: measured on Modal
+    (2026-11-16), right after the failure it held only the ``FROM`` step (79
+    characters) and the failing ``RUN`` step's output arrived 1–4 s later. So the log
+    is re-read every ``settle_seconds`` until two reads agree, within
+    ``timeout_seconds``; the newest complete read is kept. Best effort and bounded:
+    a missing API, an error or a slow first read yields "" and the build failure is
+    reported without the tail.
+    """
+    logs = getattr(image, "logs", None)
+    fetch = getattr(logs, "fetch", None)
+    if not callable(fetch):
+        return ""
+    box: dict[str, str] = {}
+
+    def fetch_once() -> str:
+        kept: collections.deque[str] = collections.deque()
+        size = 0
+        for entry in fetch(layers=1):
+            text = getattr(entry, "message", None)
+            if not isinstance(text, str) or not text:
+                continue
+            kept.append(text)
+            size += len(text)
+            while size > limit * 2 and len(kept) > 1:
+                size -= len(kept.popleft())
+        return "".join(kept)
+
+    def read() -> None:
+        deadline = time.monotonic() + timeout_seconds
+        previous: str | None = None
+        try:
+            while True:
+                text = fetch_once()
+                box["text"] = text
+                if text and text == previous:
+                    return  # two reads agree: the log has settled
+                if time.monotonic() + settle_seconds >= deadline:
+                    return
+                previous = text
+                time.sleep(settle_seconds)
+        except Exception:  # noqa: BLE001 - diagnostics only; keep the newest read
+            return
+
+    reader = threading.Thread(target=read, name="modal-build-log-tail", daemon=True)
+    reader.start()
+    reader.join(timeout_seconds)
+    text = box.get("text", "")
+    printable = "".join(ch if ch.isprintable() or ch in "\n\t" else " " for ch in text)
+    return _tail(printable, limit)
 
 
 def _parse_probe(stdout: str) -> dict[str, Any]:

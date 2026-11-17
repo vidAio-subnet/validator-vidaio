@@ -34,10 +34,19 @@ class OrchestratorConfig(BaseModel):
     tick_seconds: float = Field(default=5.0, gt=0)
 
     # ---- bounded timeouts (seconds) -------------------------------------------
-    build_timeout_seconds: float = Field(default=600.0, gt=0)
+    #: One contender image build (MINING.md promises 30 minutes; large model images
+    #: need it).
+    build_timeout_seconds: float = Field(default=1800.0, gt=0)
+    #: Measuring a built image's size in a trusted CPU sandbox (the anchored
+    #: ``container_size_limit_gb`` check, Modal only). Images near the 40 GB cap take
+    #: minutes to walk; an image that cannot be walked within this bound fails the
+    #: contender's build as oversize (too many files).
+    image_measure_timeout_seconds: float = Field(default=1200.0, gt=0)
     batch_timeout_seconds: float = Field(default=900.0, gt=0)
     probe_timeout_seconds: float = Field(default=120.0, gt=0)
-    scoring_timeout_seconds: float = Field(default=300.0, gt=0)
+    #: One /score call to the scoring worker. Above the worker's own request_timeout
+    #: (1800 s) plus its slot wait, so the worker's typed 504 arrives before this fires.
+    scoring_timeout_seconds: float = Field(default=1900.0, gt=0)
 
     # ---- retry budgets (attempts, incl. the first) -----------------------------
     build_retry_attempts: int = Field(default=2, ge=1)
@@ -97,6 +106,10 @@ class OrchestratorConfig(BaseModel):
     modal_app_name: str = ""
     modal_run_label: str = ""
     modal_creation_confirmation: str = ""
+    #: Process default / fallback Modal GPU string (Modal's exact names, e.g. ``L4``,
+    #: ``A100-80GB``). A competition requests the GPU its anchored manifest names:
+    #: exactly one ``allowed_gpus`` entry is that GPU; with several entries this value
+    #: is used when it is one of them (else creation is refused).
     modal_gpu: str = "L4"
     modal_cpu: float = Field(default=2.0, gt=0)
     modal_memory_mb: int = Field(default=8192, ge=256)
@@ -169,6 +182,40 @@ class OrchestratorConfig(BaseModel):
     public_enroll_limit_per_hour: int = Field(default=12, ge=1)
     public_read_limit_per_minute: int = Field(default=120, ge=1)
     public_trust_forwarded_for: bool = False
+    #: Signed ``GET /v1/competitions/{id}/entry`` reads, per client address and per
+    #: hotkey (enroll and withdraw share ``public_enroll_limit_per_hour``).
+    public_entry_limit_per_hour: int = Field(default=120, ge=1)
+
+    #: When finalization starts, re-read every ENROLLED entry's alpha stake from the
+    #: chain registry the public API uses and REJECT entries below the enrollment
+    #: floor (an unreadable registry halts, rejecting nobody). Before the deadline
+    #: the fetch check warns with ``stake_below_floor``.
+    enrollment_stake_recheck_enabled: bool = True
+
+    # ---- pre-deadline entry checks (warn only; see orchestrator/entries.py) -----
+    #: While ENROLLING, fetch every entry through the production checkout (the real
+    #: reader credentials) and record what would lose it: an unreadable repository,
+    #: a missing commit, a tree mismatch, an unsafe tree, no Dockerfile/LICENSE/
+    #: LICENSES.md, a tree over the cap. Never rejects and never halts. One checkout
+    #: per tick, off the event loop.
+    enrollment_precheck_enabled: bool = True
+    #: Re-check cadence for an unchanged entry; a new or replaced version is checked
+    #: on the next free tick.
+    enrollment_precheck_interval_seconds: float = Field(default=6 * 3600.0, gt=0)
+    #: Cadence inside the final window before the deadline (and after it, until
+    #: finalization).
+    enrollment_precheck_final_interval_seconds: float = Field(default=3600.0, gt=0)
+    enrollment_precheck_final_window_seconds: float = Field(default=24 * 3600.0, ge=0)
+    #: One trial build of each entry version that passed its fetch check, on the SAME
+    #: builder BUILDING uses (runner.build), before the deadline. Warns only: no
+    #: status change, no image binding, no commitment. Off unless set: on Modal it
+    #: acquires the renewable runtime, which the idle release drops afterwards.
+    enrollment_trial_build_enabled: bool = False
+    #: Completed (ok/failed) trial builds per entry per rolling 24 h.
+    enrollment_trial_build_daily_cap: int = Field(default=4, ge=1)
+    #: After a trial build could not run on OUR side, wait this long before any
+    #: trial build is tried again.
+    enrollment_trial_build_retry_seconds: float = Field(default=1800.0, gt=0)
 
     #: In-step attempts to archive one contender's submission tarball before the
     #: failure is classified (a CONTENDER-fault tree is rejected; an INFRA failure

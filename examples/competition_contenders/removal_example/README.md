@@ -87,7 +87,7 @@ docker run --rm --platform linux/amd64 --network none --read-only --tmpfs /tmp \
 
 To enter, put these files at the root of a fresh private repository (the `Dockerfile`
 must be at the root), commit, and enroll the commit and tree SHA as described in
-[docs/MINING.md](../../../docs/MINING.md), "The competition track". Enrolling this example
+[docs/MINING.md](../../../docs/MINING.md#entering-a-competition), "Entering a competition". Enrolling this example
 unchanged earns nothing.
 
 ## Doing better

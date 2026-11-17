@@ -45,6 +45,8 @@ PAYOUT_BACKENDS = {
     "removal_metrics": "removal-metrics/2",
     "interpolation_metrics": "interpolation-metrics/1",
     "upscaling_faithful_metrics": "upscaling-faithful-metrics/1",
+    "upscaling_generative_metrics": "upscaling-generative-metrics/1",
+    "generative_weights": "sha256:6e830c1fce82220def169d0bba06febdb727911d6211fd1534afdcac3848df0e",
     "streaming_packets": "streaming-packets/1",
     "lpips": "lpips/0.1.4",
     "python": "cpython/3.13.15",

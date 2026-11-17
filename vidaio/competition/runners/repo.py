@@ -198,6 +198,7 @@ class GitRepoProvider:
         max_log_bytes: int = 1024 * 1024,
         poll_seconds: float = 0.1,
         host_credentials: Mapping[str, tuple[str, str]] | None = None,
+        max_git_metadata_bytes: int | None = None,
     ) -> None:
         #: Optional per-host ``(username, read-only token)`` overriding the default
         #: pair, so the operator's own baseline host and a public forge can each get
@@ -224,6 +225,8 @@ class GitRepoProvider:
             raise ValueError("Git timeout and poll cadence must be positive")
         if max_checkout_bytes <= 0 or max_log_bytes <= 0:
             raise ValueError("Git checkout/log byte caps must be positive")
+        if max_git_metadata_bytes is not None and max_git_metadata_bytes <= 0:
+            raise ValueError("Git metadata byte cap must be positive")
         self._root = Path(scratch_root)
         self._root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._token = read_only_token
@@ -231,7 +234,17 @@ class GitRepoProvider:
         self._allowed_hosts = hosts
         self._git = git_path
         self._timeout = float(timeout_seconds)
+        #: The cap applies to the SOURCE TREE (the worktree without ``.git``), which
+        #: is what the documentation promises and what is built and archived.
         self._max_checkout_bytes = int(max_checkout_bytes)
+        #: Git's own objects/index during the fetch are bounded separately so a
+        #: server can never fill the disk; a depth-1 fetch holds about the tree's
+        #: compressed size, so twice the tree cap leaves ample room.
+        self._max_git_bytes = int(
+            max_git_metadata_bytes
+            if max_git_metadata_bytes is not None
+            else 2 * max_checkout_bytes
+        )
         self._max_log_bytes = int(max_log_bytes)
         self._poll = float(poll_seconds)
         self._owned: dict[Path, Path] = {}
@@ -371,7 +384,7 @@ class GitRepoProvider:
                 safeio.assert_safe_tree(checkout)
             except UnsafePathError as exc:
                 raise CheckoutRejectedError(f"unsafe checkout tree: {exc}") from exc
-            final_bytes = safeio.tree_bytes(checkout)
+            final_bytes = safeio.worktree_bytes(checkout)
             if final_bytes > self._max_checkout_bytes:
                 raise CheckoutRejectedError(
                     f"checkout is {final_bytes} bytes, over the cap of "
@@ -498,11 +511,8 @@ class GitRepoProvider:
                         f"timeout during {label}"
                     )
                     break
-                if safeio.tree_bytes(checkout) > self._max_checkout_bytes:
-                    violation = CheckoutRejectedError(
-                        f"{label} crossed the checkout cap of "
-                        f"{self._max_checkout_bytes} bytes"
-                    )
+                violation = self._cap_violation(checkout, label, "crossed")
+                if violation is not None:
                     break
                 try:
                     log_size = log_path.stat().st_size
@@ -534,12 +544,27 @@ class GitRepoProvider:
             raise CheckoutError(
                 f"{label} exited {returncode}: {output.strip()[-2000:]}"
             )
-        if safeio.tree_bytes(checkout) > self._max_checkout_bytes:
-            raise CheckoutRejectedError(
-                f"{label} completed over the checkout cap of "
-                f"{self._max_checkout_bytes} bytes"
-            )
+        violation = self._cap_violation(checkout, label, "completed over")
+        if violation is not None:
+            raise violation
         return output
+
+    def _cap_violation(
+        self, checkout: Path, label: str, verb: str
+    ) -> CheckoutRejectedError | None:
+        """The source tree (without ``.git``) against the checkout cap, and Git's
+        own metadata against its separate bound."""
+        if safeio.worktree_bytes(checkout) > self._max_checkout_bytes:
+            return CheckoutRejectedError(
+                f"{label} {verb} the checkout cap of {self._max_checkout_bytes} bytes"
+            )
+        git_dir = checkout / safeio.GIT_METADATA_DIR
+        if git_dir.is_dir() and safeio.tree_bytes(git_dir) > self._max_git_bytes:
+            return CheckoutRejectedError(
+                f"{label} {verb} the checkout cap of {self._max_git_bytes} bytes for "
+                "Git metadata"
+            )
+        return None
 
     @staticmethod
     def _kill_process_group(process: subprocess.Popen[bytes]) -> None:

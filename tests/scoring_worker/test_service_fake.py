@@ -708,6 +708,144 @@ async def test_faithful_upscaling_wrong_geometry_is_zeroed_without_measuring(wor
     assert faithful.calls == []
 
 
+class FakeUpscalingGenerativeBackend:
+    """Deterministic generative upscaling measurement (no media)."""
+
+    def __init__(
+        self,
+        *,
+        lowres_psnr: float = 36.0,
+        color_delta_e: float = 1.0,
+        dists: float = 0.10,
+        lpips: float = 0.15,
+        fail: str | None = None,
+        input_fail: str | None = None,
+    ) -> None:
+        self.lowres_psnr, self.color_delta_e = lowres_psnr, color_delta_e
+        self.dists, self.lpips = dists, lpips
+        self.fail, self.input_fail = fail, input_fail
+        self.calls: list[dict] = []
+
+    def version(self) -> str:
+        return "fake-upscaling-generative/1"
+
+    def measure(self, **kwargs):
+        from vidaio.scoring.upscaling_generative_formula import GenerativeFrameMetrics
+        from vidaio.scoring_worker.upscaling_generative_backend import (
+            UpscalingGenerativeInputError,
+            UpscalingGenerativeMeasurement,
+            UpscalingGenerativeMeasurementError,
+        )
+
+        self.calls.append(kwargs)
+        if self.input_fail:
+            raise UpscalingGenerativeInputError(self.input_fail)
+        if self.fail:
+            raise UpscalingGenerativeMeasurementError(self.fail)
+        return UpscalingGenerativeMeasurement(
+            metrics=GenerativeFrameMetrics(
+                dists=self.dists, lpips_vgg=self.lpips, warp_error=2.0, warp_error_reference=1.9,
+                nr=0.62, nr_reference=0.60, lowres_psnr_db=self.lowres_psnr,
+                color_delta_e=self.color_delta_e, frames=60, fr_frames=3,
+            ),
+            fr_offset=int(kwargs.get("fr_offset", 0)),
+        )
+
+
+def _generative_body(world: FakeWorld, *, upscale_factor: int = 2) -> dict:
+    body = _faithful_body(world, upscale_factor=upscale_factor)
+    body["params"]["scoring"] = "generative"
+    body["challenge_id"] = "chal-up-generative"
+    return body
+
+
+def _generative_backends(world: FakeWorld, generative, *, pieapp=None) -> ScoringBackends:
+    return ScoringBackends(
+        probe=world.fake, vmaf_primary=world.fake, vmaf_secondary=world.fake,
+        pieapp=pieapp if pieapp is not None else world.fake.pieapp,
+        perceptual=world.fake, canonicalizer=None, versions=world.fake.versions(),
+        upscaling_generative=generative,
+    )
+
+
+async def test_generative_upscaling_scores_without_pieapp_vmaf_or_size_cap(world: FakeWorld) -> None:
+    generative = FakeUpscalingGenerativeBackend()
+    world.fake.set_media("output", _media(100_000))  # far over the 8x file-size cap
+    backends = _generative_backends(
+        world, generative, pieapp=PieAppTorchBackend(_backend_version="not-configured")
+    )
+    async with _client(world, backends=backends) as client:
+        resp = await client.post("/score", json=_generative_body(world))
+    assert resp.status_code == 200, resp.text
+    item = ItemScore.from_json(resp.json()["item_score_json"])
+    assert item.gate_passed, item.violations
+    assert item.breakdown is not None and item.breakdown.kind == "upscaling_generative"
+    assert item.breakdown.upscale_factor == 2
+    assert item.score == pytest.approx(item.breakdown.final) and item.score > 0.3
+    assert item.metrics["gen_lowres_psnr_db"] == 36.0 and item.metrics["gen_dists"] == 0.10
+    assert item.metrics["delivery_encode"] == "none"
+    assert item.metrics["vmaf"] is None
+    assert world.fake.pieapp_calls == []
+    assert not any(role == ("reference", "output") for role in world.fake.vmaf_calls)
+    assert len(generative.calls) == 1
+    call = generative.calls[0]
+    assert call["reference_key"] == (world.reference_digest, world.miner_input_digest)
+    # passthrough mode: the served input itself stands in for its native canonical copy
+    assert call["canonical_served_input"] not in (call["canonical_reference"], call["canonical_candidate"])
+    assert 0 <= call["fr_offset"] < 60
+    assert item.metrics["fr_offset"] == call["fr_offset"]
+    assert any(
+        skip.gate == "tone_manipulation" and "generative" in skip.detail for skip in item.skips
+    )
+
+
+async def test_generative_upscaling_gates_zero_inconsistent_and_colour_shifted_outputs(world: FakeWorld) -> None:
+    for backend, code in (
+        (FakeUpscalingGenerativeBackend(lowres_psnr=24.0), ReasonCode.LOWRES_INCONSISTENT),
+        (FakeUpscalingGenerativeBackend(color_delta_e=7.5), ReasonCode.COLOR_SHIFT_EXCEEDED),
+    ):
+        async with _client(world, backends=_generative_backends(world, backend)) as client:
+            resp = await client.post("/score", json=_generative_body(world))
+        assert resp.status_code == 200, resp.text
+        item = ItemScore.from_json(resp.json()["item_score_json"])
+        assert not item.gate_passed and item.score == 0.0
+        assert [v.code for v in item.violations] == [code]
+        # the breakdown is still published so an auditor sees the measured facts
+        assert item.breakdown is not None and item.breakdown.final > 0.0
+
+
+async def test_generative_upscaling_faults_are_refused_or_violations(world: FakeWorld) -> None:
+    backends = _generative_backends(world, FakeUpscalingGenerativeBackend(input_fail="served input has 59 frames"))
+    async with _client(world, backends=backends) as client:
+        resp = await client.post("/score", json=_generative_body(world))
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"]["error"] == "upscaling_input_unmeasurable"
+    async with _client(world, backends=_generative_backends(world, None)) as client:
+        resp = await client.post("/score", json=_generative_body(world))
+    assert resp.status_code == 501
+    async with _client(world, backends=_generative_backends(world, FakeUpscalingGenerativeBackend())) as client:
+        resp = await client.post("/score", json=_generative_body(world, upscale_factor=3))
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"]["error"] == "upscaling_factor_unsupported"
+    backends = _generative_backends(world, FakeUpscalingGenerativeBackend(fail="candidate unreadable"))
+    async with _client(world, backends=backends) as client:
+        resp = await client.post("/score", json=_generative_body(world))
+    item = ItemScore.from_json(resp.json()["item_score_json"])
+    assert not item.gate_passed and item.score == 0.0
+    assert any(v.code is ReasonCode.METRIC_MISSING for v in item.violations)
+
+
+async def test_generative_upscaling_wrong_frame_count_is_zeroed_without_measuring(world: FakeWorld) -> None:
+    generative = FakeUpscalingGenerativeBackend()
+    world.fake.set_media("output", _media(5_000).model_copy(update={"frame_count": 59}))
+    async with _client(world, backends=_generative_backends(world, generative)) as client:
+        resp = await client.post("/score", json=_generative_body(world))
+    item = ItemScore.from_json(resp.json()["item_score_json"])
+    assert not item.gate_passed and item.score == 0.0
+    assert any(v.code is ReasonCode.FRAME_COUNT_MISMATCH for v in item.violations)
+    assert generative.calls == []
+
+
 class FakeStreamingBackend:
     """Deterministic packet measurement (no media)."""
 

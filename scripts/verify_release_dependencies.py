@@ -337,6 +337,39 @@ def _preload_removal_metrics() -> dict[str, Any]:
     return {"lpips_vgg_probe_distance": d1}
 
 
+def _preload_generative_metrics() -> dict[str, Any]:
+    """Cache the pinned generative-upscaling weights (VGG16 + DISTS, CLIP RN50) inside
+    TORCH_HOME at image build time (sha256-verified before deserialization), so scoring never
+    downloads, and prove deterministic CPU DISTS and CLIP-IQA values on a fixed pair."""
+    import numpy as np
+
+    from vidaio.scoring.generative_weights import (
+        GENERATIVE_WEIGHTS,
+        generative_weights_digest,
+        pinned_weights_path,
+    )
+    from vidaio.scoring.upscaling_generative import ClipIqa, DistsFull
+
+    for weights in GENERATIVE_WEIGHTS:
+        pinned_weights_path(weights, download=True)
+    dists = DistsFull()
+    nr = ClipIqa()
+    rng = np.random.default_rng(11)
+    a = rng.integers(0, 256, size=(128, 192, 3), dtype=np.uint8)
+    b = np.clip(a.astype(np.int16) + rng.integers(-20, 21, size=a.shape), 0, 255).astype(np.uint8)
+    d1, d2 = dists.distance(a, b), dists.distance(a, b)
+    if not (0.0 <= d1 <= 1.0) or d1 != d2 or dists.distance(a, a) > 1e-5:
+        raise RuntimeError(f"DISTS is not deterministic or out of range: {d1!r} vs {d2!r}")
+    q1, q2 = nr.quality(a), nr.quality(a)
+    if not (0.0 < q1 < 1.0) or q1 != q2:
+        raise RuntimeError(f"CLIP-IQA is not deterministic or out of range: {q1!r} vs {q2!r}")
+    return {
+        "generative_weights": generative_weights_digest(),
+        "dists_probe_distance": d1,
+        "clipiqa_probe_quality": q1,
+    }
+
+
 def _prove_cpu_pieapp_inference(pieapp: Any) -> float:
     """Decode real video frames and execute the packaged PieAPP model on CPU.
 
@@ -1073,6 +1106,7 @@ def verify(
     if preload_media:
         pieapp.preload()
         _preload_removal_metrics()
+        _preload_generative_metrics()
         pieapp_cpu_inference = _prove_cpu_pieapp_inference(pieapp)
         cpu_video_phash = _prove_cpu_video_phash()
         cpu_upscaling_score_audit = _prove_cpu_upscaling_score_audit(

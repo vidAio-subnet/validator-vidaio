@@ -40,7 +40,9 @@ class ScoringWorkerConfig(BaseModel):
     #: probes + metric runs), measured from the moment the request WINS a
     #: concurrency slot. Exceeding it kills the request's ffmpeg process groups
     #: and returns a typed 504 — the budget bounds real work, not just the wait.
-    request_timeout: float = 300.0
+    #: 1800 s: generative upscaling measures DISTS/LPIPS/CLIP-IQA on full 1080p frames
+    #: on one CPU thread, which takes many minutes per clip (the project design record #44).
+    request_timeout: float = 1800.0
     #: Per-subprocess budget (each ffmpeg/ffprobe invocation individually).
     subprocess_timeout: float = 120.0
     #: Maximum scorings in flight (asyncio.Semaphore) — scoring is

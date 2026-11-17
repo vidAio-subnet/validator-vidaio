@@ -79,6 +79,19 @@ def _reference_ref(row) -> ArtifactRef:
     )
 
 
+def _input_ref(row) -> ArtifactRef:
+    return ArtifactRef(
+        digest=row["input_sha256"],
+        kind=ArtifactKind.CHALLENGE_INPUT,
+        byte_size=row["input_bytes"],
+        backend_key=backend_key(ArtifactKind.CHALLENGE_INPUT, row["input_sha256"]),
+    )
+
+
+def row_input_bytes(orch, row) -> bytes:
+    return (orch.inputs_dir / row["input_sha256"]).read_bytes()
+
+
 def test_add_upscaling_item_stages_distinct_private_reference_and_runner_input(
     orchestrator_factory, tmp_path
 ) -> None:
@@ -102,7 +115,10 @@ def test_add_upscaling_item_stages_distinct_private_reference_and_runner_input(
         backend_key=backend_key(ArtifactKind.CHALLENGE_INPUT, row["input_sha256"]),
     )
     reference_ref = _reference_ref(row)
-    assert orch.store.get(input_ref) == miner_input
+    # The hidden input stays in the local pool: nothing under challenge_input/ until
+    # the result (the comp 005 exposure served registered inputs by digest).
+    assert not orch.store.exists(input_ref)
+    assert not any((tmp_path / "audit" / "challenge_input").rglob("*"))
     assert orch.store.get(reference_ref) == reference
 
     public = make_public_store(
@@ -207,10 +223,14 @@ async def test_completion_releases_upscaling_reference_to_keyless_public_reader(
         "human_review_deadline = ?, updated_at = ? WHERE competition_id = ?",
         (T0.isoformat(), T0.isoformat(), manifest.competition_id),
     )
+    input_ref = _input_ref(row)
+    assert not orch.store.exists(input_ref)
     await orch.step(END + M)
 
     assert phase(orch, manifest.competition_id) is Phase.COMPLETED
     assert public.get(reference_ref) == reference
+    # ...and the hidden input was uploaded and verified before COMPLETED.
+    assert public.get(input_ref) == row_input_bytes(orch, row)
 
 
 @pytest.mark.asyncio

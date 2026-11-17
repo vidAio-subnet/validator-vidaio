@@ -159,6 +159,20 @@ def test_tree_bytes_counts_without_following_links(tmp_path):
     assert counted < 150 + 1024
 
 
+def test_worktree_bytes_leaves_out_only_the_top_level_git_directory(tmp_path):
+    root = tmp_path / "checkout"
+    (root / ".git" / "objects").mkdir(parents=True)
+    (root / ".git" / "objects" / "pack").write_bytes(b"p" * 10_000)
+    (root / "src" / ".git").mkdir(parents=True)  # only the top-level one is Git's
+    (root / "src" / ".git" / "data").write_bytes(b"d" * 300)
+    (root / "weights.bin").write_bytes(b"w" * 200)
+    full = safeio.tree_bytes(root)
+    source = safeio.worktree_bytes(root)
+    assert source >= 500 and full >= source + 10_000
+    assert source == safeio.tree_bytes(root, exclude=(".git",))
+    assert source < 500 + 4 * 4096  # directory entries only
+
+
 # ---- orchestrator integration ---------------------------------------------------
 
 

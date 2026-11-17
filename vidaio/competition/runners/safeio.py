@@ -173,11 +173,12 @@ class _suppress_os_error:
         return isinstance(exc, OSError)
 
 
-def tree_bytes(root: Path) -> int:
+def tree_bytes(root: Path, *, exclude: tuple[str, ...] = ()) -> int:
     """On-disk bytes under ``root``, counting entries WITHOUT following links.
 
     Used by the sandbox output watchdog: it must charge a contender for whatever
-    it wrote, including symlinks and special files it created.
+    it wrote, including symlinks and special files it created. ``exclude`` names
+    entries directly under ``root`` that are not counted (see worktree_bytes).
     """
     total = 0
     stack = [root]
@@ -188,6 +189,8 @@ def tree_bytes(root: Path) -> int:
         except OSError:
             continue
         for entry in entries:
+            if exclude and current is root and entry.name in exclude:
+                continue
             try:
                 st = entry.stat(follow_symlinks=False)
             except OSError:
@@ -196,6 +199,21 @@ def tree_bytes(root: Path) -> int:
                 stack.append(Path(entry.path))
             total += st.st_size
     return total
+
+
+#: Git's own metadata directory at the top of a checkout. It is never part of the
+#: submitted tree (Git cannot even record a path named ``.git``), it is removed
+#: before a checkout is built or archived, and it is bounded separately.
+GIT_METADATA_DIR = ".git"
+
+
+def worktree_bytes(root: Path) -> int:
+    """Bytes of a checkout's source tree: :func:`tree_bytes` without ``.git``.
+
+    The checkout cap promises the SOURCE TREE may be that large; Git's packed
+    objects next to it (about the tree's compressed size again) do not count.
+    """
+    return tree_bytes(root, exclude=(GIT_METADATA_DIR,))
 
 
 def iter_tree_regular_files(root: Path) -> Iterator[tuple[str, Path, os.stat_result]]:

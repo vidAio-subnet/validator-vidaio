@@ -58,8 +58,10 @@ git -C /tmp/vidaio-next-compression-quality rev-parse 'HEAD^{tree}'
 
 Push through the operator's ordinary credential helper, enroll the
 credential-free HTTPS URL plus exact commit/tree pins, and let the production
-`GitRepoProvider` make a new isolated checkout. Never initialize one generated
-tree and then mutate its profile after enrollment.
+`GitRepoProvider` make a new isolated checkout. To change a profile after
+enrolling, commit and push the change and `--replace` the entry before the
+enrollment deadline (docs/MINING.md); the evaluator uses only the commit and tree
+the entry holds at the deadline.
 
 Initialize and pin each baseline tree exactly the same way, but never enroll it under
 a hotkey. Put its credential-free repository URL, exact commit/tree SHA, archived
@@ -75,7 +77,9 @@ over canonical JSON of the full active `TokenomicsConfig`; the control service r
 any supplied digest other than its own `reward_parameter_digest(config)` result. This
 binds the pre-enrollment commitment to the policy that will actually pay the epoch.
 
-The base CUDA images are pinned to their linux/amd64 registry digests. Image
+The base CUDA images are pinned to their linux/amd64 registry digests, by digest
+only: the sandbox builder rejects an image reference that carries both a tag and
+a digest (`name:tag@sha256:...`), so the tag is kept in a comment. Image
 builds require network access to the Ubuntu package repository; contender runs
 do not. The Modal runner passes no secret, identity token, volume, or network to
 the Sandbox and forces a new Sandbox per batch.

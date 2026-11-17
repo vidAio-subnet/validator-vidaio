@@ -439,6 +439,8 @@ class FakeRunner:
         self.fail_build_for: set[str] = set()
         #: repo_urls whose build fails for an INFRA reason (our docker is broken)
         self.infra_fail_build_for: set[str] = set()
+        #: repo_urls whose build cannot fetch the source (plain CheckoutError: OUR side)
+        self.checkout_fail_build_for: set[str] = set()
         self.fail_probe_for: set[str] = set()  # tree_shas whose probe must fail
         #: tree_shas whose probe cannot be RUN at all (INFRA — nothing attested)
         self.probe_unavailable_for: set[str] = set()
@@ -455,6 +457,12 @@ class FakeRunner:
         if contender.repo_url in self.infra_fail_build_for:
             raise BuildError(
                 f"docker daemon unusable while building {contender.repo_url}"
+            )
+        if contender.repo_url in self.checkout_fail_build_for:
+            from vidaio.competition.runners.errors import CheckoutError
+
+            raise CheckoutError(
+                f"git fetch pinned commit exited 128 for {contender.repo_url}"
             )
         if contender.repo_url in self.fail_build_for:
             raise ContenderBuildError(f"forced build failure for {contender.repo_url}")

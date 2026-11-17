@@ -158,6 +158,15 @@ class RenewableRunner:
                 return
             self._discard("released: no phase needs sandboxes")
 
+    def discard(self, reason: str = "discarded on request") -> bool:
+        """Close the live generation NOW (no idle grace) unless an operation is in
+        flight, so the next ``acquire()`` creates a fresh one. True = discarded."""
+        with self._lock:
+            if self._inner is None or self._in_flight > 0:
+                return False
+            self._discard(reason)
+            return True
+
     def close(self) -> None:
         with self._lock:
             self._discard("runner closed")
@@ -232,6 +241,29 @@ class RenewableRunner:
 
     def isolation_probe(self, image_digest: str) -> Any:
         return self._guarded("isolation_probe")(image_digest)
+
+    @property
+    def gpu(self) -> Any:
+        """The GPU the runner requests for the competition it is configured for.
+
+        A live generation created with the current envelope attests its own value;
+        otherwise the configured envelope's ``gpu`` (what the next generation will
+        request) applies, and only an unconfigured runner reports the static
+        process default. Absent everywhere = ``AttributeError`` like any other
+        optional capability."""
+        with self._lock:
+            inner = self._inner
+            current = self._inner_resources == self._resources
+            configured = (self._resources or {}).get("gpu")
+        if inner is not None and current and hasattr(inner, "gpu"):
+            return inner.gpu
+        if configured is not None:
+            return configured
+        if "gpu" in self._static:
+            return self._static["gpu"]
+        if inner is not None and hasattr(inner, "gpu"):
+            return inner.gpu
+        raise AttributeError("gpu")
 
     def __getattr__(self, name: str) -> Any:
         # Only reached for attributes not defined above.

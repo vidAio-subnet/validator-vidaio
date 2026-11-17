@@ -42,9 +42,10 @@ class CompetitionConfig(BaseModel):
     vmaf_threshold_min: float = Field(default=50.0, ge=0, le=100)
     vmaf_threshold_max: float = Field(default=100.0, ge=0, le=100)
 
-    #: Hard ceiling on the manifest's container image cap. NOTE: the 25 GB cap is
-    #: "acknowledged-but-unmeasured" on Modal (size unattested) — spec §04/§05.
-    container_size_limit_gb_max: float = Field(default=25.0, gt=0)
+    #: Ceiling on the manifest's container image cap (``container_size_limit_gb``).
+    #: 40 GB fits generative video models with their weights; the Modal runner measures
+    #: every built image against the anchored cap in a trusted CPU sandbox.
+    container_size_limit_gb_max: float = Field(default=40.0, gt=0)
 
     #: Ceiling on the manifest's evaluation batch-size upper bound (comp-01: 1-5).
     evaluation_batch_size_max: int = Field(default=16, ge=1)

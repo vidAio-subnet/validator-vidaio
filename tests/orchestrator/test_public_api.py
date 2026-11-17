@@ -111,13 +111,16 @@ async def test_registered_staked_miner_enrolls_itself(orchestrator_factory, fixt
         assert listing["min_enroll_alpha_stake"] == 500.0
         entry = listing["competitions"][0]
         assert entry["enrollment_open"] is True
-        assert entry["enrolled"] == [{"hotkey": HK_A, "status": "ENROLLED"}]
+        assert [(e["hotkey"], e["status"]) for e in entry["enrolled"]] == [
+            (HK_A, "ENROLLED")
+        ]
         assert entry["manifest"]["competition_id"] == cid
 
-        # One submission per hotkey per competition.
+        # One entry per hotkey per competition (changing it needs replace=true).
         path, raw, headers = _enroll_request(cid, _Signer(HK_A))
         again = await client.post(path, content=raw, headers=headers)
         assert again.status_code == 409
+        assert again.json()["detail"]["code"] == "already_enrolled"
 
 
 @pytest.mark.parametrize(

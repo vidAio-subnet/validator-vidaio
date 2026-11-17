@@ -43,6 +43,9 @@ EVENT_COMMITMENT_ANCHORED = "commitment_anchored_onchain"
 EVENT_HALTED = "orchestrator_halted"
 EVENT_HALT_CLEARED = "orchestrator_halt_cleared"
 EVENT_COMPETITION_REFERENCES_RELEASED = "competition_references_released"
+#: Hidden inputs and contender outputs uploaded to their public prefixes at the
+#: result (never earlier); the payload lists the digests verified present.
+EVENT_COMPETITION_ARTIFACTS_PUBLISHED = "competition_artifacts_published"
 #: One contender's submission tarball archived.
 EVENT_SUBMISSION_ARCHIVED = "contender_submission_archived"
 #: Anchor claim ledger. See "anchor claims" below.

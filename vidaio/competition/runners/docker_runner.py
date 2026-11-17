@@ -453,7 +453,7 @@ class DockerSandboxRunner:
         outputs_dir: str | Path,
         scratch_dir: str | Path,
         docker_path: str = "docker",
-        build_timeout: float = 600.0,
+        build_timeout: float = 1800.0,
         batch_timeout: float = 900.0,
         probe_timeout: float = 120.0,
         memory: str = "2g",

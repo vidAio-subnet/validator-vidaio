@@ -348,7 +348,7 @@ of the scorer identity.
 | `metrics_port` | `9103` | Health/metrics port |
 | `work_dir` | `./data/scoring-work` | Scratch root (per-request dirs, libvmaf logs); swept at startup |
 | `backend` | `real` | `real` shells out to ffmpeg/ffprobe; `fake` REQUIRES injected backends |
-| `request_timeout` | `300.0` | Whole-request budget from slot win; overrun kills the process groups → 504 |
+| `request_timeout` | `1800.0` | Whole-request budget from slot win; overrun kills the process groups → 504 (generative upscaling needs many minutes per clip) |
 | `subprocess_timeout` | `120.0` | Per-ffmpeg/ffprobe invocation budget |
 | `max_concurrent` | `2` | Hard bound on scorings in flight (slot held for the work's true lifetime) |
 | `queue_wait_timeout_seconds` | `30.0` | Max wait for a slot before 503 + Retry-After |

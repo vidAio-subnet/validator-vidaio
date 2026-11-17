@@ -30,10 +30,10 @@ def test_tag_plus_digest_add_and_user_are_reported() -> None:
 
 
 def test_the_shipped_examples_pass() -> None:
-    for example in ("removal_example", "interpolation_example", "upscaling_example", "streaming_example", "cpu_compression"):
+    for example in ("removal_example", "interpolation_example", "upscaling_example", "streaming_example", "cpu_compression", "generative_upscaling_example", "template"):
         assert precheck.main([str(ROOT / "examples" / "competition_contenders" / example)]) == 0
     # the interpolation and upscaling examples are valid starts for a commercial-use competition
-    for example in ("interpolation_example", "upscaling_example", "streaming_example"):
+    for example in ("interpolation_example", "upscaling_example", "streaming_example", "generative_upscaling_example"):
         path = ROOT / "examples" / "competition_contenders" / example
         assert precheck.main([str(path), "--commercial"]) == 0
 

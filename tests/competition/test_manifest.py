@@ -140,7 +140,7 @@ def test_manifest_is_frozen() -> None:
     [
         {"vmaf_threshold": 30.0},  # below configured floor of 50
         {"sealed_vmaf_variants": [40.0, 89.0]},
-        {"container_size_limit_gb": 26.0},  # over the 25 GB (unattested) cap
+        {"container_size_limit_gb": 41.0},  # over the 40 GB cap
         {"evaluation_batch_size": {"min": 1, "max": 32}},
     ],
 )

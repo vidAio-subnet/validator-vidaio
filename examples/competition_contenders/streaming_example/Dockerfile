@@ -21,7 +21,6 @@ RUN chmod 0755 /app/run.sh && chmod 0644 /app/streaming_example.py
 
 # Fail the build, not the evaluation, when something the run relies on is missing.
 RUN ffmpeg -hide_banner -encoders 2>/dev/null | grep -q libx264 \
- && ffmpeg -hide_banner -filters 2>/dev/null | grep -q libx264 \
  && ffprobe -version >/dev/null \
  && command -v timeout >/dev/null && command -v du >/dev/null && command -v date >/dev/null \
  && python3 -c "import streaming_example"

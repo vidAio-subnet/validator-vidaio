@@ -133,6 +133,12 @@ from vidaio.scoring.upscaling_faithful_formula import (
     UpscalingFaithfulBreakdown,
     score_upscaling_faithful,
 )
+from vidaio.scoring.upscaling_generative_formula import (
+    UPSCALING_GENERATIVE_FACTORS,
+    GenerativeFrameMetrics,
+    UpscalingGenerativeBreakdown,
+    score_upscaling_generative,
+)
 from vidaio.scoring.upscaling import (
     UpscalingBreakdown,
     final_from_pre,
@@ -218,6 +224,10 @@ __all__ = [
     "score_removal",
     "score_upscaling",
     "score_upscaling_faithful",
+    "score_upscaling_generative",
+    "GenerativeFrameMetrics",
+    "UpscalingGenerativeBreakdown",
+    "UPSCALING_GENERATIVE_FACTORS",
     "StreamingBreakdown",
     "StreamingMeasurement",
     "StreamingPacket",

@@ -30,6 +30,7 @@ from pydantic import (
 from vidaio.competition.config import CompetitionConfig
 from vidaio.scoring.streaming import StreamingRules
 from vidaio.scoring.upscaling_faithful_formula import UPSCALING_FAITHFUL_FACTORS
+from vidaio.scoring.upscaling_generative_formula import UPSCALING_GENERATIVE_FACTORS
 from vidaio.competition.item_commitment import (
     evaluation_item_commitment as evaluation_item_commitment,
 )
@@ -152,6 +153,11 @@ class ResultRules(BaseModel):
     #: = inserted frames (sum of N - 1 per item); faithful upscaling and streaming
     #: compression = output frames.
     speed_inserted_frames: int | None = Field(default=None, ge=1)
+    #: Largest share of a contender's items that may score 0 (a failed gate, or nothing
+    #: earned over the floor) while it keeps its rank. Above it the contender's ranking
+    #: score is 0, below the anchored ``podium_min_score`` (required > 0 with this rule),
+    #: so it holds no paid place. Absent = no such rule.
+    max_failed_item_fraction: float | None = Field(default=None, ge=0, lt=1, allow_inf_nan=False)
 
     _SPEED_FIELDS = ("speed_weight", "speed_fast_spf", "speed_slow_spf", "speed_inserted_frames")
 
@@ -174,6 +180,13 @@ class ResultRules(BaseModel):
             )
         if all(speed) and not self.speed_fast_spf < self.speed_slow_spf:
             raise ValueError("speed_fast_spf must be below speed_slow_spf")
+        if self.max_failed_item_fraction is not None and not (
+            self.podium_min_score is not None and self.podium_min_score > 0
+        ):
+            raise ValueError(
+                "max_failed_item_fraction needs a podium_min_score above 0 (a contender over "
+                "the limit ranks with score 0 and must not qualify for a paid place)"
+            )
         from vidaio.tokenomics.state import _validate_split
 
         for name in ("crown_split", "podium_split"):
@@ -251,9 +264,12 @@ class CompetitionManifest(BaseModel):
     #: Upscaling-only scorer selector. ``"faithful"``: every output frame is compared
     #: with the sealed original and credited only for its gain over the Lanczos upscale
     #: of the served input (vidaio/scoring/upscaling_faithful.py) — no PieAPP, VMAF or
-    #: file-size gate. Absent = the inference upscaling scorer, and omitted from the
-    #: canonical JSON so every anchored digest is unchanged.
-    upscaling_scoring: Literal["faithful"] | None = None
+    #: file-size gate. ``"generative"``: perceptual (DISTS/LPIPS on full frames), temporal
+    #: and capped no-reference quality against the sealed original, gated by
+    #: low-resolution consistency with the served input and colour fidelity
+    #: (vidaio/scoring/upscaling_generative.py). Absent = the inference upscaling scorer,
+    #: and omitted from the canonical JSON so every anchored digest is unchanged.
+    upscaling_scoring: Literal["faithful", "generative"] | None = None
     #: Compression-only scorer selector. ``"streaming"``: quality at a bitrate budget under
     #: streaming delivery rules (vidaio/scoring/streaming.py) instead of the smallest file
     #: over the VMAF threshold; the budget and rules are ``streaming_rules``. Absent = the
@@ -359,15 +375,21 @@ class CompetitionManifest(BaseModel):
             raise ValueError(
                 f"faithful upscaling scores the factors {list(UPSCALING_FAITHFUL_FACTORS)} only"
             )
+        if self.upscaling_scoring == "generative" and any(
+            factor not in UPSCALING_GENERATIVE_FACTORS for factor in self.allowed_upscale_factors or ()
+        ):
+            raise ValueError(
+                f"generative upscaling scores the factors {list(UPSCALING_GENERATIVE_FACTORS)} only"
+            )
         if self.result_rules is not None and self.result_rules.has_speed_term:
             if not (
                 self.track == "interpolation"
-                or self.upscaling_scoring == "faithful"
+                or self.upscaling_scoring in ("faithful", "generative")
                 or self.compression_scoring == "streaming"
             ):
                 raise ValueError(
-                    "the speed term is defined for the interpolation track, faithful "
-                    "upscaling and streaming compression only"
+                    "the speed term is defined for the interpolation track, faithful and "
+                    "generative upscaling and streaming compression only"
                 )
             if self.sandbox_resources is None:
                 raise ValueError(

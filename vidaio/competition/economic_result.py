@@ -41,6 +41,8 @@ class SubjectAggregate:
     quality: float | None = None
     run_seconds: float | None = None
     speed_score: float | None = None
+    #: share of the subject's items that scored 0, when the anchored rules limit it
+    failed_fraction: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,11 +232,15 @@ def aggregate_subject_scores(
     }
     rules = getattr(competition, "rules", None)
     timed = rules is not None and rules.has_speed_term
+    failed_limit = None if rules is None else getattr(rules, "max_failed_item_fraction", None)
     aggregates: list[SubjectAggregate] = []
     for subject in competition.subjects:
         values = [validated[digest] for digest in subject.packet_digests]
         quality = math.fsum(values) / len(values)
         score, speed = quality, None
+        failed_fraction = None
+        if failed_limit is not None:
+            failed_fraction = sum(1 for value in values if value == 0.0) / len(values)
         if timed:
             if subject.run_seconds is None:
                 raise CompetitionEconomicResultError(
@@ -247,6 +253,10 @@ def aggregate_subject_scores(
                 slow_spf=rules.speed_slow_spf,
             )
             score = speed_adjusted_score(quality, speed, weight=rules.speed_weight)
+        if failed_fraction is not None and failed_fraction > failed_limit:
+            # Too many failed items: the subject keeps its committed identity in the
+            # result but ranks with 0, below the anchored podium_min_score (> 0).
+            score = 0.0
         aggregates.append(
             SubjectAggregate(
                 subject_id=subject.subject_id,
@@ -257,6 +267,7 @@ def aggregate_subject_scores(
                 quality=quality,
                 run_seconds=subject.run_seconds,
                 speed_score=speed,
+                failed_fraction=failed_fraction,
             )
         )
     return tuple(aggregates)

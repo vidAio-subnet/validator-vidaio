@@ -32,6 +32,9 @@ Bulletproofing invariants (spec §14, fault-injection checklist):
 Local-first artifact convention (shared with DockerSandboxRunner):
   <work_dir>/inputs/<sha256>   sealed input pool (staged by add_evaluation_item)
   <work_dir>/outputs/<sha256>  collected output pool (written by the runner)
+Both pools stay local while a competition runs: hidden inputs and contender
+outputs reach their public store prefixes only at the result, right before
+COMPLETED (_release_due_upscaling_references).
 
 --------------------------------------------------------------------------------
 FAULT CLASSIFICATION
@@ -133,11 +136,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import json
+import re
 import sqlite3
 import shutil
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -146,6 +151,7 @@ from prometheus_client import Counter, Gauge, Histogram
 
 from vidaio.audit import ArtifactKind, ArtifactRef, AuditConfig, AuditStore
 from vidaio.audit import (
+    AuditBundle,
     CompetitionItemBinding,
     LifecycleStage,
     build_bundle,
@@ -191,6 +197,7 @@ from vidaio.competition.interfaces import (
     SandboxRunner,
     logical_build_identity,
 )
+from vidaio.competition.orchestrator import entries
 from vidaio.competition.orchestrator import persistence as pers
 from vidaio.competition.orchestrator.results import ResultNotReady
 from vidaio.competition.orchestrator.config import OrchestratorConfig
@@ -209,6 +216,11 @@ from vidaio.services.commitment_capacity import (
 )
 from vidaio.competition.runners import safeio
 from vidaio.competition.runners.docker_runner import DockerSandboxRunner
+from vidaio.competition.runners.errors import (
+    CheckoutError,
+    CheckoutRejectedError,
+    UnsafePathError,
+)
 from vidaio.competition.runners.repo import (
     RepoProvider,
     checkout_pinned,
@@ -226,6 +238,21 @@ from vidaio.tokenomics.state import CompetitionResult
 
 EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 MAX_COMPETITION_INGEST_BYTES = 2 * 1024 * 1024 * 1024
+#: Same bound epoch evidence applies when it reads a persisted audit bundle.
+_MAX_AUDIT_BUNDLE_READ_BYTES = 4 * 1024 * 1024
+
+
+
+def _hash_file(path: Path) -> tuple[str, int]:
+    """sha256 and byte size of a local pool file, streamed."""
+    digest = hashlib.sha256()
+    size = 0
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+            size += len(chunk)
+    return digest.hexdigest(), size
+
 
 #: Appended to the halt reason when someone claims the reserved zero namespace.
 _RESERVED_FIX = (
@@ -366,6 +393,13 @@ class Orchestrator(BaseService):
         #: competition ids whose manifest scoring_version has been checked against
         #: the live worker at least once (the "at competition start" half).
         self._identity_checked: set[str] = set()
+        #: Serializes the two sandbox users that can overlap in time: a pre-deadline
+        #: trial build (step, ENROLLING) and a SCHEDULED competition's baseline
+        #: prebuild (anchor_competition, control API). Everything else that builds
+        #: or runs sandboxes is a later phase of the one running competition.
+        self._sandbox_lock = asyncio.Lock()
+        #: The one running pre-deadline entry check (fetch check or trial build).
+        self._entry_check_task: asyncio.Task[None] | None = None
         reg = self.health.registry
         self.m_builds = Counter(
             "vidaio_orchestrator_builds_total",
@@ -416,6 +450,12 @@ class Orchestrator(BaseService):
             "vidaio_orchestrator_stage_seconds",
             "Wall seconds spent on one phase's work within a step",
             ["phase"],
+            registry=reg,
+        )
+        self.m_entry_checks = Counter(
+            "vidaio_orchestrator_entry_checks_total",
+            "Pre-deadline entry checks (warn only) by kind (fetch / trial_build) and result",
+            ["kind", "result"],
             registry=reg,
         )
         self.m_last_tick = Gauge(
@@ -481,16 +521,44 @@ class Orchestrator(BaseService):
         kwargs: dict[str, Any] = {}
         if self._hotkey_verify_fn is not None:
             kwargs["verify_fn"] = self._hotkey_verify_fn
-        self._hotkey_guard_value = HotkeyAuthGuard(
-            RegisteredHotkeyRegistry(
-                self.chain,
-                ttl_seconds=hk_cfg.registry_ttl_seconds,
-                max_stale_seconds=hk_cfg.registry_max_stale_seconds,
-            ),
-            hk_cfg,
-            **kwargs,
+        registry = RegisteredHotkeyRegistry(
+            self.chain,
+            ttl_seconds=hk_cfg.registry_ttl_seconds,
+            max_stale_seconds=hk_cfg.registry_max_stale_seconds,
         )
+        #: The SAME registry object the guard reads: the enrollment stake re-check
+        #: sees exactly what the public API saw when it admitted the entry.
+        self._hotkey_registry_value = registry
+        self._hotkey_guard_value = HotkeyAuthGuard(registry, hk_cfg, **kwargs)
         return self._hotkey_guard_value
+
+    def _stake_registry(self) -> Any | None:
+        """The chain registry behind the shared hotkey guard, or None when no guard
+        is configured (no chain, or hotkey auth off)."""
+        self._hotkey_guard()
+        return getattr(self, "_hotkey_registry_value", None)
+
+    def _enrollment_floor(self, manifest: CompetitionManifest) -> float:
+        """The alpha-stake floor public enrollment enforces for this competition."""
+        from vidaio.services.hotkey_auth import HotkeyAuthConfig
+
+        hk_cfg = section(self.raw_config, "hotkey_auth", HotkeyAuthConfig)
+        return max(
+            float(manifest.minimum_alpha_stake),
+            float(hk_cfg.min_enroll_alpha_stake or 0.0),
+        )
+
+    def _registry_max_stale_seconds(self) -> float:
+        """How old the chain's stake view may be when the re-check acts on it."""
+        from vidaio.services.hotkey_auth import HotkeyAuthConfig
+
+        hk_cfg = section(self.raw_config, "hotkey_auth", HotkeyAuthConfig)
+        return float(hk_cfg.registry_max_stale_seconds)
+
+    @staticmethod
+    def _read_stakes(registry: Any, hotkeys: list[str]) -> dict[str, float | None]:
+        """Blocking: alpha stake per hotkey (None = not registered)."""
+        return {hotkey: registry.alpha_stake(hotkey) for hotkey in hotkeys}
 
     def _build_public_app(self) -> Any | None:
         if not self.cfg.public_enabled:
@@ -506,6 +574,7 @@ class Orchestrator(BaseService):
             allowed_repo_hosts=tuple(self.cfg.git_allowed_hosts),
             enroll_limit_per_hour=self.cfg.public_enroll_limit_per_hour,
             read_limit_per_minute=self.cfg.public_read_limit_per_minute,
+            entry_limit_per_hour=self.cfg.public_entry_limit_per_hour,
             trust_forwarded_for=self.cfg.public_trust_forwarded_for,
         )
 
@@ -640,6 +709,7 @@ class Orchestrator(BaseService):
                 )
         finally:
             self.request_stop()
+            await self._cancel_entry_check()
             if server is not None:
                 server.should_exit = True
             if public_server is not None:
@@ -675,10 +745,10 @@ class Orchestrator(BaseService):
         work. Deterministic and re-entrant — tests drive it with a fake clock."""
         if now.tzinfo is None:
             raise ValueError("step requires a timezone-aware `now`")
-        # A due upscaling competition may become COMPLETED inside engine.tick.
-        # Publish every pristine reference first; if storage release fails, halt and
-        # leave the phase AWAITING_END_TIME so no earning evidence can exist without
-        # keyless CPU recomputation bytes.
+        # A due competition may become COMPLETED inside engine.tick. Upload its
+        # hidden inputs and outputs and publish every pristine reference first; if
+        # storage fails, halt and leave the phase AWAITING_END_TIME so no earning
+        # evidence can exist without keyless CPU recomputation bytes.
         if not self._release_due_upscaling_references(now):
             self._last_step_monotonic = time.monotonic()
             self.m_last_tick.set(time.time())
@@ -687,7 +757,7 @@ class Orchestrator(BaseService):
         self._last_step_monotonic = time.monotonic()
         self.m_last_tick.set(time.time())
         competition_id = repo.running_competition_id(self.conn)
-        self._release_idle_runner(competition_id)
+        self._release_idle_runner(competition_id, now)
         if competition_id is None:
             return
         if pers.is_halted(self.conn, competition_id):
@@ -708,6 +778,7 @@ class Orchestrator(BaseService):
             if not self._check_scorer_identity(competition_id, now):
                 return
         handler = {
+            Phase.ENROLLING: self._stage_enrolling,
             Phase.FINALIZING_SUBMISSIONS: self._stage_finalizing,
             Phase.VALIDATING: self._stage_validating,
             Phase.BUILDING: self._stage_building,
@@ -715,7 +786,15 @@ class Orchestrator(BaseService):
             Phase.SCORING: self._stage_scoring,
         }.get(comp.status)
         if handler is None:
-            return  # ENROLLING / AWAITING_END_TIME: nothing between ticks
+            return  # AWAITING_END_TIME: nothing between ticks
+        if comp.status is not Phase.ENROLLING and self._entry_check_running():
+            # A pre-deadline check started just before the phase changed is still
+            # running: nothing after ENROLLING overlaps it. Retry next tick.
+            self.log.info(
+                "waiting for a pre-deadline entry check to finish",
+                extra=log_fields(competition_id=competition_id, phase=comp.status.value),
+            )
+            return
         stage_started = time.monotonic()
         try:
             await handler(competition_id, now)
@@ -724,13 +803,22 @@ class Orchestrator(BaseService):
                 time.monotonic() - stage_started
             )
 
-    def _release_idle_runner(self, competition_id: str | None) -> None:
+    def _release_idle_runner(
+        self, competition_id: str | None, now: datetime | None = None
+    ) -> None:
         """Let a renewable runner drop its remote runtime when no phase needs it.
 
-        Only BUILDING and EVALUATING execute sandboxes. Holding a remote runtime
+        Only BUILDING and EVALUATING hold sandboxes. Holding a remote runtime
         through a days-long enrollment window is what let it die unnoticed; the
         runner itself ignores the release while an operation is in flight or inside
-        its idle grace, so a pre-anchor baseline build is never cut short.
+        its idle grace, so a pre-anchor baseline build or a pre-deadline trial build
+        is never cut short.
+
+        Trial builds are the exception: while the running competition is ENROLLING
+        with trial builds enabled and its deadline has not passed, the runtime is
+        kept, so ONE generation (one fresh Modal Environment + App) serves every
+        trial build instead of one per build. It is released normally after the
+        deadline, long before BUILDING acquires its own fresh generation.
         """
         release = getattr(self.runner, "release", None)
         if not callable(release):
@@ -738,6 +826,14 @@ class Orchestrator(BaseService):
         if competition_id is not None:
             comp = repo.get_competition(self.conn, competition_id)
             if comp is not None and comp.status in (Phase.BUILDING, Phase.EVALUATING):
+                return
+            if (
+                comp is not None
+                and comp.status is Phase.ENROLLING
+                and self.cfg.enrollment_trial_build_enabled
+                and now is not None
+                and now <= comp.enrollment_deadline
+            ):
                 return
         try:
             release()
@@ -748,11 +844,24 @@ class Orchestrator(BaseService):
             )
 
     def _release_due_upscaling_references(self, now: datetime) -> bool:
-        """Release due holdouts before the lifecycle can mark them COMPLETED.
+        """Publish every hidden artifact of a due competition before COMPLETED.
 
-        Returns ``False`` only when a due upscaling competition must stay closed.
-        Releases are content-addressed and idempotent; a crash after object release
-        but before the event/phase transition safely retries the same refs.
+        Returns ``False`` only when a due competition must stay closed.
+
+        Hidden inputs (``challenge_input``) and contender outputs (``miner_output``)
+        are public object kinds, so they are never uploaded while a competition is
+        running: an output of a hidden clip is as revealing as the clip itself. They
+        live only in the local digest pools until the result is due, and are
+        uploaded here — for every track — together with the release of the sealed
+        pristine references (upscaling, removal, interpolation). Every upload is
+        verified (stored digest/size equal to the committed ones, object present)
+        BEFORE the engine may complete the competition, so epoch evidence, the
+        auditors and crown promotion find exactly the objects they always found.
+
+        Puts and releases are content-addressed and idempotent; a crash after any
+        upload but before the event/phase transition safely retries the same refs.
+        A failed upload or release halts the competition in AWAITING_END_TIME; it is
+        never completed without its public evidence bytes.
         """
         for comp in repo.list_competitions_in(self.conn, [Phase.AWAITING_END_TIME]):
             deadline = comp.end_time
@@ -761,10 +870,12 @@ class Orchestrator(BaseService):
             if now < deadline:
                 continue
             manifest = repo.get_manifest(self.conn, comp.competition_id)
-            if manifest.track not in SEALED_REFERENCE_TRACKS:
-                continue
             if pers.is_halted(self.conn, comp.competition_id):
                 return False
+            if not self._publish_due_competition_artifacts(comp.competition_id, now):
+                return False
+            if manifest.track not in SEALED_REFERENCE_TRACKS:
+                continue
             try:
                 rows = repo.validate_evaluation_item_bindings(
                     self.conn, comp.competition_id
@@ -815,6 +926,136 @@ class Orchestrator(BaseService):
                         now,
                         payload={"reference_sha256": released},
                     )
+        return True
+
+    def _due_public_artifacts(self, competition_id: str) -> list[tuple[ArtifactRef, Path]]:
+        """Every public artifact a completed competition's evidence names.
+
+        The hidden inputs of all evaluation items, and the output of every recorded
+        performance row (its score packet's ``content_digest`` is the bundle's
+        ``miner_output`` by construction). A row without those columns falls back to
+        its persisted audit bundle. Returned with the local pool file each upload
+        reads from, de-duplicated by (kind, digest).
+        """
+        refs: dict[tuple[str, str], tuple[ArtifactRef, Path]] = {}
+
+        def add(kind: ArtifactKind, digest: str, size: int, pool: Path) -> None:
+            key = (kind.value, digest)
+            if key in refs:
+                return
+            refs[key] = (
+                ArtifactRef(
+                    digest=digest,
+                    kind=kind,
+                    byte_size=size,
+                    backend_key=backend_key(kind, digest),
+                ),
+                pool / digest,
+            )
+
+        for row in self.conn.execute(
+            "SELECT input_sha256, input_bytes FROM evaluation_items "
+            "WHERE competition_id = ? ORDER BY item_index",
+            (competition_id,),
+        ).fetchall():
+            add(
+                ArtifactKind.CHALLENGE_INPUT,
+                str(row["input_sha256"]),
+                int(row["input_bytes"]),
+                self.inputs_dir,
+            )
+        for row in self.conn.execute(
+            "SELECT output_sha256, output_bytes, audit_bundle_digest "
+            "FROM performance_history WHERE competition_id = ? ORDER BY performance_id",
+            (competition_id,),
+        ).fetchall():
+            if row["output_sha256"] is not None and row["output_bytes"] is not None:
+                add(
+                    ArtifactKind.MINER_OUTPUT,
+                    str(row["output_sha256"]),
+                    int(row["output_bytes"]),
+                    self.outputs_dir,
+                )
+                continue
+            if row["audit_bundle_digest"] is None:
+                continue  # the engine's audit-linkage gate keeps this one open
+            bundle = AuditBundle.model_validate_json(
+                self.store.get_digest_limited(
+                    ArtifactKind.AUDIT_BUNDLE,
+                    str(row["audit_bundle_digest"]),
+                    max_bytes=_MAX_AUDIT_BUNDLE_READ_BYTES,
+                )
+            )
+            for ref, pool in (
+                (bundle.challenge_input, self.inputs_dir),
+                (bundle.miner_output, self.outputs_dir),
+            ):
+                add(ref.kind, ref.digest, ref.byte_size, pool)
+        return list(refs.values())
+
+    def _publish_due_competition_artifacts(
+        self, competition_id: str, now: datetime
+    ) -> bool:
+        """Upload and verify a due competition's hidden inputs and outputs.
+
+        Already-verified digests are read back from the append-only
+        ``competition_artifacts_published`` events, so a competition whose
+        completion stays gated (e.g. on audit linkage) costs a DB query per tick,
+        not a store round-trip per artifact. Returns ``False`` after halting.
+        """
+        published: set[tuple[str, str]] = set()
+        for event in self.conn.execute(
+            "SELECT payload_json FROM events WHERE competition_id = ? AND event_type = ?",
+            (competition_id, pers.EVENT_COMPETITION_ARTIFACTS_PUBLISHED),
+        ).fetchall():
+            payload = json.loads(event["payload_json"] or "{}")
+            for kind in (ArtifactKind.CHALLENGE_INPUT, ArtifactKind.MINER_OUTPUT):
+                published.update(
+                    (kind.value, str(digest)) for digest in payload.get(kind.value, [])
+                )
+        newly: dict[str, list[str]] = {
+            ArtifactKind.CHALLENGE_INPUT.value: [],
+            ArtifactKind.MINER_OUTPUT.value: [],
+        }
+        try:
+            for ref, local in self._due_public_artifacts(competition_id):
+                if (ref.kind.value, ref.digest) in published:
+                    continue
+                if not self.store.exists(ref):
+                    if not local.is_file():
+                        raise FileNotFoundError(
+                            f"{ref.kind.value} {ref.digest} is neither stored nor in "
+                            f"the local pool ({local})"
+                        )
+                    stored = self.store.put_file(local, ref.kind)
+                    if (stored.digest, stored.byte_size) != (ref.digest, ref.byte_size):
+                        raise RuntimeError(
+                            f"pooled {ref.kind.value} {ref.digest} stored as "
+                            f"{stored.digest}/{stored.byte_size}, expected "
+                            f"{ref.digest}/{ref.byte_size}"
+                        )
+                    if not self.store.exists(ref):
+                        raise RuntimeError(
+                            f"{ref.kind.value} {ref.digest} is absent after upload"
+                        )
+                newly[ref.kind.value].append(ref.digest)
+        except Exception as exc:
+            self._halt(
+                competition_id,
+                "completion blocked: publishing the hidden inputs/outputs at the "
+                f"result failed: {type(exc).__name__}: {exc}",
+                now,
+            )
+            return False
+        if any(newly.values()):
+            with pers.txn(self.conn):
+                repo.record_event(
+                    self.conn,
+                    competition_id,
+                    pers.EVENT_COMPETITION_ARTIFACTS_PUBLISHED,
+                    now,
+                    payload=newly,
+                )
         return True
 
     # ---- scorer identity -------------------------------------------------------
@@ -902,6 +1143,465 @@ class Orchestrator(BaseService):
         )
         return False
 
+    # ---- ENROLLING: pre-deadline entry checks (warn only) ----------------------
+
+    async def _stage_enrolling(self, competition_id: str, now: datetime) -> None:
+        """Check entries ahead of the deadline so entrants can fix them in time.
+
+        The check runs as ONE background task at a time and this tick returns at
+        once, so the tick loop (and the ``engine_tick`` health check) never waits on
+        a checkout or a build. While a task runs, later ticks only see that it is
+        running. Each task does one checkout: a due fetch check first (a new or
+        replaced entry version, then the oldest re-check), otherwise one trial build.
+        A fetch check never starts at or after finalization_time, a trial build
+        never after the enrollment deadline. Both WARN only: they record an event,
+        never change a contender's status and never halt. The blocking work runs in
+        a worker thread; the database is touched only on the loop thread, with no
+        transaction across an await. The only other possible user of the repo
+        provider meanwhile is a SCHEDULED competition's baseline prebuild
+        (GitRepoProvider checkouts are independent, locked sessions); trial builds
+        take ``_sandbox_lock``. Later phases wait for a running task (see step).
+        """
+        if self._entry_check_running():
+            return
+        comp = repo.get_competition(self.conn, competition_id)
+        if comp is None or now >= comp.finalization_time:
+            return
+        try:
+            work: tuple[str, repo.ContenderRecord] | None = None
+            if self.cfg.enrollment_precheck_enabled:
+                due = self._due_precheck(competition_id, comp, now)
+                if due is not None:
+                    work = ("fetch", due)
+            if (
+                work is None
+                and self.cfg.enrollment_trial_build_enabled
+                and now <= comp.enrollment_deadline
+            ):
+                due = self._due_trial_build(competition_id, now)
+                if due is not None:
+                    work = ("trial_build", due)
+        except Exception as exc:  # noqa: BLE001 - checks must never disturb enrollment
+            self._log_entry_check_failure(competition_id, exc)
+            return
+        if work is None:
+            return
+        kind, contender = work
+        self._entry_check_task = asyncio.create_task(
+            self._run_entry_check(competition_id, kind, contender, now),
+            name=f"orchestrator-entry-{kind}",
+        )
+
+    def _entry_check_running(self) -> bool:
+        """True while a pre-deadline check task is still running."""
+        task = self._entry_check_task
+        if task is None:
+            return False
+        if not task.done():
+            return True
+        self._entry_check_task = None
+        if not task.cancelled() and task.exception() is not None:
+            self._log_entry_check_failure(None, task.exception())
+        return False
+
+    async def _cancel_entry_check(self) -> None:
+        """Shutdown: cancel a running check task and wait for it to unwind."""
+        task = self._entry_check_task
+        self._entry_check_task = None
+        if task is None or task.done():
+            return
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await asyncio.wait_for(task, timeout=30)
+
+    async def _run_entry_check(
+        self, competition_id: str, kind: str, contender: repo.ContenderRecord, now: datetime
+    ) -> None:
+        try:
+            if kind == "fetch":
+                await self._fetch_check(competition_id, contender, now)
+            else:
+                await self._trial_check(competition_id, contender, now)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - never raised into the tick loop
+            self._log_entry_check_failure(competition_id, exc)
+
+    def _log_entry_check_failure(self, competition_id: str | None, exc: BaseException) -> None:
+        self.log.warning(
+            "pre-deadline entry check failed; enrollment is unaffected",
+            extra=log_fields(
+                competition_id=competition_id, error=f"{type(exc).__name__}: {exc}"
+            ),
+        )
+
+    def _open_entries(self, competition_id: str) -> list[repo.ContenderRecord]:
+        return [
+            contender
+            for contender in repo.list_contenders(self.conn, competition_id)
+            if not contender.is_calibration and contender.status == "ENROLLED"
+        ]
+
+    def _due_precheck(
+        self, competition_id: str, comp: repo.CompetitionRecord, now: datetime
+    ) -> repo.ContenderRecord | None:
+        """The entry whose fetch check is most overdue, if any is due."""
+        contenders = self._open_entries(competition_id)
+        if not contenders:
+            return None
+        checks = entries.entry_checks(self.conn, competition_id, contenders)
+        interval = entries.precheck_interval(
+            now,
+            comp.enrollment_deadline,
+            interval_seconds=self.cfg.enrollment_precheck_interval_seconds,
+            final_interval_seconds=self.cfg.enrollment_precheck_final_interval_seconds,
+            final_window_seconds=self.cfg.enrollment_precheck_final_window_seconds,
+        )
+        due: list[tuple[int, str, int, repo.ContenderRecord]] = []
+        for contender in contenders:
+            last = checks[contender.contender_id].precheck
+            if last is None:
+                # never checked in this version: first, oldest change first
+                due.append((0, contender.updated_at or "", contender.contender_id, contender))
+                continue
+            at = repo.parse_ts(last.get("at"))
+            if at is None or now - at >= interval:
+                due.append((1, last.get("at") or "", contender.contender_id, contender))
+        if not due:
+            return None
+        due.sort(key=lambda entry: entry[:3])
+        return due[0][3]
+
+    async def _fetch_check(
+        self, competition_id: str, contender: repo.ContenderRecord, now: datetime
+    ) -> None:
+        """Fetch-check one entry version (background task) and record the result."""
+        manifest = repo.get_manifest(self.conn, competition_id)
+        ok, problems, detail = await asyncio.to_thread(
+            self._precheck_entry,
+            contender,
+            licenses_required=entries.licenses_required(manifest),
+        )
+        stake_warning = await self._stake_warning(contender, manifest)
+        if stake_warning is not None:
+            ok = False
+            problems = [*problems, entries.STAKE_BELOW_FLOOR]
+            detail = _short("; ".join(d for d in (detail, stake_warning) if d), limit=600)
+        with pers.txn(self.conn):
+            repo.record_event(
+                self.conn,
+                competition_id,
+                entries.EVENT_PRECHECKED,
+                now,
+                payload={
+                    "contender_id": contender.contender_id,
+                    "repo_url": contender.repo_url,
+                    "commit_sha": contender.commit_sha,
+                    "tree_sha": contender.tree_sha,
+                    "ok": ok,
+                    "problems": problems,
+                    "detail": detail,
+                },
+            )
+        self.m_entry_checks.labels(
+            kind="fetch", result="ok" if ok else (problems[0] if problems else "failed")
+        ).inc()
+        self.log.info(
+            "entry fetch check recorded (warn only)",
+            extra=log_fields(
+                competition_id=competition_id,
+                contender_id=contender.contender_id,
+                commit_sha=contender.commit_sha,
+                ok=ok,
+                problems=problems,
+            ),
+        )
+
+    async def _stake_warning(
+        self, contender: repo.ContenderRecord, manifest: CompetitionManifest
+    ) -> str | None:
+        """Warn (never reject) when the entry's hotkey is under the stake floor that
+        the deadline re-check will enforce. An unreadable registry warns nothing."""
+        if not self.cfg.enrollment_stake_recheck_enabled or not contender.hotkey:
+            return None
+        registry = self._stake_registry()
+        if registry is None:
+            return None
+        try:
+            stakes = await asyncio.to_thread(
+                self._read_stakes, registry, [contender.hotkey]
+            )
+        except Exception as exc:  # noqa: BLE001 - our side; the deadline check halts
+            self.log.warning(
+                "stake warning skipped: the hotkey registry is unreadable",
+                extra=log_fields(error=f"{type(exc).__name__}: {exc}"),
+            )
+            return None
+        stake = stakes.get(contender.hotkey)
+        value = 0.0 if stake is None else float(stake)
+        floor = self._enrollment_floor(manifest)
+        if value >= floor:
+            return None
+        return (
+            f"alpha stake {value:g} is below the floor {floor:g}"
+            + (" (hotkey not registered)" if stake is None else "")
+            + "; the stake is re-checked when entries are finalized (the manifest's "
+            "finalization_time, after the enrollment deadline) and an entry below the "
+            "floor then is rejected"
+        )
+
+    def _precheck_entry(
+        self, contender: repo.ContenderRecord, *, licenses_required: bool
+    ) -> tuple[bool, list[str], str]:
+        """Blocking: run the production checkout of one entry version and inspect it.
+
+        Returns ``(ok, problem codes, short operator-safe detail)``. Never raises:
+        anything we cannot attribute to the entry is ``check_unavailable``.
+        """
+        try:
+            checkout = checkout_pinned(
+                self.repo_provider,
+                contender.repo_url,
+                contender.commit_sha,
+                contender.tree_sha,
+            )
+        except Exception as exc:  # noqa: BLE001 - classified, never raised
+            code, detail = _precheck_checkout_problem(exc)
+            return False, [code], detail
+        problems: list[str] = []
+        details: list[str] = []
+        try:
+            try:
+                safeio.assert_safe_tree(checkout)
+                if (checkout / ".gitmodules").exists():
+                    raise UnsafePathError(
+                        ".gitmodules: submodules are never fetched"
+                    )
+            except UnsafePathError as exc:
+                problems.append("unsafe_tree")
+                details.append(_short(str(exc)))
+            try:
+                safeio.lstat_regular(checkout / "Dockerfile", what="Dockerfile")
+            except (FileNotFoundError, UnsafePathError):
+                problems.append("no_dockerfile")
+                details.append("no regular file named Dockerfile at the repository root")
+            if licenses_required:
+                if not any(
+                    _is_regular(checkout / name) for name in entries.LICENSE_FILES
+                ):
+                    problems.append("no_license")
+                    details.append(
+                        "no LICENSE (or LICENSE.md, LICENSE.txt, COPYING) at the "
+                        "repository root"
+                    )
+                if not _is_regular(checkout / entries.LICENSES_MANIFEST):
+                    problems.append("no_licenses_md")
+                    details.append("no LICENSES.md at the repository root")
+            size = safeio.worktree_bytes(checkout)
+            if size > self.cfg.git_checkout_max_bytes:
+                problems.append("over_size_cap")
+                details.append(
+                    f"the source tree is {size} bytes, over the cap of "
+                    f"{self.cfg.git_checkout_max_bytes}"
+                )
+        except Exception as exc:  # noqa: BLE001 - our own inspection failed
+            problems.append("check_unavailable")
+            details.append(f"the check could not inspect the checkout ({type(exc).__name__})")
+        finally:
+            try:
+                release_checkout(self.repo_provider, checkout)
+            except Exception as exc:  # noqa: BLE001 - cleanup only
+                self.log.warning(
+                    "releasing a pre-deadline check checkout failed",
+                    extra=log_fields(error=f"{type(exc).__name__}: {exc}"),
+                )
+        return not problems, problems, _short("; ".join(details), limit=600)
+
+    def _due_trial_build(
+        self, competition_id: str, now: datetime
+    ) -> repo.ContenderRecord | None:
+        """The oldest entry version that passed its fetch check and has no build
+        result yet, within the per-entry daily cap and the infra back-off."""
+        if self._sandbox_lock.locked():
+            return None  # a baseline prebuild holds the sandbox runtime: next tick
+        retry = timedelta(seconds=self.cfg.enrollment_trial_build_retry_seconds)
+        last_unavailable = entries.last_trial_unavailable_at(self.conn, competition_id)
+        if last_unavailable is not None and now - last_unavailable < retry:
+            return None
+        contenders = self._open_entries(competition_id)
+        checks = entries.entry_checks(self.conn, competition_id, contenders)
+        since = now - timedelta(days=1)
+        candidates: list[tuple[str, int, repo.ContenderRecord]] = []
+        for contender in contenders:
+            state = checks[contender.contender_id]
+            if not entries.fetch_passed(state):
+                continue
+            if state.trial is not None and state.trial.get("outcome") in (
+                entries.TRIAL_OK,
+                entries.TRIAL_FAILED,
+            ):
+                continue  # this exact version has its answer
+            if state.trial_builds_since(since) >= self.cfg.enrollment_trial_build_daily_cap:
+                continue
+            if state.trial is not None and state.trial.get("outcome") == entries.TRIAL_UNAVAILABLE:
+                tried = repo.parse_ts(state.trial.get("at"))
+                if tried is not None and now - tried < retry:
+                    continue  # this version's last try could not run: back off it alone
+            candidates.append(
+                (contender.updated_at or "", contender.contender_id, contender)
+            )
+        if not candidates:
+            return None
+        candidates.sort(key=lambda entry: entry[:2])
+        return candidates[0][2]
+
+    async def _trial_check(
+        self, competition_id: str, contender: repo.ContenderRecord, now: datetime
+    ) -> None:
+        """Trial-build one entry version (background task) and record the result."""
+        if self._sandbox_lock.locked():
+            return  # a baseline prebuild took the runtime meanwhile: re-selected later
+        async with self._sandbox_lock:
+            outcome, error, detail, cause = await self._trial_build(
+                competition_id, contender
+            )
+            if outcome == entries.TRIAL_UNAVAILABLE and cause != entries.CAUSE_CHECKOUT:
+                # Our side failed: the next attempt starts a fresh runtime generation.
+                self._discard_sandbox_runtime("a trial build could not run")
+        with pers.txn(self.conn):
+            repo.record_event(
+                self.conn,
+                competition_id,
+                entries.EVENT_TRIAL_BUILT,
+                now,
+                payload={
+                    "contender_id": contender.contender_id,
+                    "repo_url": contender.repo_url,
+                    "commit_sha": contender.commit_sha,
+                    "tree_sha": contender.tree_sha,
+                    "ok": outcome == entries.TRIAL_OK,
+                    "outcome": outcome,
+                    "error": error,
+                    "detail": detail,
+                    "cause": cause,
+                },
+            )
+        self.m_entry_checks.labels(kind="trial_build", result=outcome).inc()
+        self.log.info(
+            "entry trial build recorded (warn only)",
+            extra=log_fields(
+                competition_id=competition_id,
+                contender_id=contender.contender_id,
+                commit_sha=contender.commit_sha,
+                outcome=outcome,
+            ),
+        )
+        if outcome == entries.TRIAL_UNAVAILABLE and cause == entries.CAUSE_CHECKOUT:
+            # The runtime is fine; this entry's source could not be fetched (removed,
+            # made private, host trouble). Re-run its fetch check now: an entry whose
+            # repository went away then leaves the trial queue at once, instead of
+            # staying the oldest candidate until its next scheduled check.
+            await self._fetch_check(competition_id, contender, now)
+
+    def _discard_sandbox_runtime(self, reason: str) -> None:
+        """Drop the renewable runner's live generation now (no idle grace)."""
+        discard = getattr(self.runner, "discard", None)
+        if not callable(discard):
+            return
+        try:
+            discard(reason)
+        except Exception as exc:  # noqa: BLE001 - cleanup only
+            self.log.warning(
+                "discarding the sandbox runtime failed",
+                extra=log_fields(error=f"{type(exc).__name__}: {exc}"),
+            )
+
+    async def _trial_build(
+        self, competition_id: str, contender: repo.ContenderRecord
+    ) -> tuple[str, str | None, str | None, str | None]:
+        """Build one entry version exactly as BUILDING would, keeping nothing.
+
+        ``runner.build`` only builds and caches the image in the live runtime's
+        memory; the image binding, the probe, the contender status and the
+        commitment are all written by ``_stage_building``, which this never calls.
+        Returns ``(outcome, error for the entrant, detail for the operator, cause)``;
+        ``cause`` is ``checkout`` when an unavailable build failed fetching the
+        entry's source (the runtime itself is fine), else None.
+        """
+        spec = ContenderSpec(
+            contender_id=contender.contender_id,
+            repo_url=contender.repo_url,
+            commit_sha=contender.commit_sha,
+            tree_sha=contender.tree_sha,
+        )
+        try:
+            # The image-size cap is this competition's anchored container limit.
+            self._configure_runner_for(competition_id)
+            acquire = getattr(self.runner, "acquire", None)
+            if callable(acquire):
+                # The renewable runtime; the per-tick idle release drops it again.
+                await asyncio.to_thread(acquire)
+        except Exception as exc:  # noqa: BLE001 - our side: retried later
+            return (
+                entries.TRIAL_UNAVAILABLE,
+                None,
+                _short(f"sandbox runtime unavailable: {type(exc).__name__}: {exc}"),
+                None,
+            )
+        try:
+            await asyncio.to_thread(self.runner.build, spec)
+        except Exception as exc:  # noqa: BLE001 - classified
+            from vidaio.competition.orchestrator.failures import unwrap
+
+            if classify_failure(exc) is Fault.CONTENDER:
+                message = f"build failed ({fault_code(exc)}): {unwrap(exc)}"
+                return entries.TRIAL_FAILED, message[:4000], None, None
+            return (
+                entries.TRIAL_UNAVAILABLE,
+                None,
+                _short(f"{type(exc).__name__}: {exc}"),
+                entries.CAUSE_CHECKOUT if _caused_by_checkout(exc) else None,
+            )
+        return entries.TRIAL_OK, None, None, None
+
+    def submit_entry(
+        self,
+        competition_id: str,
+        *,
+        hotkey: str,
+        repo_url: str,
+        commit_sha: str,
+        tree_sha: str,
+        stake: float,
+        now: datetime,
+        replace: bool,
+    ) -> repo.EntryOutcome:
+        """Enroll, or replace the hotkey's ENROLLED entry in place (public API)."""
+        with pers.txn(self.conn):
+            return repo.submit_contender_entry(
+                self.conn,
+                competition_id,
+                hotkey=hotkey,
+                repo_url=repo_url,
+                commit_sha=commit_sha,
+                tree_sha=tree_sha,
+                stake=stake,
+                now=now,
+                replace=replace,
+            )
+
+    def withdraw_entry(self, competition_id: str, *, hotkey: str, now: datetime) -> int:
+        """The entrant withdraws its own ENROLLED entry before the deadline."""
+        with pers.txn(self.conn):
+            contender_id = repo.withdraw_contender(
+                self.conn, competition_id, hotkey=hotkey, now=now
+            )
+        self.log.warning(
+            "contender withdrew its entry",
+            extra=log_fields(competition_id=competition_id, contender_id=contender_id),
+        )
+        return contender_id
+
     # ---- FINALIZING_SUBMISSIONS -> VALIDATING ----------------------------------
 
     async def _stage_finalizing(self, competition_id: str, now: datetime) -> None:
@@ -932,6 +1632,10 @@ class Orchestrator(BaseService):
         append-only event log, so a restart archives only what is still missing and
         the combined ref is stable.
         """
+        if self._entry_check_running():
+            return  # never archive while a pre-deadline check still runs
+        if not await self._recheck_enrollment_stakes(competition_id, now):
+            return  # halted: the stake floor could not be checked
         archived = pers.archived_submissions(self.conn, competition_id)
         for contender in repo.list_contenders(self.conn, competition_id):
             if contender.status == "REJECTED":
@@ -1021,6 +1725,88 @@ class Orchestrator(BaseService):
         self.engine.mark_submissions_backed_up(
             self.conn, competition_id, backup_ref, now
         )
+
+    async def _recheck_enrollment_stakes(self, competition_id: str, now: datetime) -> bool:
+        """Re-read every ENROLLED entry's alpha stake once enrollment has closed.
+
+        Runs at the first FINALIZING step, before anything is archived, against the
+        same chain registry the public API admitted the entries with. An entry whose
+        hotkey is now below ``max(manifest.minimum_alpha_stake,
+        hotkey_auth.min_enroll_alpha_stake)`` (an unregistered hotkey counts as 0) is
+        REJECTED with the reason. All stakes are read before anyone is rejected: an
+        unreadable registry is OUR failure and HALTS finalization with nobody
+        rejected. Done once per competition (``enrollment_stake_rechecked``).
+        Returns False when it halted.
+        """
+        if not self.cfg.enrollment_stake_recheck_enabled:
+            return True
+        done = self.conn.execute(
+            "SELECT 1 FROM events WHERE competition_id = ? AND event_type = ? LIMIT 1",
+            (competition_id, entries.EVENT_STAKE_RECHECKED),
+        ).fetchone()
+        if done is not None:
+            return True
+        registry = self._stake_registry()
+        if registry is None:
+            self.log.warning(
+                "enrollment stake re-check skipped: no hotkey registry is configured",
+                extra=log_fields(competition_id=competition_id),
+            )
+            return True
+        manifest = repo.get_manifest(self.conn, competition_id)
+        floor = self._enrollment_floor(manifest)
+        contenders = self._open_entries(competition_id)
+        try:
+            stakes = await asyncio.to_thread(
+                self._read_stakes, registry, [c.hotkey or "" for c in contenders]
+            )
+            # The adapter keeps serving its cached neurons when a refresh fails, so
+            # a successful read above can still be arbitrarily old: require the
+            # chain's own last successful read to be recent before rejecting anyone.
+            max_age = self._registry_max_stale_seconds()
+            fresh = getattr(registry, "chain_snapshot_fresh", None)
+            if callable(fresh) and not await asyncio.to_thread(fresh, max_age):
+                raise RuntimeError(
+                    f"the chain's last successful metagraph read is older than "
+                    f"{max_age:g} s"
+                )
+        except Exception as exc:  # noqa: BLE001 - our failure: halt, reject nobody
+            self._halt(
+                competition_id,
+                "the alpha-stake re-check when entries are finalized could not read "
+                f"current stakes from the chain registry: {type(exc).__name__}: {exc}. "
+                "This is OUR failure: nobody was rejected and finalization did NOT "
+                "start. Restore the chain connection and clear_halt to re-run the check.",
+                now,
+            )
+            return False
+        checked: list[dict[str, Any]] = []
+        rejected: list[int] = []
+        for contender in contenders:
+            stake = stakes.get(contender.hotkey or "")
+            value = 0.0 if stake is None else float(stake)
+            checked.append(
+                {"contender_id": contender.contender_id, "stake": stake}
+            )
+            if value >= floor:
+                continue
+            self._reject_contender(
+                competition_id,
+                contender.contender_id,
+                f"alpha stake {value:g} below the floor {floor:g} when entries were "
+                "finalized" + (" (hotkey not registered)" if stake is None else ""),
+                now,
+            )
+            rejected.append(contender.contender_id)
+        with pers.txn(self.conn):
+            repo.record_event(
+                self.conn,
+                competition_id,
+                entries.EVENT_STAKE_RECHECKED,
+                now,
+                payload={"floor": floor, "checked": checked, "rejected": rejected},
+            )
+        return True
 
     def _archive_submission_bytes(self, contender: repo.ContenderRecord) -> bytes:
         """Checkout + deterministic tarball for one contender (blocking)."""
@@ -1364,9 +2150,7 @@ class Orchestrator(BaseService):
         # treats it exactly like a process restart.
         acquire = getattr(self.runner, "acquire", None)
         if callable(acquire):
-            configure = getattr(self.runner, "configure", None)
-            if callable(configure):
-                configure(self.runner_envelope(competition_id))
+            self._configure_runner_for(competition_id)
             try:
                 await asyncio.to_thread(acquire)
             except Exception as exc:
@@ -1376,6 +2160,12 @@ class Orchestrator(BaseService):
                     f"{type(exc).__name__}: {exc}",
                     now,
                 )
+                return False
+            # The live generation now attests its own GPU: re-check it against the
+            # competition's before any build or batch can request a sandbox.
+            if self._halt_on_manifest_gpu_problem(
+                competition_id, repo.get_manifest(self.conn, competition_id), now
+            ):
                 return False
         try:
             fence = self._modal_runtime_fence()
@@ -2474,13 +3264,15 @@ class Orchestrator(BaseService):
             )
 
         # Content-addressed artifact puts are idempotent and crash-safe on their
-        # own; only the DB rows need the transaction. The output put deliberately
-        # precedes the digest check: an output race may leave an unreferenced object,
-        # but it can never produce a packet, bundle or economic row.
+        # own; only the DB rows need the transaction. The hidden input and the
+        # contender output are public object kinds: the bundle names them by their
+        # deterministic refs now, and _release_due_upscaling_references uploads and
+        # verifies both at the result, before COMPLETED. Nothing that runs before
+        # then reads them from the store (the scorer and the sandboxes use the local
+        # pools). The output is hashed here so the bundle can only ever name the
+        # exact bytes that were scored.
         input_ref = self._challenge_input_ref(item_row)
-        output_ref = self.store.put_file(
-            self.outputs_dir / output.output_sha256, ArtifactKind.MINER_OUTPUT
-        )
+        output_ref = self._pooled_output_ref(output)
         if (
             output_ref.digest != output.output_sha256
             or output_ref.byte_size != output.output_bytes
@@ -2596,20 +3388,27 @@ class Orchestrator(BaseService):
             repo.set_audit_bundle_digest(self.conn, performance_id, bundle_digest)
 
     def _challenge_input_ref(self, item_row: sqlite3.Row) -> ArtifactRef:
-        digest = item_row["input_sha256"]
-        ref = ArtifactRef(
+        """The deterministic public ref of an item's hidden input.
+
+        Never touches the store: the input stays in the local pool until the result
+        (``_publish_due_competition_artifacts`` uploads and verifies it then)."""
+        digest = str(item_row["input_sha256"])
+        return ArtifactRef(
             digest=digest,
             kind=ArtifactKind.CHALLENGE_INPUT,
-            byte_size=item_row["input_bytes"],
+            byte_size=int(item_row["input_bytes"]),
             backend_key=backend_key(ArtifactKind.CHALLENGE_INPUT, digest),
         )
-        if not self.store.exists(ref):
-            # Item was seeded out-of-band (tests / direct repo use): archive the
-            # pooled sealed input now — the bundle must reference stored bytes.
-            ref = self.store.put_file(
-                self.inputs_dir / digest, ArtifactKind.CHALLENGE_INPUT
-            )
-        return ref
+
+    def _pooled_output_ref(self, output: BatchOutput) -> ArtifactRef:
+        """The deterministic public ref of the pooled output bytes (not uploaded)."""
+        digest, size = _hash_file(self.outputs_dir / output.output_sha256)
+        return ArtifactRef(
+            digest=digest,
+            kind=ArtifactKind.MINER_OUTPUT,
+            byte_size=size,
+            backend_key=backend_key(ArtifactKind.MINER_OUTPUT, digest),
+        )
 
     def _reference_original_ref(self, item_row: sqlite3.Row) -> ArtifactRef:
         digest = str(item_row["reference_sha256"])
@@ -2656,10 +3455,18 @@ class Orchestrator(BaseService):
 
     def runner_envelope(self, competition_id: str) -> dict[str, Any]:
         """What the runner enforces for this competition: the effective compute
-        envelope (when the manifest pins one) and the anchored image-size cap."""
+        envelope (when the manifest pins one), the anchored image-size cap and, on
+        Modal, the competition's GPU (:meth:`competition_gpu`)."""
         resources = self.effective_sandbox_resources(competition_id) or {}
         manifest = repo.get_manifest(self.conn, competition_id)
-        return {**resources, "container_size_limit_gb": float(manifest.container_size_limit_gb)}
+        envelope = {**resources, "container_size_limit_gb": float(manifest.container_size_limit_gb)}
+        if self.cfg.sandbox_backend == "modal":
+            try:
+                envelope["gpu"] = self.competition_gpu(manifest)
+            except ValueError:
+                # No deterministic GPU: the GPU policy check halts before any sandbox.
+                pass
+        return envelope
 
     def effective_sandbox_resources(self, competition_id: str) -> dict[str, Any] | None:
         """The anchored envelope, raised by the latest execution amendment if any."""
@@ -2988,38 +3795,81 @@ class Orchestrator(BaseService):
 
     # ---- repository/engine passthroughs ----------------------------------------
 
-    def _manifest_gpu_problem(self, manifest: CompetitionManifest) -> str | None:
-        """Return a live-Modal GPU policy mismatch, if any.
+    def competition_gpu(self, manifest: CompetitionManifest) -> str:
+        """The Modal GPU this competition's builds and evaluation request.
 
-        Docker and injected fake runners remain the explicit report/test path. A
-        live Modal composition has two independent facts: the operator config and
-        the runner's actual request value. Both must agree and the resulting exact
-        GPU string must be committed in ``manifest.allowed_gpus``.
+        It comes from the anchored manifest, not from the process: exactly one
+        ``allowed_gpus`` entry is that GPU; with several entries the process
+        default ``orchestrator.modal_gpu`` is used when it is one of them.
+        Raises ``ValueError`` when the manifest names no GPU this orchestrator can
+        pick deterministically.
         """
-        if self.cfg.sandbox_backend == "remote_docker":
-            from vidaio.competition.runners.remote_docker_runner import (
-                normalize_gpu_name,
-            )
+        gpus = [gpu.strip() for gpu in manifest.allowed_gpus]
+        if len(gpus) == 1:
+            return gpus[0]
+        configured = self.cfg.modal_gpu.strip()
+        if configured and configured in gpus:
+            return configured
+        raise ValueError(
+            f"manifest.allowed_gpus={manifest.allowed_gpus!r} lists several GPUs and "
+            f"the process default orchestrator.modal_gpu {configured!r} is not one of "
+            "them; anchor exactly one GPU or include the default"
+        )
 
-            configured = normalize_gpu_name(self.cfg.remote_docker_expected_gpu)
-            actual_value = getattr(self.runner, "gpu", None)
-            actual = (
-                normalize_gpu_name(actual_value) if isinstance(actual_value, str) else ""
+    def _manifest_gpu_policy_problem(self, manifest: CompetitionManifest) -> str | None:
+        """Manifest-level GPU rules, independent of any live runner."""
+        rules = manifest.result_rules
+        if rules is not None and rules.has_speed_term and len(manifest.allowed_gpus) != 1:
+            return (
+                "the speed term times every contender on one GPU type: "
+                f"manifest.allowed_gpus={manifest.allowed_gpus!r} must name exactly one"
             )
-            if not configured or actual != configured:
-                return (
-                    f"remote GPU sandbox reports {actual_value!r}, configured "
-                    f"{self.cfg.remote_docker_expected_gpu!r}"
-                )
-            if actual not in {normalize_gpu_name(g) for g in manifest.allowed_gpus}:
-                return (
-                    f"remote GPU {actual!r} is not committed in manifest."
-                    f"allowed_gpus={manifest.allowed_gpus!r}"
-                )
-            return None
+        if self.cfg.sandbox_backend == "modal":
+            try:
+                self.competition_gpu(manifest)
+            except ValueError as exc:
+                return str(exc)
+        return None
+
+    def _remote_docker_gpu_problem(self, manifest: CompetitionManifest) -> str | None:
+        from vidaio.competition.runners.remote_docker_runner import (
+            normalize_gpu_name,
+        )
+
+        configured = normalize_gpu_name(self.cfg.remote_docker_expected_gpu)
+        actual_value = getattr(self.runner, "gpu", None)
+        actual = (
+            normalize_gpu_name(actual_value) if isinstance(actual_value, str) else ""
+        )
+        if not configured or actual != configured:
+            return (
+                f"remote GPU sandbox reports {actual_value!r}, configured "
+                f"{self.cfg.remote_docker_expected_gpu!r}"
+            )
+        if actual not in {normalize_gpu_name(g) for g in manifest.allowed_gpus}:
+            return (
+                f"remote GPU {actual!r} is not committed in manifest."
+                f"allowed_gpus={manifest.allowed_gpus!r}"
+            )
+        return None
+
+    def _manifest_gpu_problem(self, manifest: CompetitionManifest) -> str | None:
+        """Return a live GPU policy mismatch for ``manifest``, if any.
+
+        Docker and injected fake runners remain the explicit report/test path. The
+        ``remote_docker`` fallback runs on one operator host whose GPU model must be
+        committed. A live Modal runner must attest exactly the competition's GPU
+        (:meth:`competition_gpu`); a renewable runner reports the GPU of the
+        envelope it was configured with for this competition.
+        """
+        problem = self._manifest_gpu_policy_problem(manifest)
+        if problem is not None:
+            return problem
+        if self.cfg.sandbox_backend == "remote_docker":
+            return self._remote_docker_gpu_problem(manifest)
         if self.cfg.sandbox_backend != "modal":
             return None
-        configured = self.cfg.modal_gpu.strip()
+        expected = self.competition_gpu(manifest)
         actual_value = getattr(self.runner, "gpu", None)
         actual = actual_value.strip() if isinstance(actual_value, str) else ""
         if not actual:
@@ -3027,26 +3877,38 @@ class Orchestrator(BaseService):
                 "live Modal runner does not attest its requested GPU; refusing "
                 "manifest execution"
             )
-        if actual != configured:
+        if actual != expected:
             return (
-                f"live Modal runner GPU {actual!r} does not match configured "
-                f"orchestrator.modal_gpu {configured!r}"
-            )
-        if actual not in manifest.allowed_gpus:
-            return (
-                f"live Modal runner GPU {actual!r} is not committed in manifest."
-                f"allowed_gpus={manifest.allowed_gpus!r}"
+                f"live Modal runner GPU {actual!r} is not the competition GPU "
+                f"{expected!r} (manifest.allowed_gpus={manifest.allowed_gpus!r})"
             )
         return None
 
     def _assert_manifest_gpu(self, manifest: CompetitionManifest) -> None:
-        problem = self._manifest_gpu_problem(manifest)
+        """Creation gate. A runner that is configured per competition (the renewable
+        Modal runner) will request :meth:`competition_gpu` when this competition runs,
+        so only the manifest rules apply here; a fixed runner cannot follow the
+        manifest and must already attest the right GPU."""
+        if self.cfg.sandbox_backend == "modal" and callable(
+            getattr(self.runner, "configure", None)
+        ):
+            problem = self._manifest_gpu_policy_problem(manifest)
+        else:
+            problem = self._manifest_gpu_problem(manifest)
         if problem is not None:
             raise ValueError(problem)
+
+    def _configure_runner_for(self, competition_id: str) -> None:
+        configure = getattr(self.runner, "configure", None)
+        if callable(configure):
+            configure(self.runner_envelope(competition_id))
 
     def _halt_on_manifest_gpu_problem(
         self, competition_id: str, manifest: CompetitionManifest, now: datetime
     ) -> bool:
+        # The runner must describe THIS competition's envelope (GPU included) before
+        # its attestation is compared with the manifest.
+        self._configure_runner_for(competition_id)
         problem = self._manifest_gpu_problem(manifest)
         if problem is None:
             return False
@@ -3273,90 +4135,93 @@ class Orchestrator(BaseService):
                     f"persisted manifest: expected {expected_baseline_tree}"
                 )
         if manifest.baseline is not None:
-            # Every declared baseline is built before the chain claim. Persist the
-            # process-local Modal runtime fence first so even this pre-enrollment
-            # handle has explicit provenance; report/Docker runners are a no-op.
-            if not await self._ensure_fresh_modal_runtime(
-                competition_id, Phase.SCHEDULED, at
-            ):
-                raise ValueError(
-                    "the baseline runtime could not be bound before its "
-                    "pre-enrollment build; no chain write was attempted"
-                )
-            baseline_spec = ContenderSpec(
-                contender_id=0,
-                repo_url=manifest.baseline.repo_url,
-                commit_sha=manifest.baseline.commit_sha,
-                tree_sha=manifest.baseline.tree_sha,
-            )
-            try:
-                built_baseline_digest: str | None = None
-                modal_controls = self._modal_image_controls()
-                if modal_controls is not None:
-                    if baseline_image_digest is not None:
-                        binding = pers.latest_modal_image_binding(
-                            self.conn,
-                            competition_id,
-                            baseline_image_digest,
-                            is_calibration=True,
-                        )
-                    else:
-                        binding = pers.latest_modal_calibration_binding(
-                            self.conn, competition_id
-                        )
-                    if binding is not None:
-                        bound_digest = binding.get("image_digest")
-                        if not isinstance(bound_digest, str):
-                            raise ValueError(
-                                "persisted baseline Modal image digest is malformed"
-                            )
-                        self._require_modal_binding_matches(
-                            binding,
-                            baseline_spec,
-                            bound_digest,
-                            is_calibration=True,
-                        )
-                        built_baseline_digest = await self._restore_bound_modal_image(
-                            competition_id,
-                            baseline_spec,
-                            bound_digest,
-                            is_calibration=True,
-                        )
-                if built_baseline_digest is None:
-                    built_baseline_digest = await retry_async(
-                        lambda: asyncio.to_thread(self.runner.build, baseline_spec),
-                        attempts=self.cfg.build_retry_attempts,
-                        base_delay=self.cfg.retry_base_delay_seconds,
-                        max_delay=self.cfg.retry_max_delay_seconds,
+            # A pre-deadline trial build of the running competition may hold the
+            # sandbox runtime: wait for it instead of sharing the runtime with it.
+            async with self._sandbox_lock:
+                # Every declared baseline is built before the chain claim. Persist the
+                # process-local Modal runtime fence first so even this pre-enrollment
+                # handle has explicit provenance; report/Docker runners are a no-op.
+                if not await self._ensure_fresh_modal_runtime(
+                    competition_id, Phase.SCHEDULED, at
+                ):
+                    raise ValueError(
+                        "the baseline runtime could not be bound before its "
+                        "pre-enrollment build; no chain write was attempted"
                     )
-            except Exception as exc:
-                raise ValueError(
-                    "the baseline could not be prebuilt before anchoring; no "
-                    f"chain write was attempted: {exc}"
-                ) from exc
-            if built_baseline_digest != manifest.baseline.image_digest:
-                raise ValueError(
-                    "the archived baseline image identity does not match the image "
-                    f"rebuilt by this fresh runner: registry={manifest.baseline.image_digest}, "
-                    f"rebuilt={built_baseline_digest}"
+                baseline_spec = ContenderSpec(
+                    contender_id=0,
+                    repo_url=manifest.baseline.repo_url,
+                    commit_sha=manifest.baseline.commit_sha,
+                    tree_sha=manifest.baseline.tree_sha,
                 )
-            if (
-                baseline_image_digest is not None
-                and built_baseline_digest != baseline_image_digest
-            ):
-                raise ValueError(
-                    "baseline_image_digest does not match the image prebuilt by this "
-                    f"fresh runner: expected {built_baseline_digest}"
-                )
-            baseline_image_digest = built_baseline_digest
-            with pers.txn(self.conn):
-                self._record_modal_image_binding(
-                    competition_id,
-                    baseline_spec,
-                    baseline_image_digest,
-                    is_calibration=True,
-                    now=at,
-                )
+                try:
+                    built_baseline_digest: str | None = None
+                    modal_controls = self._modal_image_controls()
+                    if modal_controls is not None:
+                        if baseline_image_digest is not None:
+                            binding = pers.latest_modal_image_binding(
+                                self.conn,
+                                competition_id,
+                                baseline_image_digest,
+                                is_calibration=True,
+                            )
+                        else:
+                            binding = pers.latest_modal_calibration_binding(
+                                self.conn, competition_id
+                            )
+                        if binding is not None:
+                            bound_digest = binding.get("image_digest")
+                            if not isinstance(bound_digest, str):
+                                raise ValueError(
+                                    "persisted baseline Modal image digest is malformed"
+                                )
+                            self._require_modal_binding_matches(
+                                binding,
+                                baseline_spec,
+                                bound_digest,
+                                is_calibration=True,
+                            )
+                            built_baseline_digest = await self._restore_bound_modal_image(
+                                competition_id,
+                                baseline_spec,
+                                bound_digest,
+                                is_calibration=True,
+                            )
+                    if built_baseline_digest is None:
+                        built_baseline_digest = await retry_async(
+                            lambda: asyncio.to_thread(self.runner.build, baseline_spec),
+                            attempts=self.cfg.build_retry_attempts,
+                            base_delay=self.cfg.retry_base_delay_seconds,
+                            max_delay=self.cfg.retry_max_delay_seconds,
+                        )
+                except Exception as exc:
+                    raise ValueError(
+                        "the baseline could not be prebuilt before anchoring; no "
+                        f"chain write was attempted: {exc}"
+                    ) from exc
+                if built_baseline_digest != manifest.baseline.image_digest:
+                    raise ValueError(
+                        "the archived baseline image identity does not match the image "
+                        f"rebuilt by this fresh runner: registry={manifest.baseline.image_digest}, "
+                        f"rebuilt={built_baseline_digest}"
+                    )
+                if (
+                    baseline_image_digest is not None
+                    and built_baseline_digest != baseline_image_digest
+                ):
+                    raise ValueError(
+                        "baseline_image_digest does not match the image prebuilt by this "
+                        f"fresh runner: expected {built_baseline_digest}"
+                    )
+                baseline_image_digest = built_baseline_digest
+                with pers.txn(self.conn):
+                    self._record_modal_image_binding(
+                        competition_id,
+                        baseline_spec,
+                        baseline_image_digest,
+                        is_calibration=True,
+                        now=at,
+                    )
         base = manifest.baseline
         payload = build_competition_commitment(
             CompetitionCommitment(
@@ -3765,7 +4630,10 @@ class Orchestrator(BaseService):
     ) -> int:
         """Seed a manifest-bound evaluation item.
 
-        The miner-visible ``input_path`` is staged as ``CHALLENGE_INPUT``.  An
+        The miner-visible ``input_path`` is hashed and staged in the LOCAL digest
+        pool only. It is a hidden item until the result: it is uploaded to the public
+        ``challenge_input`` prefix by ``_publish_due_competition_artifacts`` once the
+        result is due, never at registration.  An
         upscaling, removal or interpolation item additionally requires a distinct
         pristine ``reference_path`` (removal: the clean clip under the object;
         interpolation: the full-frame-rate clip);
@@ -3775,12 +4643,14 @@ class Orchestrator(BaseService):
         """
         manifest = repo.get_manifest(self.conn, competition_id)
         src = Path(input_path)
-        input_ref = self.store.put_file(src, ArtifactKind.CHALLENGE_INPUT)
-        digest = input_ref.digest
-        input_bytes = input_ref.byte_size
+        digest, input_bytes = _hash_file(src)
         pooled = self.inputs_dir / digest
         if not pooled.exists():
             shutil.copy2(src, pooled)
+        if _hash_file(pooled) != (digest, input_bytes):
+            raise RuntimeError(
+                f"pooled competition input {pooled} does not hold the bytes it is named after"
+            )
 
         reference_digest: str | None = None
         reference_bytes: int | None = None
@@ -3955,6 +4825,77 @@ def _assert_packet_identity_not_reserved(packet_bytes: bytes) -> None:
         assert_not_reserved(identity, what="the scoring worker's returned packet")
 
 
+def _short(text: str, *, limit: int = 300) -> str:
+    """One operator-safe line: control characters dropped, length bounded."""
+    cleaned = " ".join(
+        "".join(ch if ch.isprintable() else " " for ch in text).split()
+    )
+    return cleaned if len(cleaned) <= limit else cleaned[: limit - 3] + "..."
+
+
+def _is_regular(path: Path) -> bool:
+    try:
+        safeio.lstat_regular(path, what="file")
+    except (OSError, UnsafePathError):
+        return False
+    return True
+
+
+#: Git/forge messages that mean the reader account cannot read the repository
+#: (deleted, renamed, made private, never shared with the reader).
+_UNREADABLE_RE = re.compile(
+    r"repository not found|repository '[^']*' not found|returned error: 40[34]"
+    r"|no local checkout registered|no local repository directory"
+)
+#: ...that the commit is not on the remote (not pushed, force-pushed away).
+_COMMIT_MISSING_RE = re.compile(
+    r"not our ref|unadvertised object|couldn't find remote ref|no such remote ref"
+    r"|remote did not send all necessary objects|fetched commit|checked-out head"
+    r"|commit pin"
+)
+#: ...that OUR side failed (reader credential, network, TLS, Git itself).
+_OURS_RE = re.compile(
+    r"authentication failed|invalid username or token|could not start git"
+    r"|could not resolve host|failed to connect|connection (?:reset|refused|timed out)"
+    r"|operation timed out|ssl certificate|ssl connect|gnutls|tls handshake"
+    r"|returned error: 5\d\d"
+)
+
+
+def _precheck_checkout_problem(exc: BaseException) -> tuple[str, str]:
+    """Map a checkout failure to ``(problem code, short detail)``.
+
+    A checkout the source itself broke (CheckoutRejectedError: commit/tree
+    mismatch, unsafe tree, over the cap) is the entry's problem. A plain
+    CheckoutError is classified by Git's message, and anything we cannot attribute
+    to the entry is ``check_unavailable`` (or ``fetch_timeout``, which may be ours).
+    """
+    text = str(exc)
+    lowered = text.lower()
+    detail = _short(text)
+    if isinstance(exc, CheckoutRejectedError):
+        if "tree" in lowered and "does not match" in lowered:
+            return "tree_mismatch", detail
+        if _COMMIT_MISSING_RE.search(lowered):
+            return "commit_missing", detail
+        if "checkout cap" in lowered or "over the cap" in lowered:
+            return "over_size_cap", detail
+        if "unsafe" in lowered or "gitmodules" in lowered:
+            return "unsafe_tree", detail
+        return "checkout_rejected", detail
+    if isinstance(exc, CheckoutError):
+        if "exceeded the bounded" in lowered:
+            return "fetch_timeout", detail
+        if _UNREADABLE_RE.search(lowered):
+            return "repo_unreadable", detail
+        if _COMMIT_MISSING_RE.search(lowered):
+            return "commit_missing", detail
+        if _OURS_RE.search(lowered):
+            return "check_unavailable", detail
+        return "check_unavailable", detail
+    return "check_unavailable", _short(f"{type(exc).__name__}: {text}")
+
+
 def _submission_reject_reason(exc: BaseException) -> str:
     """The rejection reason recorded when a submission is unusable BY ITS OWN DOING.
 
@@ -4026,3 +4967,18 @@ def _probe_json(report: Any) -> str:
         },
         sort_keys=True,
     )
+
+
+def _caused_by_checkout(exc: BaseException) -> bool:
+    """Whether a build failure came from fetching the entry's source (a plain
+    ``CheckoutError`` anywhere in its cause chain), not from the runtime."""
+    from vidaio.competition.runners.errors import CheckoutError
+
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        if isinstance(current, CheckoutError):
+            return True
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return False

@@ -442,8 +442,18 @@ def test_faithful_upscaling_selector_comes_from_the_anchored_manifest(tmp_path) 
     bundle, artifacts = _faithful_upscaling_bundle(scoring=None)
     assert "scoring" not in RealScoreRecomputer._reconstruct_params(bundle, artifacts, packet)
     bundle, artifacts = _faithful_upscaling_bundle(scoring="generative")
+    assert RealScoreRecomputer._reconstruct_params(bundle, artifacts, packet)["scoring"] == "generative"
+    bundle, artifacts = _faithful_upscaling_bundle(scoring="inference")
     with pytest.raises(RuntimeError, match="unknown upscaling scorer"):
         RealScoreRecomputer._reconstruct_params(bundle, artifacts, packet)
+
+
+def test_generative_upscaling_item_is_recomputable_without_pieapp(tmp_path) -> None:
+    # the generative scorer measures against the sealed original too: no PieAPP
+    recomputer = _recomputer_with_unconfigured_pieapp(tmp_path)
+    bundle, artifacts = _faithful_upscaling_bundle(scoring="generative")
+    assert recomputer.unsupported_reason(bundle, artifacts) is None
+    assert recomputer.unsupported_reason(bundle, artifacts, track="upscaling") is None
 
 
 def test_streaming_rules_come_from_the_anchored_compression_manifest() -> None:

@@ -254,6 +254,10 @@ SCORER_REQUIRED_PAYOUT_BACKENDS = frozenset(
         "interpolation_metrics",
         # faithful upscaling scoring (competition track): frame metrics vs the sealed original
         "upscaling_faithful_metrics",
+        # generative upscaling scoring (competition track): perceptual/temporal/NR metrics
+        # and the digest of their pinned weight files
+        "upscaling_generative_metrics",
+        "generative_weights",
         # streaming compression (competition track): packet sizes, timestamps, keyframes
         "streaming_packets",
         "lpips",

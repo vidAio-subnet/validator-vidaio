@@ -654,6 +654,8 @@ class CompetitionRulesInput(BaseModel):
     speed_fast_spf: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     speed_slow_spf: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     speed_inserted_frames: int | None = Field(default=None, ge=1)
+    # Failed-item limit (generative upscaling, competition 006). Same omission rule.
+    max_failed_item_fraction: float | None = Field(default=None, ge=0, lt=1, allow_inf_nan=False)
 
     @property
     def has_speed_term(self) -> bool:
@@ -698,7 +700,7 @@ class CompetitionRulesInput(BaseModel):
             "podium_min_margin": self.podium_min_margin,
             "podium_min_score": self.podium_min_score,
         }
-        for name in self._POLICY_FIELDS + self._SPEED_FIELDS:
+        for name in self._POLICY_FIELDS + self._SPEED_FIELDS + ("max_failed_item_fraction",):
             value = getattr(self, name)
             if value is not None:
                 obj[name] = list(value) if isinstance(value, tuple) else value

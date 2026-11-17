@@ -90,6 +90,9 @@ from vidaio.services.protocol import ScoreRequest
 
 #: The version string unconfigured backend stubs stamp (see backends_real).
 _UNCONFIGURED = "not-configured"
+#: Upscaling scorers selected by the anchored manifest that measure against the sealed
+#: original and need no PieAPP (vidaio/scoring/upscaling_faithful.py, upscaling_generative.py).
+_REFERENCE_SCORED_UPSCALING = frozenset({"faithful", "generative"})
 _VALIDATOR_ZERO_SCORER_NAME = "validator-zero/1"
 _EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 
@@ -280,8 +283,9 @@ class RealScoreRecomputer:
 
     @staticmethod
     def _faithful_upscaling(artifacts: Mapping[ArtifactKind, ArtifactPayload]) -> bool:
-        """The committed competition manifest selects the faithful upscaling scorer, which
-        needs no PieAPP (frame metrics against the sealed original)."""
+        """The committed competition manifest selects a reference-scored upscaling scorer
+        (faithful or generative), which needs no PieAPP (metrics against the sealed
+        original)."""
         raw = artifacts.get(ArtifactKind.MANIFEST)
         if raw is None or isinstance(raw, Path):
             return False
@@ -289,7 +293,7 @@ class RealScoreRecomputer:
             manifest = json.loads(raw)
         except (TypeError, ValueError):
             return False
-        return isinstance(manifest, dict) and manifest.get("upscaling_scoring") == "faithful"
+        return isinstance(manifest, dict) and manifest.get("upscaling_scoring") in _REFERENCE_SCORED_UPSCALING
 
     @staticmethod
     def _track(artifacts: Mapping[ArtifactKind, ArtifactPayload]) -> str:
@@ -980,7 +984,7 @@ class RealScoreRecomputer:
                 scoring = manifest.get("upscaling_scoring")
                 if scoring is not None:
                     # The scorer selector comes from the anchored manifest, never the packet.
-                    if scoring != "faithful":
+                    if scoring not in _REFERENCE_SCORED_UPSCALING:
                         raise RuntimeError(
                             f"competition manifest names an unknown upscaling scorer {scoring!r}"
                         )

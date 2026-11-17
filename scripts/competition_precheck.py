@@ -4,7 +4,7 @@
     python scripts/competition_precheck.py /path/to/your/repo [--commit <sha>]
 
 It applies the rules the evaluator enforces on a submission tree and the limits of the
-sandbox image builder (docs/MINING.md, "The competition track"), so a Dockerfile that
+sandbox image builder (docs/MINING.md, "Checklist"), so a Dockerfile that
 builds with Docker locally but not in the sandbox is caught before the deadline:
 
 - the tree is at most 512 MiB, holds only regular files and directories (no symlinks,

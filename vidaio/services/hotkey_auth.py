@@ -220,6 +220,20 @@ class RegisteredHotkeyRegistry:
         entry = self._entries().get(hotkey)
         return entry.alpha_stake if entry is not None else None
 
+    def chain_snapshot_fresh(self, max_age_seconds: float) -> bool:
+        """Whether the chain's last SUCCESSFUL metagraph read is at most
+        ``max_age_seconds`` old.
+
+        The production adapter's ``refresh()`` never raises: on failure it keeps
+        its cached neurons, so this registry's own refresh time moves on even when
+        no new chain state arrived. A decision that must not act on old stakes asks
+        the chain itself. A chain without the freshness API counts as fresh.
+        """
+        check = getattr(self._chain, "has_fresh_snapshot", None)
+        if not callable(check):
+            return True
+        return bool(check(time.time(), max_age_seconds))
+
 
 def _canonical_request_digest(
     *, method: str, path: str, body: bytes, timestamp: int, nonce: str, hotkey: str

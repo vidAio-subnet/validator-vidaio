@@ -83,6 +83,9 @@ class ReasonCode(StrEnum):
     STREAMING_BITRATE_EXCEEDED = "STREAMING_BITRATE_EXCEEDED"
     STREAMING_PEAK_EXCEEDED = "STREAMING_PEAK_EXCEEDED"
     STREAMING_KEYFRAME_INTERVAL = "STREAMING_KEYFRAME_INTERVAL"
+    # generative upscaling (vidaio/scoring/upscaling_generative.py)
+    LOWRES_INCONSISTENT = "LOWRES_INCONSISTENT"
+    COLOR_SHIFT_EXCEEDED = "COLOR_SHIFT_EXCEEDED"
 
 
 class ValidityViolation(BaseModel):
@@ -152,6 +155,11 @@ class GateContext:
     #: measured against the sealed original, so the VMAF, size-cap and perceptual gates of
     #: the PieAPP upscaling formula do not apply.
     upscaling_faithful: bool = False
+    #: Generative competition upscaling (vidaio/scoring/upscaling_generative.py): perceptual,
+    #: temporal and no-reference metrics against the sealed original, with the low-resolution
+    #: consistency and colour gates (:func:`upscaling_generative_violations`) instead of the
+    #: VMAF, size-cap and perceptual gates of the PieAPP upscaling formula.
+    upscaling_generative: bool = False
     #: Streaming compression (vidaio/scoring/streaming.py): quality at a bitrate budget. The
     #: budget and delivery rules replace the compression VMAF floor and size-ratio gates.
     streaming: bool = False
@@ -163,6 +171,11 @@ class GateContext:
     #: Measured CPU perceptual results, retained so the score packet records
     #: successful checks as well as violations.
     perceptual_results: dict[str, PerceptualCheckResult] = field(default_factory=dict)
+
+    @property
+    def reference_scored_upscaling(self) -> bool:
+        """Competition upscaling measured against the sealed original (faithful or generative)."""
+        return self.upscaling_faithful or self.upscaling_generative
 
     @property
     def effective_input(self) -> MediaInfo:
@@ -227,8 +240,8 @@ class FileSizeCapGate:
     name = "file_size_cap"
 
     def check(self, ctx: GateContext) -> list[ValidityViolation]:
-        if ctx.track != TRACK_UPSCALING or ctx.upscaling_faithful:
-            return []  # faithful scoring compares with the original; output size is free
+        if ctx.track != TRACK_UPSCALING or ctx.reference_scored_upscaling:
+            return []  # faithful/generative scoring compares with the original; size is free
         caps = ctx.config.file_size_caps
         if ctx.upscale_factor is None:
             return [
@@ -306,8 +319,8 @@ class VmafFloorGate:
     name = "vmaf_floor"
 
     def check(self, ctx: GateContext) -> list[ValidityViolation]:
-        if ctx.track in (TRACK_REMOVAL, TRACK_INTERPOLATION) or ctx.upscaling_faithful:
-            return []  # region / inserted-frame / faithful-upscale metrics, no VMAF term
+        if ctx.track in (TRACK_REMOVAL, TRACK_INTERPOLATION) or ctx.reference_scored_upscaling:
+            return []  # region / inserted-frame / faithful or generative upscale metrics, no VMAF
         if ctx.streaming:
             # quality at the budget is the score itself; a missing VMAF is caught by the
             # model-delta gate and leaves no breakdown
@@ -353,8 +366,8 @@ class VmafModelDeltaGate:
     name = "vmaf_model_delta"
 
     def check(self, ctx: GateContext) -> list[ValidityViolation]:
-        if ctx.track in (TRACK_REMOVAL, TRACK_INTERPOLATION) or ctx.upscaling_faithful:
-            return []  # no VMAF runs on the removal, interpolation and faithful-upscaling tracks
+        if ctx.track in (TRACK_REMOVAL, TRACK_INTERPOLATION) or ctx.reference_scored_upscaling:
+            return []  # no VMAF runs on removal, interpolation, faithful and generative upscaling
         violations: list[ValidityViolation] = []
         delta_pair_supplied = (
             ctx.vmaf_delta_primary is not None or ctx.vmaf_delta_secondary is not None
@@ -451,6 +464,17 @@ class _PerceptualGate:
                 )
             )
             return []
+        if ctx.upscaling_generative:
+            # The output is measured against the sealed original; the low-resolution
+            # consistency gate (against the served input) and the CIEDE2000 colour gate
+            # (against the original) rule out tone, grayscale and chroma manipulation.
+            ctx.skips.append(
+                GateSkip(
+                    gate=self.name,
+                    detail="generative upscaling: the low-resolution consistency and colour gates apply instead",
+                )
+            )
+            return []
         if ctx.track == TRACK_INTERPOLATION:
             # The output carries twice the input's frames, so whole-clip comparisons
             # against the served input do not line up. The input frames must come back
@@ -537,6 +561,50 @@ class GatePipeline:
         for gate in self.gates:
             violations.extend(gate.check(ctx))
         return (len(violations) == 0, violations)
+
+
+def upscaling_generative_violations(
+    *, lowres_psnr_db: float, color_delta_e: float, config: ScoringConfig
+) -> list[ValidityViolation]:
+    """The two per-clip gates of generative upscaling (fail closed on non-finite values).
+
+    * low-resolution consistency: the output, Lanczos-downscaled to the served input's
+      geometry, must agree with the input once both are blurred (luma PSNR at least
+      ``max(upscaling_generative_lowres_psnr_min_db, upscaling_generative_lowres_psnr_floor_db)``):
+      invented structure the input does not support, shifted geometry or a different
+      exposure fail it;
+    * colour: the mean CIEDE2000 against the sealed original on area-downscaled frames is
+      at most ``upscaling_generative_color_delta_e_max``.
+    """
+    violations: list[ValidityViolation] = []
+    threshold = max(
+        config.upscaling_generative_lowres_psnr_min_db,
+        config.upscaling_generative_lowres_psnr_floor_db,
+    )
+    if not math.isfinite(lowres_psnr_db):
+        violations.append(_non_finite_violation("lowres_psnr_db", lowres_psnr_db))
+    elif lowres_psnr_db < threshold:
+        violations.append(
+            ValidityViolation(
+                code=ReasonCode.LOWRES_INCONSISTENT,
+                detail="the downscaled output does not match the served input",
+                measured=lowres_psnr_db,
+                limit=threshold,
+            )
+        )
+    limit = config.upscaling_generative_color_delta_e_max
+    if not math.isfinite(color_delta_e):
+        violations.append(_non_finite_violation("color_delta_e", color_delta_e))
+    elif color_delta_e > limit:
+        violations.append(
+            ValidityViolation(
+                code=ReasonCode.COLOR_SHIFT_EXCEEDED,
+                detail="mean CIEDE2000 against the original exceeds the limit",
+                measured=color_delta_e,
+                limit=limit,
+            )
+        )
+    return violations
 
 
 def _structural_gates() -> list[Gate]:

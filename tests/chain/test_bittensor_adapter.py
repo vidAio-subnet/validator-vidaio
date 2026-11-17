@@ -2834,11 +2834,62 @@ def test_sdk_caught_transport_error_stays_ambiguous_but_rejections_do_not():
     pool_rejection = _parse_chain_result(
         FakeExtrinsicResponse(
             False,
-            "Transaction is already imported",
-            error=RuntimeError("Transaction is already imported"),
+            "Priority is too low",
+            error=RuntimeError("Priority is too low: (1 vs 1)"),
         )
     )
     assert pool_rejection.transport_error is None
+
+
+class SubstrateRequestException(Exception):
+    """Name-alike of async_substrate_interface's pool-error exception."""
+
+
+def test_already_imported_is_a_replayed_submit_not_a_rejection():
+    # Production 2026-11-16/17: the substrate layer re-sent the same signed CRv4
+    # commit, the node answered 1013 "Transaction Already Imported", and the first
+    # copy was on chain at the reported block every time. That answer must take
+    # the ambiguity/readback path, never settle the intent as chain_rejected.
+    error = SubstrateRequestException("Transaction Already Imported")
+    replayed = _parse_chain_result(
+        FakeExtrinsicResponse(
+            False,
+            "Subtensor returned `SubstrateRequestException(Transaction Already"
+            " Imported)` error.",
+            error=error,
+        )
+    )
+    assert replayed.success is False
+    assert replayed.transport_error is error
+
+    # Wrapper classes do not change what the pool said about these exact bytes.
+    class ChainTransactionError(Exception):
+        pass
+
+    wrapped = ChainTransactionError("Transaction is already imported")
+    assert (
+        _parse_chain_result(
+            FakeExtrinsicResponse(False, "already imported", error=wrapped)
+        ).transport_error
+        is wrapped
+    )
+
+
+def test_real_transport_raises_already_imported_so_the_caller_reads_back():
+    class WriteSdk:
+        def set_weights(self, **kwargs):
+            return FakeExtrinsicResponse(
+                False,
+                "Transaction Already Imported",
+                error=SubstrateRequestException("Transaction Already Imported"),
+            )
+
+        def commit_reveal_enabled(self, *, netuid):
+            return True
+
+    transport = _real_transport_with(WriteSdk())
+    with pytest.raises(SubstrateRequestException, match="Already Imported"):
+        transport.set_weights(netuid=1, uids=[2], weights=[U16_MAX], version_key=12)
 
 
 def test_real_transport_set_weights_disables_mev_and_preserves_error_boundary():

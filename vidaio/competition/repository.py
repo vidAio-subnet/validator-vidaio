@@ -46,6 +46,39 @@ class EnrollmentError(Exception):
     """Enrollment rejected: wrong phase, past deadline, or stake below the gate."""
 
 
+class EnrollmentClosedError(EnrollmentError):
+    """The competition is not ENROLLING, or its enrollment deadline has passed."""
+
+
+class AlreadyEnrolledError(EnrollmentError):
+    """The hotkey already holds an ENROLLED entry and did not ask to replace it."""
+
+    def __init__(self, message: str, *, contender_id: int, commit_sha: str) -> None:
+        super().__init__(message)
+        self.contender_id = contender_id
+        self.commit_sha = commit_sha
+
+
+class EntryNotReplaceableError(EnrollmentError):
+    """The hotkey's entry is no longer ENROLLED (withdrawn, rejected, ...): final."""
+
+    def __init__(self, message: str, *, contender_id: int, status: str) -> None:
+        super().__init__(message)
+        self.contender_id = contender_id
+        self.status = status
+
+
+class NotEnrolledError(EnrollmentError):
+    """The hotkey holds no entry in this competition."""
+
+
+#: An entry's pinned version was replaced in place before the deadline.
+EVENT_ENTRY_REPLACED = "contender_entry_replaced"
+#: The entrant withdrew its entry before the deadline (status REJECTED, final).
+EVENT_WITHDRAWN = "contender_withdrawn"
+WITHDRAWN_REASON = "withdrawn by the miner"
+
+
 class ScorePacketError(Exception):
     """Score packet rejected: unparseable, violates the gates-first invariant, or its
     identity (miner hotkey / challenge id / item id) does not match the row being
@@ -132,6 +165,8 @@ class ContenderRecord:
     length_coverage: float | None
     average_vmaf: float | None
     average_compression_rate: float | None
+    created_at: str | None = None
+    updated_at: str | None = None
 
     @staticmethod
     def from_row(row: sqlite3.Row) -> "ContenderRecord":
@@ -156,6 +191,8 @@ class ContenderRecord:
             length_coverage=row["length_coverage"],
             average_vmaf=row["average_vmaf"],
             average_compression_rate=row["average_compression_rate"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
         )
 
 
@@ -280,20 +317,77 @@ def enroll_contender(
     """Enroll a real (earning-eligible) contender during ENROLLING.
 
     Enforces the phase, the enrollment deadline, and the alpha-stake gate from the
-    manifest (spec §04: minimum_alpha_stake controls enrollment eligibility).
+    manifest (spec §04: minimum_alpha_stake controls enrollment eligibility). A
+    hotkey holds at most one entry per competition: a second enrollment raises
+    AlreadyEnrolledError (see submit_contender_entry for replacing it).
     """
+    _require_open_enrollment(conn, competition_id, now, stake=stake)
+    existing = find_contender_by_hotkey(conn, competition_id, hotkey)
+    if existing is not None:
+        raise _already_enrolled(existing)
+    return _insert_contender(
+        conn,
+        competition_id,
+        hotkey=hotkey,
+        repo_url=repo_url,
+        commit_sha=commit_sha,
+        tree_sha=tree_sha,
+        stake=stake,
+        now=now,
+    )
+
+
+def _require_open_enrollment(
+    conn: sqlite3.Connection, competition_id: str, now: datetime, *, stake: float | None
+) -> CompetitionRecord:
+    """The phase and deadline checks every entry change shares (plus the manifest
+    stake floor when ``stake`` is given)."""
     comp = get_competition(conn, competition_id)
     if comp is None:
         raise EnrollmentError(f"unknown competition {competition_id}")
     if comp.status is not Phase.ENROLLING:
-        raise EnrollmentError(f"competition {competition_id} is {comp.status}, not ENROLLING")
-    if now > comp.enrollment_deadline:
-        raise EnrollmentError("enrollment deadline has passed")
-    manifest = get_manifest(conn, competition_id)
-    if stake < manifest.minimum_alpha_stake:
-        raise EnrollmentError(
-            f"stake {stake} below minimum_alpha_stake {manifest.minimum_alpha_stake}"
+        raise EnrollmentClosedError(
+            f"competition {competition_id} is {comp.status}, not ENROLLING"
         )
+    if now > comp.enrollment_deadline:
+        raise EnrollmentClosedError("enrollment deadline has passed")
+    if stake is not None:
+        manifest = get_manifest(conn, competition_id)
+        if stake < manifest.minimum_alpha_stake:
+            raise EnrollmentError(
+                f"stake {stake} below minimum_alpha_stake {manifest.minimum_alpha_stake}"
+            )
+    return comp
+
+
+def _already_enrolled(existing: "ContenderRecord") -> EnrollmentError:
+    if existing.status != "ENROLLED":
+        return EntryNotReplaceableError(
+            f"this hotkey's entry (contender {existing.contender_id}) is "
+            f"{existing.status} and can no longer be changed in this competition",
+            contender_id=existing.contender_id,
+            status=existing.status,
+        )
+    return AlreadyEnrolledError(
+        f"this hotkey is already enrolled as contender {existing.contender_id}, "
+        f"commit {existing.commit_sha[:7]}; add --replace to change it before the "
+        "deadline",
+        contender_id=existing.contender_id,
+        commit_sha=existing.commit_sha,
+    )
+
+
+def _insert_contender(
+    conn: sqlite3.Connection,
+    competition_id: str,
+    *,
+    hotkey: str,
+    repo_url: str,
+    commit_sha: str,
+    tree_sha: str,
+    stake: float,
+    now: datetime,
+) -> int:
     ts = iso(now)
     cur = conn.execute(
         """INSERT INTO contenders
@@ -310,6 +404,149 @@ def enroll_contender(
         payload={"contender_id": cur.lastrowid, "hotkey": hotkey},
     )
     return int(cur.lastrowid)  # type: ignore[arg-type]
+
+
+@dataclass(frozen=True)
+class EntryOutcome:
+    """What one signed entry submission did."""
+
+    contender_id: int
+    #: ``enrolled`` (new row), ``replaced`` (pinned version changed in place) or
+    #: ``unchanged`` (replace asked for the version already pinned: idempotent)
+    action: str
+    previous_repo_url: str | None = None
+    previous_commit_sha: str | None = None
+    previous_tree_sha: str | None = None
+
+
+def find_contender_by_hotkey(
+    conn: sqlite3.Connection, competition_id: str, hotkey: str
+) -> "ContenderRecord | None":
+    row = conn.execute(
+        "SELECT * FROM contenders WHERE competition_id = ? AND hotkey = ?",
+        (competition_id, hotkey),
+    ).fetchone()
+    return ContenderRecord.from_row(row) if row is not None else None
+
+
+def submit_contender_entry(
+    conn: sqlite3.Connection,
+    competition_id: str,
+    *,
+    hotkey: str,
+    repo_url: str,
+    commit_sha: str,
+    tree_sha: str,
+    stake: float,
+    now: datetime,
+    replace: bool,
+) -> EntryOutcome:
+    """Enroll a hotkey, or replace its ENROLLED entry IN PLACE before the deadline.
+
+    The same phase, deadline and stake checks as :func:`enroll_contender` apply to
+    both. A replacement keeps the ``contender_id`` and rewrites the pinned repo,
+    commit and tree (and the stake read at this request): nothing reads an entry
+    before the deadline, and everything after it reads the row as it then stands.
+    An entry that is no longer ENROLLED (withdrawn or rejected) is final. Asking to
+    replace an entry with the version it already pins changes nothing.
+    """
+    _require_open_enrollment(conn, competition_id, now, stake=stake)
+    existing = find_contender_by_hotkey(conn, competition_id, hotkey)
+    if existing is None:
+        contender_id = _insert_contender(
+            conn,
+            competition_id,
+            hotkey=hotkey,
+            repo_url=repo_url,
+            commit_sha=commit_sha,
+            tree_sha=tree_sha,
+            stake=stake,
+            now=now,
+        )
+        return EntryOutcome(contender_id=contender_id, action="enrolled")
+    if existing.status != "ENROLLED" or not replace:
+        raise _already_enrolled(existing)
+    previous = dict(
+        previous_repo_url=existing.repo_url,
+        previous_commit_sha=existing.commit_sha,
+        previous_tree_sha=existing.tree_sha,
+    )
+    if (existing.repo_url, existing.commit_sha, existing.tree_sha) == (
+        repo_url,
+        commit_sha,
+        tree_sha,
+    ):
+        return EntryOutcome(
+            contender_id=existing.contender_id, action="unchanged", **previous
+        )
+    cur = conn.execute(
+        "UPDATE contenders SET repo_url = ?, commit_sha = ?, tree_sha = ?,"
+        " enrollment_stake = ?, updated_at = ?"
+        " WHERE contender_id = ? AND status = 'ENROLLED' AND is_calibration = 0",
+        (repo_url, commit_sha, tree_sha, stake, iso(now), existing.contender_id),
+    )
+    if cur.rowcount != 1:  # defensive: the row changed under us
+        raise EnrollmentError(
+            f"contender {existing.contender_id} could not be replaced; retry"
+        )
+    record_event(
+        conn,
+        competition_id,
+        EVENT_ENTRY_REPLACED,
+        now,
+        payload={
+            "contender_id": existing.contender_id,
+            "hotkey": hotkey,
+            "previous_repo_url": existing.repo_url,
+            "repo_url": repo_url,
+            "previous_commit_sha": existing.commit_sha,
+            "commit_sha": commit_sha,
+            "previous_tree_sha": existing.tree_sha,
+            "tree_sha": tree_sha,
+        },
+    )
+    return EntryOutcome(
+        contender_id=existing.contender_id, action="replaced", **previous
+    )
+
+
+def withdraw_contender(
+    conn: sqlite3.Connection, competition_id: str, *, hotkey: str, now: datetime
+) -> int:
+    """The entrant takes its own ENROLLED entry out before the deadline.
+
+    The row becomes REJECTED with the reason "withdrawn by the miner". It is final
+    for that hotkey in that competition: a REJECTED entry can be neither replaced
+    nor enrolled again (one row per hotkey). Returns the contender id.
+    """
+    _require_open_enrollment(conn, competition_id, now, stake=None)
+    existing = find_contender_by_hotkey(conn, competition_id, hotkey)
+    if existing is None:
+        raise NotEnrolledError("this hotkey is not enrolled in this competition")
+    if existing.status != "ENROLLED":
+        raise EntryNotReplaceableError(
+            f"this hotkey's entry (contender {existing.contender_id}) is "
+            f"{existing.status}; only an ENROLLED entry can be withdrawn",
+            contender_id=existing.contender_id,
+            status=existing.status,
+        )
+    conn.execute(
+        "UPDATE contenders SET status = 'REJECTED', updated_at = ?"
+        " WHERE contender_id = ? AND status = 'ENROLLED'",
+        (iso(now), existing.contender_id),
+    )
+    record_event(
+        conn,
+        competition_id,
+        EVENT_WITHDRAWN,
+        now,
+        payload={
+            "contender_id": existing.contender_id,
+            "hotkey": hotkey,
+            "reason": WITHDRAWN_REASON,
+        },
+    )
+    return existing.contender_id
 
 
 def insert_calibration_contender(

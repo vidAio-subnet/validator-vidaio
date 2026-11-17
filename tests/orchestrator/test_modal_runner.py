@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Sequence
@@ -134,6 +135,7 @@ class _Lease:
             )
         if list(args[:2]) == ["du", "-sxb"]:
             self.runtime.du_calls.append(tuple(args))
+            self.runtime.du_timeouts.append(timeout_seconds)
             total = (
                 b""
                 if self.runtime.du_returncode
@@ -235,12 +237,15 @@ class _Runtime:
         self.returncode = 0
         self.sandbox_gone_after_exit = False
         self.bad_network_attestation = False
+        #: a provider that hands back a different GPU than the one requested
+        self.attested_gpu: str | None = None
         self.restored_image_ids: list[str] = []
         self.probe_input_write = "1"
         self.probe_overlay_mutated = "0"
         self.image_bytes = 5_000_000_000
         self.du_returncode = 0
         self.du_calls: list[tuple[str, ...]] = []
+        self.du_timeouts: list[float] = []
         self.listed_inputs: list[list[str]] = []
 
     def available(self) -> bool:
@@ -278,7 +283,9 @@ class _Runtime:
             volume_mounts=(),
             network_filesystem_mounts=(),
             ports=(),
-            gpu=kwargs["gpu"] if isinstance(kwargs["gpu"], str) else None,
+            gpu=(
+                (self.attested_gpu or kwargs["gpu"]) if isinstance(kwargs["gpu"], str) else None
+            ),
         )
         lease = _Lease(self, f"sb-fresh-{len(self.leases) + 1}", request)
         self.leases.append(lease)
@@ -648,6 +655,30 @@ def test_build_releases_fresh_checkout_only_after_modal_consumes_context(
         )
     )
     assert events == ["checkout", "modal-build-complete", "release"]
+
+
+def test_competition_gpu_is_requested_for_probe_and_contender_sandboxes(tmp_path: Path):
+    runtime = _Runtime()
+    runner, spec = _make_runner(
+        tmp_path, runtime, gpu="A100-80GB", output_poll_seconds=0.001
+    )
+    assert runner.gpu == "A100-80GB"
+    digest = runner.build(spec)
+    assert runner.isolation_probe(digest).passed
+    runner.run_batch(digest, [_stage(runner, b"0123456789abcdef")], 0)
+    gpus = {str(call["role"]): call["gpu"] for call in runtime.create_calls}
+    assert gpus["probe"] == gpus["contender"] == "A100-80GB"
+    assert gpus["probe-overlay-check"] is None and gpus["collector"] is None
+
+
+def test_sandbox_attesting_another_gpu_fails_closed(tmp_path: Path):
+    runtime = _Runtime()
+    runtime.attested_gpu = "L4"
+    runner, spec = _make_runner(tmp_path, runtime, gpu="A100-80GB")
+    digest = runner.build(spec)
+    with pytest.raises(SandboxIsolationError, match="GPU 'L4' != required 'A100-80GB'"):
+        runner.isolation_probe(digest)
+    assert runtime.leases[0].terminated == 1
 
 
 def test_request_isolation_mismatch_fails_closed_and_terminates(tmp_path: Path):
@@ -1076,6 +1107,163 @@ def test_sdk_input_image_explicitly_includes_hidden_factor_sidecars(
     assert observed["app"] is runtime._app
 
 
+class _FakeImageBuildError(Exception):
+    def __init__(self, message: str, image_id: str) -> None:
+        super().__init__(message)
+        self.image_id = image_id
+
+
+def _failing_build_runtime(log_lines: list[str] | None):
+    """A ModalSdkRuntime whose image build fails like Modal's (no log text in the
+    exception, only the failed image id), with ``image.logs.fetch`` as in the SDK."""
+    observed: dict[str, object] = {}
+
+    class Entry:
+        def __init__(self, message: str) -> None:
+            self.message = message
+
+    class Logs:
+        def fetch(self, layers=1):
+            observed["layers"] = layers
+            for line in log_lines or []:
+                yield Entry(line)
+
+    class Builder:
+        def entrypoint(self, value):
+            return self
+
+        def cmd(self, value):
+            return self
+
+        def build(self, app):
+            raise _FakeImageBuildError(
+                "Image build for im-abc123 failed.\nView the build logs:\n"
+                "  modal image logs im-abc123",
+                "im-abc123",
+            )
+
+    if log_lines is not None:
+        Builder.logs = Logs()
+
+    class FakeImageApi:
+        @staticmethod
+        def from_dockerfile(*args, **kwargs):
+            return Builder()
+
+    class FakeException:
+        ImageBuildError = _FakeImageBuildError
+
+    class FakeModal:
+        Image = FakeImageApi
+        exception = FakeException
+
+    runtime = object.__new__(ModalSdkRuntime)
+    runtime._modal = FakeModal
+    runtime._app = object()
+    runtime._active = True
+    return runtime, observed
+
+
+def test_failed_image_build_carries_the_builder_log_tail(tmp_path: Path) -> None:
+    from vidaio.competition.runners.modal_runner import _ModalContenderImageBuildError
+
+    lines = [f"step {i}: noise\n" for i in range(400)] + [
+        "Step 7/9 : RUN pip install nonexistent-pkg==9.9\n",
+        "ERROR: No matching distribution found for nonexistent-pkg==9.9\n",
+    ]
+    runtime, observed = _failing_build_runtime(lines)
+    with pytest.raises(_ModalContenderImageBuildError) as caught:
+        runtime.build_contender_image(tmp_path, tmp_path / "Dockerfile")
+    message = str(caught.value)
+    assert message.startswith("contender Dockerfile was rejected by Modal:")
+    assert "im-abc123" in message
+    assert "No matching distribution found for nonexistent-pkg==9.9" in message
+    assert "step 0: noise" not in message  # only the tail
+    assert observed["layers"] == 1
+    assert len(message) < 4000  # fits the stored build-failure reason
+
+
+def test_failed_image_build_without_a_log_api_keeps_modals_message(tmp_path: Path) -> None:
+    from vidaio.competition.runners.modal_runner import _ModalContenderImageBuildError
+
+    runtime, _ = _failing_build_runtime(None)
+    with pytest.raises(_ModalContenderImageBuildError, match="im-abc123") as caught:
+        runtime.build_contender_image(tmp_path, tmp_path / "Dockerfile")
+    assert "build log (last" not in str(caught.value)
+
+
+def test_build_log_tail_is_bounded_in_time_and_never_raises() -> None:
+    from vidaio.competition.runners.modal_runner import _build_log_tail
+
+    release = threading.Event()
+
+    class SlowLogs:
+        def fetch(self, layers=1):
+            release.wait(5)
+            yield type("E", (), {"message": "late"})()
+
+    class BrokenLogs:
+        def fetch(self, layers=1):
+            raise RuntimeError("logs API down")
+
+    class Image:
+        pass
+
+    slow, broken = Image(), Image()
+    slow.logs, broken.logs = SlowLogs(), BrokenLogs()
+    try:
+        assert _build_log_tail(slow, timeout_seconds=0.05) == ""
+    finally:
+        release.set()
+    assert _build_log_tail(broken) == ""
+    assert _build_log_tail(object()) == ""
+
+
+def test_build_log_tail_waits_for_the_eventually_consistent_log() -> None:
+    """Modal's failed-build log fills in after the failure (measured 2026-11-16): the
+    first read holds only the FROM step; the failing RUN step arrives seconds later."""
+    from vidaio.competition.runners.modal_runner import _build_log_tail
+
+    reads = [
+        ["=> Step 0: FROM debian\n"],
+        ["=> Step 0: FROM debian\n", "=> Step 1: RUN make\n"],
+        ["=> Step 0: FROM debian\n", "=> Step 1: RUN make\n", "make: *** missing-header.h\n"],
+        ["=> Step 0: FROM debian\n", "=> Step 1: RUN make\n", "make: *** missing-header.h\n"],
+        ["should never be read\n"],
+    ]
+    calls = {"n": 0}
+
+    class GrowingLogs:
+        def fetch(self, layers=1):
+            index = min(calls["n"], len(reads) - 1)
+            calls["n"] += 1
+            for line in reads[index]:
+                yield type("E", (), {"message": line})()
+
+    class Image:
+        pass
+
+    image = Image()
+    image.logs = GrowingLogs()
+    tail = _build_log_tail(image, timeout_seconds=5.0, settle_seconds=0.01)
+    assert "missing-header.h" in tail
+    assert calls["n"] == 4  # stopped once two reads agreed
+
+    calls["n"] = 0
+
+    class EndlessLogs:
+        def fetch(self, layers=1):
+            calls["n"] += 1
+            yield type("E", (), {"message": f"line {calls['n']}\n"})()
+
+    endless = Image()
+    endless.logs = EndlessLogs()
+    started = time.monotonic()
+    tail = _build_log_tail(endless, timeout_seconds=0.3, settle_seconds=0.05)
+    assert time.monotonic() - started < 1.0  # bounded even if the log never settles
+    assert tail.startswith("line ")
+
+
 def test_sdk_restore_uses_only_the_exact_owned_immutable_image_id() -> None:
     observed: list[str] = []
 
@@ -1263,6 +1451,25 @@ def test_an_unmeasurable_image_is_our_failure_not_the_contenders(tmp_path: Path)
     with pytest.raises(BuildError, match="image size measurement failed") as err:
         runner.build(spec)
     assert not isinstance(err.value, ContenderBuildError)
+
+
+def test_image_measurement_uses_the_configured_bound(tmp_path: Path):
+    runtime = _Runtime()
+    runtime.image_bytes = 39_500_000_000  # a 40 GB cap holds a 39.5 GB image
+    runner, spec = _make_runner(
+        tmp_path, runtime, output_poll_seconds=0.001, max_image_bytes=40_000_000_000,
+        image_measure_timeout_seconds=1800.0,
+    )
+    runner.build(spec)
+    assert runtime.du_timeouts == [1800.0]
+    (call,) = [c for c in runtime.create_calls if c["role"] == "collector"]
+    assert call["timeout_seconds"] == 1800 + 120
+
+
+def test_runner_defaults_match_the_documented_limits() -> None:
+    cfg = ModalRunnerConfig()
+    assert cfg.build_timeout_seconds == 1800.0  # MINING.md: builds within 30 minutes
+    assert cfg.image_measure_timeout_seconds == 1200.0
 
 
 def test_without_a_cap_no_image_is_measured(tmp_path: Path):

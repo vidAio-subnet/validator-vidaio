@@ -70,8 +70,8 @@ def test_template_is_digest_pinned_cuda_execution_not_a_gpu_only_scorer() -> Non
     run = (ROOT / "template" / "run.sh").read_text(encoding="utf-8")
     cuda = (ROOT / "template" / "gpu_transform.cu").read_text(encoding="utf-8")
     assert dockerfile.count("@sha256:") == 2
-    assert "nvidia/cuda:12.4.1-devel-ubuntu22.04@sha256:" in dockerfile
-    assert "nvidia/cuda:12.4.1-runtime-ubuntu22.04@sha256:" in dockerfile
+    assert "FROM nvidia/cuda@sha256:5645fec64549cc35930eee9d85aafd2b0006c0c3f22632be5a1d85e2604e9749 AS build" in dockerfile
+    assert "FROM nvidia/cuda@sha256:cff3a0d82d2c2b47bab252d67fa9b34a20ef4c50781d98501b5c7367ea9afd10" in dockerfile
     assert '"$gpu_filter" --probe' in run
     assert '"$nvidia_smi_bin"' in run
     assert "cudaMalloc" in cuda

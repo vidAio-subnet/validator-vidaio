@@ -20,6 +20,7 @@ from vidaio.scoring.gates import GateSkip, ValidityViolation
 from vidaio.scoring.upscaling import UpscalingBreakdown
 from vidaio.scoring.interpolation_formula import InterpolationBreakdown
 from vidaio.scoring.upscaling_faithful_formula import UpscalingFaithfulBreakdown
+from vidaio.scoring.upscaling_generative_formula import UpscalingGenerativeBreakdown
 from vidaio.scoring.removal_formula import RemovalBreakdown
 from vidaio.scoring.streaming import StreamingBreakdown
 
@@ -31,6 +32,7 @@ Breakdown = Annotated[
         InterpolationBreakdown,
         UpscalingFaithfulBreakdown,
         StreamingBreakdown,
+        UpscalingGenerativeBreakdown,
     ],
     Field(discriminator="kind"),
 ]
@@ -88,12 +90,37 @@ STREAMING_CONFIG_FIELDS = frozenset({"streaming_vmaf_floor", "streaming_rate_tol
 #: ship together, so the release before it computed the digest without all of them).
 COMP004_RELEASE_CONFIG_FIELDS = UPSCALING_FAITHFUL_CONFIG_FIELDS | STREAMING_CONFIG_FIELDS
 
+#: ScoringConfig fields added with the generative upscaling scorer (competition 006; after
+#: :data:`COMP004_RELEASE_CONFIG_FIELDS`).
+UPSCALING_GENERATIVE_CONFIG_FIELDS = frozenset(
+    {
+        "upscaling_generative_weights",
+        "upscaling_generative_anchors",
+        "upscaling_generative_fr_frames",
+        "upscaling_generative_fr_max_side",
+        "upscaling_generative_temporal_max_side",
+        "upscaling_generative_warp_floor",
+        "upscaling_generative_nr_cap",
+        "upscaling_generative_lowres_psnr_min_db",
+        "upscaling_generative_lowres_psnr_floor_db",
+        "upscaling_generative_lowres_blur_sigma",
+        "upscaling_generative_color_delta_e_max",
+        "upscaling_generative_color_max_side",
+        "upscaling_generative_delivery_encode",
+        "upscaling_generative_delivery_crf",
+    }
+)
+
+#: Everything the competition-006 release added.
+COMP006_RELEASE_CONFIG_FIELDS = UPSCALING_GENERATIVE_CONFIG_FIELDS
+
 #: Config generations, oldest addition first. Each prefix of exclusions reproduces the
 #: digest an earlier release computed for the same settings.
 _CONFIG_FIELD_GENERATIONS = (
     REMOVAL_CONFIG_FIELDS,
     INTERPOLATION_CONFIG_FIELDS,
     COMP004_RELEASE_CONFIG_FIELDS,
+    COMP006_RELEASE_CONFIG_FIELDS,
 )
 
 
@@ -211,6 +238,7 @@ def compose_item_score(
         | InterpolationBreakdown
         | UpscalingFaithfulBreakdown
         | StreamingBreakdown
+        | UpscalingGenerativeBreakdown
         | None
     ),
     config: ScoringConfig,

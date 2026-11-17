@@ -142,6 +142,14 @@ orchestrator:
   control_host: 127.0.0.1
   control_port: 8500
   control_token: ''
+  enrollment_precheck_enabled: true
+  enrollment_precheck_final_interval_seconds: 3600.0
+  enrollment_precheck_final_window_seconds: 86400.0
+  enrollment_precheck_interval_seconds: 21600.0
+  enrollment_stake_recheck_enabled: true
+  enrollment_trial_build_daily_cap: 4
+  enrollment_trial_build_enabled: false
+  enrollment_trial_build_retry_seconds: 1800.0
   git_allowed_hosts:
   - github.com
   git_host_credentials: {}
@@ -153,11 +161,13 @@ orchestrator:
   modal_run_label: ''
   public_enabled: false
   public_enroll_limit_per_hour: 12
+  public_entry_limit_per_hour: 120
   public_host: 127.0.0.1
   public_port: 8510
   public_read_limit_per_minute: 120
   public_trust_forwarded_for: false
   sandbox_backend: modal
+  scoring_timeout_seconds: 1900.0
 registry:
   allow_disabled_automatic_promotion_for_testnet: false
   automatic_promotion_enabled: false
@@ -204,6 +214,7 @@ scoring_worker:
     tone_std_delta_max: 0.08
   pieapp_device: cpu
   queue_wait_timeout_seconds: 30.0
+  request_timeout: 1800.0
   scorer_version: vidaio-scorer/1
 tokenomics:
   alpha_stake_weigh_factor: 0.0

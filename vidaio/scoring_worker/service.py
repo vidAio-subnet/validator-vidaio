@@ -123,6 +123,18 @@ from vidaio.scoring.upscaling_faithful_formula import (
     UPSCALING_FAITHFUL_FACTORS,
     score_upscaling_faithful,
 )
+from vidaio.scoring_worker.upscaling_generative_backend import (
+    CpuUpscalingGenerativeBackend,
+    UpscalingGenerativeCancelled,
+    UpscalingGenerativeInputError,
+    UpscalingGenerativeMeasurementError,
+    UpscalingGenerativeMetricsBackend,
+)
+from vidaio.scoring.upscaling_generative import fr_sampling_stride
+from vidaio.scoring.upscaling_generative_formula import (
+    UPSCALING_GENERATIVE_FACTORS,
+    score_upscaling_generative,
+)
 from vidaio.scoring_worker.interpolation_backend import (
     CpuInterpolationBackend,
     InterpolationCancelled,
@@ -184,6 +196,9 @@ from vidaio.scoring.backends_real import (
     use_metric_log_limit,
     use_process_scope,
 )
+from vidaio.scoring.backends_real import _run as _run_media_tool
+from vidaio.scoring.gates import upscaling_generative_violations
+from vidaio.scoring.media_inputs import UNTRUSTED_INPUT_ARGS
 from vidaio.scoring.content_fingerprint import (
     CONTENT_FINGERPRINT_VERSION,
     ContentFingerprintCancelled,
@@ -264,6 +279,9 @@ class ScoringBackends:
     #: Faithful upscaling metrics (vidaio/scoring_worker/upscaling_faithful_backend.py), used for
     #: upscaling requests with ``params["scoring"] == "faithful"``; None = not configured (501).
     upscaling_faithful: UpscalingFaithfulMetricsBackend | None = None
+    #: Generative upscaling metrics (vidaio/scoring_worker/upscaling_generative_backend.py),
+    #: used for upscaling requests with ``params["scoring"] == "generative"``; None = 501.
+    upscaling_generative: UpscalingGenerativeMetricsBackend | None = None
     #: Streaming compression packet measurement (vidaio/scoring_worker/streaming_backend.py),
     #: used for compression requests with ``params["scoring"] == "streaming"``; None = 501.
     streaming: StreamingPacketBackend | None = None
@@ -327,6 +345,7 @@ def real_backends(
     # one LPIPS-VGG network per worker thread, shared by the removal and interpolation tracks
     interpolation_backend = CpuInterpolationBackend(lpips_loader=removal_backend.lpips_net)
     upscaling_faithful_backend = CpuUpscalingFaithfulBackend(lpips_loader=removal_backend.lpips_net)
+    upscaling_generative_backend = CpuUpscalingGenerativeBackend(lpips_loader=removal_backend.lpips_net)
     versions = complete_payout_backend_versions(
         versions,
         pieapp=pieapp,
@@ -348,6 +367,7 @@ def real_backends(
         removal=removal_backend,
         interpolation=interpolation_backend,
         upscaling_faithful=upscaling_faithful_backend,
+        upscaling_generative=upscaling_generative_backend,
         streaming=FfprobeStreamingBackend(config.ffprobe_path, timeout=config.subprocess_timeout),
         canonicalizer=CanonicalizeExecutor(
             config.ffmpeg_path, timeout=config.subprocess_timeout
@@ -746,9 +766,16 @@ def _score_in_dir(
     # output against the sealed original, credited over a Lanczos upscale of the served input.
     # Every other upscaling request keeps the PieAPP/VMAF formula.
     upscaling_faithful = request.track == TRACK_UPSCALING and str(params.get("scoring", "")) == "faithful"
+    # Generative competition upscaling (vidaio/scoring/upscaling_generative.py): perceptual,
+    # temporal and capped no-reference metrics vs the sealed original, gated by low-resolution
+    # consistency with the served input and colour fidelity.
+    upscaling_generative = (
+        request.track == TRACK_UPSCALING and str(params.get("scoring", "")) == "generative"
+    )
+    reference_scored = upscaling_faithful or upscaling_generative
     pieapp_value: float | None = None
     start_frame: int | None = None
-    if request.track == TRACK_UPSCALING and dims_match and not upscaling_faithful:
+    if request.track == TRACK_UPSCALING and dims_match and not reference_scored:
         window = usable_frames(
             canon_ref_info.frame_count, scoring_config.pieapp_sample_window
         )
@@ -762,7 +789,7 @@ def _score_in_dir(
             pieapp_value = backends.pieapp.compute(
                 canon_ref, canon_cand, start_frame=start_frame
             )
-    if request.track == TRACK_UPSCALING and pieapp_value is None and not upscaling_faithful:
+    if request.track == TRACK_UPSCALING and pieapp_value is None and not reference_scored:
         extra_violations = extra_violations + [
             ValidityViolation(
                 code=ReasonCode.METRIC_MISSING,
@@ -773,7 +800,7 @@ def _score_in_dir(
     vmaf_primary: float | None = None
     vmaf_delta_primary: float | None = None
     vmaf_delta_secondary: float | None = None
-    if dims_match and request.track not in (TRACK_REMOVAL, TRACK_INTERPOLATION) and not upscaling_faithful:
+    if dims_match and request.track not in (TRACK_REMOVAL, TRACK_INTERPOLATION) and not reference_scored:
         # Round-4 an internal review: each VMAF run's JSON log is hard-bounded to the
         # per-run share of the metric-log reservation taken above — the same
         # watchdog that bounds a canonicalization kills the run past it. Blown
@@ -1052,6 +1079,53 @@ def _score_in_dir(
                     ValidityViolation(code=ReasonCode.METRIC_MISSING, detail=str(exc)[:300]),
                 ]
 
+    # 5f') Generative upscaling: the candidate against the sealed original and the served input
+    #      at its own geometry (low-resolution consistency), optionally after a delivery encode.
+    generative_measurement = None
+    generative_factor: int | None = None
+    if upscaling_generative:
+        generative_factor = _param_int(params, "upscale_factor")
+        if generative_factor not in UPSCALING_GENERATIVE_FACTORS:
+            raise ScoreRejected(
+                422,
+                {
+                    "error": "upscaling_factor_unsupported",
+                    "detail": f"upscale_factor {generative_factor} (supported: {list(UPSCALING_GENERATIVE_FACTORS)})",
+                },
+            )
+    if upscaling_generative and dims_match:
+        if backends.upscaling_generative is None:
+            raise NotConfiguredError("generative upscaling metrics backend is not configured")
+        frame_count_ok = not any(
+            v.code == ReasonCode.FRAME_COUNT_MISMATCH for v in extra_violations
+        )
+        if frame_count_ok:
+            generative_measurement, generative_violation = _measure_generative(
+                backends=backends,
+                config=config,
+                scoring_config=scoring_config,
+                lease=lease,
+                tmp=tmp,
+                snapshot=snapshot,
+                request=request,
+                canon_ref=canon_ref,
+                canon_cand=canon_cand,
+                reference_frames=canon_ref_info.frame_count,
+                input_info=input_info,
+                miner_input_path=miner_input_path,
+            )
+            if generative_violation is not None:
+                extra_violations = [*extra_violations, generative_violation]
+            if generative_measurement is not None:
+                extra_violations = [
+                    *extra_violations,
+                    *upscaling_generative_violations(
+                        lowres_psnr_db=generative_measurement.metrics.lowres_psnr_db,
+                        color_delta_e=generative_measurement.metrics.color_delta_e,
+                        config=scoring_config,
+                    ),
+                ]
+
     # 5g) Streaming compression: the candidate's packets against the clip's bitrate budget
     #     and the delivery rules (vidaio/scoring/streaming.py). The budget comes from the
     #     reference's own geometry and frame rate under the anchored rule.
@@ -1126,6 +1200,7 @@ def _score_in_dir(
         upscale_factor=_param_int(params, "upscale_factor"),
         extra_violations=extra_violations,
         upscaling_faithful=upscaling_faithful,
+        upscaling_generative=upscaling_generative,
         streaming=streaming,
     )
     passed, violations = gate_pipeline.run(ctx)
@@ -1265,7 +1340,37 @@ def _score_in_dir(
                 "final_score": breakdown.final,
             }
         )
-    elif request.track == TRACK_UPSCALING and pieapp_value is not None and not upscaling_faithful:
+    elif upscaling_generative and generative_measurement is not None and generative_factor is not None:
+        measured_g = generative_measurement.metrics
+        breakdown = score_upscaling_generative(
+            metrics=measured_g, upscale_factor=generative_factor, config=scoring_config
+        )
+        metrics.update(
+            {
+                "gen_dists": breakdown.dists,
+                "gen_lpips_vgg": breakdown.lpips_vgg,
+                "gen_warp_error": breakdown.warp_error,
+                "gen_warp_error_reference": breakdown.warp_error_reference,
+                "gen_nr": breakdown.nr,
+                "gen_nr_reference": breakdown.nr_reference,
+                "gen_lowres_psnr_db": breakdown.lowres_psnr_db,
+                "gen_color_delta_e": breakdown.color_delta_e,
+                "gen_s_fr": breakdown.s_fr,
+                "gen_s_temporal": breakdown.s_temporal,
+                "gen_s_nr": breakdown.s_nr,
+                "upscale_frames": breakdown.frames,
+                "upscale_factor": breakdown.upscale_factor,
+                "fr_frames": breakdown.fr_frames,
+                "fr_offset": generative_measurement.fr_offset,
+                "delivery_encode": (
+                    f"x264-crf{scoring_config.upscaling_generative_delivery_crf}"
+                    if scoring_config.upscaling_generative_delivery_encode
+                    else "none"
+                ),
+                "final_score": breakdown.final,
+            }
+        )
+    elif request.track == TRACK_UPSCALING and pieapp_value is not None and not reference_scored:
         content_length = _param_float(params, "content_length")
         if content_length is None:
             content_length = canon_ref_info.duration
@@ -1300,6 +1405,152 @@ def _score_in_dir(
         # THIS worker's version — never the caller's (see check_scorer_version).
         scorer_version=scorer_version,
     )
+
+
+# --- generative upscaling ------------------------------------------------------------
+
+
+def _measure_generative(
+    *,
+    backends: ScoringBackends,
+    config: ScoringWorkerConfig,
+    scoring_config: ScoringConfig,
+    lease: ScratchLease,
+    tmp: Path,
+    snapshot: InputSnapshot,
+    request: ScoreRequest,
+    canon_ref: str,
+    canon_cand: str,
+    reference_frames: int,
+    input_info: MediaInfo,
+    miner_input_path: str,
+) -> tuple[Any, ValidityViolation | None]:
+    """Measure one generative upscaling candidate.
+
+    Needs the served input at its OWN geometry (the shared canonical input is
+    Lanczos-upscaled to the candidate's), so it is canonicalized once more without a
+    rescale; with ``upscaling_generative_delivery_encode`` the canonical candidate is
+    first passed through a light x264 encode and decoded again. Both extra files are
+    reserved on the scratch lease like every other generated byte. Returns the
+    measurement (or None) and a candidate-side violation (or None)."""
+    assert backends.upscaling_generative is not None
+    scope = current_process_scope()
+    cancelled = (lambda: scope.cancelled) if scope else None
+    reserved = 0
+    try:
+        if backends.canonicalizer is not None:
+            native_input = str(tmp / "miner-input-native.y4m")
+            native_cap = projected_canonical_bytes("miner_input", input_info)
+            lease.reserve_generated(kind="generative_native_input", nbytes=native_cap)
+            reserved += native_cap
+            _canonicalize(
+                backends.canonicalizer,
+                build_canonicalization_plan(
+                    miner_input_path, native_input, **untagged_color_fill(input_info)
+                ),
+                field="miner_input",
+                output_path=native_input,
+                max_output_bytes=native_cap,
+                timeout=config.subprocess_timeout,
+            )
+        else:
+            native_input = miner_input_path
+        measured_candidate = canon_cand
+        if scoring_config.upscaling_generative_delivery_encode and backends.canonicalizer is not None:
+            delivered = str(tmp / "candidate-delivery.y4m")
+            encoded = str(tmp / "candidate-delivery.mkv")
+            cand_bytes = _file_size(canon_cand)
+            # the encode (<= the raw y4m) plus its decoded y4m (header may differ slightly)
+            delivery_bytes = 2 * cand_bytes + 4096
+            lease.reserve_generated(kind="generative_delivery_encode", nbytes=delivery_bytes)
+            reserved += delivery_bytes
+            _delivery_encode(
+                config.ffmpeg_path,
+                canon_cand,
+                encoded,
+                delivered,
+                crf=scoring_config.upscaling_generative_delivery_crf,
+                max_bytes=cand_bytes,
+                # one-thread x264 of a 10 s 1080p60 clip takes minutes, more than the
+                # per-ffmpeg budget; the whole request stays bounded by request_timeout
+                timeout=max(config.subprocess_timeout, config.request_timeout / 3),
+            )
+            measured_candidate = delivered
+        count = scoring_config.upscaling_generative_fr_frames
+        stride = fr_sampling_stride(max(1, reference_frames), count)
+        # which full frames are sampled is derived from the HELD-OUT reference digest
+        fr_offset = (
+            derive_pieapp_start_frame(snapshot.reference.digest, request.challenge_id, stride)
+            if stride > 1
+            else 0
+        )
+        try:
+            return (
+                backends.upscaling_generative.measure(
+                    canonical_reference=canon_ref,
+                    canonical_candidate=measured_candidate,
+                    canonical_served_input=native_input,
+                    config=scoring_config,
+                    fr_offset=fr_offset,
+                    cancelled=cancelled,
+                    # the reference-side values depend only on the verified original + input
+                    reference_key=(snapshot.reference.digest, snapshot.miner_input.digest),
+                ),
+                None,
+            )
+        except UpscalingGenerativeCancelled as exc:
+            raise MediaWorkCancelled(str(exc)) from exc
+        except UpscalingGenerativeInputError as exc:
+            # validator-side: original / served input unusable — refuse, never a zero
+            raise ScoreRejected(
+                422, {"error": "upscaling_input_unmeasurable", "detail": str(exc)[:300]}
+            ) from exc
+        except UpscalingGenerativeMeasurementError as exc:
+            return None, ValidityViolation(code=ReasonCode.METRIC_MISSING, detail=str(exc)[:300])
+    finally:
+        if reserved:
+            lease.refund_generated(reserved)
+
+
+def _delivery_encode(
+    ffmpeg_path: str,
+    source_y4m: str,
+    encoded_path: str,
+    decoded_y4m: str,
+    *,
+    crf: int,
+    max_bytes: int,
+    timeout: float,
+) -> None:
+    """x264 at ``crf`` on one thread (deterministic), then decoded back to 8-bit 4:2:0 y4m."""
+    try:
+        _run_media_tool(
+            [
+                ffmpeg_path, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+                *UNTRUSTED_INPUT_ARGS, "-i", source_y4m,
+                "-map", "0:v:0", "-c:v", "libx264", "-preset", "medium", "-crf", str(int(crf)),
+                "-pix_fmt", "yuv420p", "-threads", "1", "-x264-params", "threads=1:lookahead-threads=1",
+                "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
+                "-color_range", "tv", "-f", "matroska", encoded_path,
+            ],
+            timeout=timeout,
+            output_limit=(encoded_path, max_bytes),
+        )
+        _run_media_tool(
+            [
+                ffmpeg_path, "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-threads", "1",
+                *UNTRUSTED_INPUT_ARGS, "-i", encoded_path,
+                "-map", "0:v:0", "-pix_fmt", "yuv420p", "-f", "yuv4mpegpipe", decoded_y4m,
+            ],
+            timeout=timeout,
+            output_limit=(decoded_y4m, max_bytes + 4096),
+        )
+    except MediaToolError as exc:  # timeouts and oversize included; cancellation propagates
+        raise ScoreRejected(
+            422, {"error": "delivery_encode_failed", "detail": str(exc)[:300]}
+        ) from exc
+    finally:
+        _remove_partial(encoded_path)
 
 
 # --- the expansion budget ------------------------------------------------------------

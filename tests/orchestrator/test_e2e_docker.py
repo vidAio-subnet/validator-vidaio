@@ -108,19 +108,31 @@ async def test_full_competition_e2e(orchestrator_factory, fixture_repos, tmp_pat
     assert repo.count_missing_calibration_rows(orch.conn, cid) == 0
     assert len(events_of(orch, cid, "audit_bundle_built")) == 9
 
-    # Artifacts really archived: inputs, outputs and packets fetchable by digest.
+    # Hidden inputs and contender outputs stay in the local pools until the result:
+    # nothing under the public challenge_input/ or miner_output/ prefixes yet.
+    public_refs = []
     for item_id in item_ids:
         row = orch.conn.execute(
             "SELECT input_sha256, input_bytes FROM evaluation_items WHERE item_id = ?",
             (item_id,),
         ).fetchone()
-        ref = ArtifactRef(
+        public_refs.append(ArtifactRef(
             digest=row["input_sha256"],
             kind=ArtifactKind.CHALLENGE_INPUT,
             byte_size=row["input_bytes"],
             backend_key=backend_key(ArtifactKind.CHALLENGE_INPUT, row["input_sha256"]),
-        )
-        assert orch.store.exists(ref)
+        ))
+    for row in orch.conn.execute(
+        "SELECT output_sha256, output_bytes FROM performance_history WHERE competition_id = ?",
+        (cid,),
+    ).fetchall():
+        public_refs.append(ArtifactRef(
+            digest=row["output_sha256"],
+            kind=ArtifactKind.MINER_OUTPUT,
+            byte_size=row["output_bytes"],
+            backend_key=backend_key(ArtifactKind.MINER_OUTPUT, row["output_sha256"]),
+        ))
+    assert not any(orch.store.exists(ref) for ref in public_refs)
 
     # Review window still open at T0+30h (deadline ~T0+27h but end_time is T0+48h).
     await orch.step(T0 + timedelta(hours=30))
@@ -129,6 +141,8 @@ async def test_full_competition_e2e(orchestrator_factory, fixture_repos, tmp_pat
     # Completion after end_time: gates (audit linkage + baseline matrix) are satisfied.
     await orch.step(END + M)
     assert phase(orch, cid) is Phase.COMPLETED
+    # Uploaded and verified at the result, before COMPLETED.
+    assert all(orch.store.exists(ref) for ref in public_refs)
 
     # Ranking: hk-a (512 B outputs) beats hk-b (1024 B); untrusted ranks last on
     # zero; the baseline is EXCLUDED from ranking/podium by construction, even though

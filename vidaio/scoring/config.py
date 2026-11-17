@@ -135,6 +135,89 @@ class UpscalingFaithfulWeights(BaseModel):
             raise ValueError(f"upscaling_faithful_weights must sum to 1.0, got {total!r}")
         return self
 
+
+class UpscalingGenerativeWeights(BaseModel):
+    """Weights of the three terms of the generative upscaling score (0.55 / 0.15 / 0.30):
+    full-reference fidelity, temporal consistency and capped no-reference quality.
+
+    The temporal term is capped at the original's own stability, so a blurred upscale earns
+    it in full: at 0.30 it let plain Lanczos outscore the generative baseline (2026-11-16
+    calibration, DECISIONS #44). At 0.15 it stays an anti-flicker guard."""
+
+    fr: float = 0.55
+    temporal: float = 0.15
+    nr: float = 0.30
+
+    @model_validator(mode="after")
+    def _finite(self) -> "UpscalingGenerativeWeights":
+        _require_unit_interval("upscaling_generative_weights.fr", self.fr)
+        _require_unit_interval("upscaling_generative_weights.temporal", self.temporal)
+        _require_unit_interval("upscaling_generative_weights.nr", self.nr)
+        total = self.fr + self.temporal + self.nr
+        if abs(total - 1.0) > _WEIGHT_SUM_TOLERANCE:
+            raise ValueError(f"upscaling_generative_weights must sum to 1.0, got {total!r}")
+        return self
+
+
+class GenerativeAnchor(BaseModel):
+    """Normalisation band of one generative metric, on a higher-is-better scale.
+
+    ``floor`` maps to 0 and ``anchor`` to 1: the medians of the weakest and the strongest
+    public baseline upscaler on that metric (see :class:`UpscalingGenerativeAnchors`)."""
+
+    floor: float
+    anchor: float
+
+    @model_validator(mode="after")
+    def _ordered(self) -> "GenerativeAnchor":
+        _require_finite_config("generative anchor floor", self.floor)
+        _require_finite_config("generative anchor anchor", self.anchor)
+        if not self.anchor > self.floor:
+            raise ValueError(f"generative anchor must exceed its floor, got {self.floor!r} -> {self.anchor!r}")
+        return self
+
+
+class UpscalingGenerativeAnchors(BaseModel):
+    """The normalisation bands of one upscale factor.
+
+    Calibrated on 2026-11-16 (the project design record #44): 18 public clips (practice pack 004 and
+    degraded Blender open-movie excerpts, never used for a hidden set) upscaled by Lanczos,
+    Real-ESRGAN and SeedVR2-3B on an A100 and scored by this scorer. Per factor and metric the
+    band runs from the weakest to the strongest baseline's median: the generative reference
+    did not beat Real-ESRGAN on every metric, so "floor = non-generative, anchor = generative"
+    could not hold for all four. The scoring config digest commits these values.
+
+    * ``dists_similarity`` — ``1 - DISTS`` against the sealed original;
+    * ``lpips_similarity`` — ``1 - LPIPS-VGG`` against the sealed original;
+    * ``temporal``         — reference warp error / candidate warp error, capped at 1;
+    * ``nr_ratio``         — candidate no-reference quality / the reference's own, capped
+      at ``1 + upscaling_generative_nr_cap``.
+    """
+
+    dists_similarity: GenerativeAnchor
+    lpips_similarity: GenerativeAnchor
+    temporal: GenerativeAnchor
+    nr_ratio: GenerativeAnchor
+
+
+def _calibrated_generative_anchors() -> dict[int, UpscalingGenerativeAnchors]:
+    """Baseline medians of the 2026-11-16 calibration (weakest -> strongest per metric)."""
+    return {
+        2: UpscalingGenerativeAnchors(
+            dists_similarity=GenerativeAnchor(floor=0.886, anchor=0.901),  # Lanczos -> SeedVR2-3B
+            lpips_similarity=GenerativeAnchor(floor=0.696, anchor=0.759),  # SeedVR2-3B -> Lanczos
+            temporal=GenerativeAnchor(floor=0.693, anchor=1.0),  # SeedVR2-3B -> Lanczos
+            nr_ratio=GenerativeAnchor(floor=0.503, anchor=1.049),  # Lanczos -> Real-ESRGAN
+        ),
+        4: UpscalingGenerativeAnchors(
+            dists_similarity=GenerativeAnchor(floor=0.826, anchor=0.896),  # Lanczos -> SeedVR2-3B
+            lpips_similarity=GenerativeAnchor(floor=0.616, anchor=0.677),  # Lanczos -> SeedVR2-3B
+            temporal=GenerativeAnchor(floor=0.778, anchor=0.973),  # SeedVR2-3B -> Lanczos
+            nr_ratio=GenerativeAnchor(floor=0.143, anchor=0.664),  # Lanczos -> SeedVR2-3B
+        ),
+    }
+
+
 class ScoringConfig(BaseModel):
     # --- gates -------------------------------------------------------------
     #: Upscaling VMAF pass/fail gate on the vmaf/100 scale (< 0.5 -> score 0).
@@ -210,6 +293,45 @@ class ScoringConfig(BaseModel):
     upscaling_faithful_lpips_stride: int = 4
     #: frames are downscaled (INTER_AREA) so the long side is at most this before LPIPS-VGG
     upscaling_faithful_lpips_max_side: int = 512
+    # --- generative upscaling (competitions; vidaio/scoring/upscaling_generative.py) -----
+    #: Used when an upscaling request asks for ``params["scoring"] = "generative"``.
+    upscaling_generative_weights: UpscalingGenerativeWeights = Field(
+        default_factory=UpscalingGenerativeWeights
+    )
+    #: Per-factor normalisation bands, calibrated on public baseline runs (2026-11-16).
+    upscaling_generative_anchors: dict[int, UpscalingGenerativeAnchors] = Field(
+        default_factory=_calibrated_generative_anchors
+    )
+    #: Full frames sampled per clip for DISTS, LPIPS and the no-reference metric (evenly
+    #: spaced, phase derived from the held-out reference digest).
+    upscaling_generative_fr_frames: int = 3
+    #: Long-side bound of the sampled frames before DISTS/LPIPS/NR; 0 = native full frames
+    #: (generated detail is judged at the delivered resolution).
+    upscaling_generative_fr_max_side: int = 0
+    #: Temporal term: frames are area-downscaled to this long side before the reference's
+    #: DIS optical flow and the warp errors are computed (0 = native).
+    upscaling_generative_temporal_max_side: int = 960
+    #: Floor of the reference warp error in the temporal ratio (8-bit mean abs units), so a
+    #: static reference does not make the ratio degenerate.
+    upscaling_generative_warp_floor: float = 0.5
+    #: The no-reference quality counts up to the reference clip's own value times 1 + cap.
+    upscaling_generative_nr_cap: float = 0.05
+    #: Low-resolution consistency gate: the output Lanczos-downscaled to the served input's
+    #: geometry and both blurred must reach max(min, floor) dB of luma PSNR against the input.
+    upscaling_generative_lowres_psnr_min_db: float = 28.0
+    #: Calibrated part of that threshold (e.g. baseline - 2 dB); 0 = only the minimum applies.
+    upscaling_generative_lowres_psnr_floor_db: float = 0.0
+    #: Gaussian sigma (pixels at the input geometry) applied to both sides of that gate.
+    upscaling_generative_lowres_blur_sigma: float = 1.0
+    #: Colour gate: mean CIEDE2000 against the sealed original, on frames area-downscaled to
+    #: ``upscaling_generative_color_max_side`` (regional colour, not texture), at most this.
+    #: 6.0: honest baselines reached 4.07 at most in the 2026-11-16 calibration (x4, heavy
+    #: degradations); a visible colour cast is well above it.
+    upscaling_generative_color_delta_e_max: float = 6.0
+    upscaling_generative_color_max_side: int = 256
+    #: Score the candidate after a light delivery encode (x264, this CRF, one thread).
+    upscaling_generative_delivery_encode: bool = False
+    upscaling_generative_delivery_crf: int = 18
     # --- streaming compression (competitions; vidaio/scoring/streaming.py) ----------------
     #: Used when a compression request asks for ``params["scoring"] = "streaming"``: VMAF at
     #: or below this scores 0, 100 scores 1 (linear between).
@@ -311,6 +433,7 @@ class ScoringConfig(BaseModel):
             raise ValueError(
                 f"upscaling_faithful_lpips_max_side must be >= 0, got {self.upscaling_faithful_lpips_max_side!r}"
             )
+        self._check_generative()
         if not 0.0 <= self.streaming_vmaf_floor < 100.0:
             raise ValueError(f"streaming_vmaf_floor must be in [0, 100), got {self.streaming_vmaf_floor!r}")
         if not 0.0 <= self.streaming_rate_tolerance <= 0.25:
@@ -355,6 +478,52 @@ class ScoringConfig(BaseModel):
         if self.pieapp_sample_window < 1:
             raise ValueError("pieapp_sample_window must be >= 1")
         return self
+
+    def _check_generative(self) -> None:
+        for name in (
+            "upscaling_generative_warp_floor",
+            "upscaling_generative_nr_cap",
+            "upscaling_generative_lowres_psnr_min_db",
+            "upscaling_generative_lowres_psnr_floor_db",
+            "upscaling_generative_lowres_blur_sigma",
+            "upscaling_generative_color_delta_e_max",
+        ):
+            value = getattr(self, name)
+            _require_finite_config(name, value)
+            if value < 0.0:
+                raise ValueError(f"{name} must be >= 0, got {value!r}")
+        if self.upscaling_generative_lowres_blur_sigma <= 0.0:
+            raise ValueError("upscaling_generative_lowres_blur_sigma must be > 0")
+        if self.upscaling_generative_warp_floor <= 0.0:
+            raise ValueError("upscaling_generative_warp_floor must be > 0")
+        if self.upscaling_generative_nr_cap > 1.0:
+            raise ValueError("upscaling_generative_nr_cap must be in [0, 1]")
+        if self.upscaling_generative_fr_frames < 1:
+            raise ValueError("upscaling_generative_fr_frames must be >= 1")
+        for name in (
+            "upscaling_generative_fr_max_side",
+            "upscaling_generative_temporal_max_side",
+            "upscaling_generative_color_max_side",
+        ):
+            if getattr(self, name) < 0:
+                raise ValueError(f"{name} must be >= 0")
+        if self.upscaling_generative_color_max_side == 0:
+            raise ValueError("upscaling_generative_color_max_side must be > 0")
+        if not 0 <= self.upscaling_generative_delivery_crf <= 51:
+            raise ValueError("upscaling_generative_delivery_crf must be in [0, 51]")
+        anchors = self.upscaling_generative_anchors
+        if set(anchors) != {2, 4}:
+            raise ValueError("upscaling_generative_anchors must define exactly the factors 2 and 4")
+        nr_ceiling = 1.0 + self.upscaling_generative_nr_cap
+        for factor, bands in anchors.items():
+            for band in ("dists_similarity", "lpips_similarity", "temporal"):
+                value = getattr(bands, band)
+                if not (0.0 <= value.floor and value.anchor <= 1.0):
+                    raise ValueError(f"upscaling_generative_anchors[{factor}].{band} must lie in [0, 1]")
+            if not (0.0 <= bands.nr_ratio.floor and bands.nr_ratio.anchor <= nr_ceiling):
+                raise ValueError(
+                    f"upscaling_generative_anchors[{factor}].nr_ratio must lie in [0, 1 + nr_cap]"
+                )
 
     def vmaf_floor(self, track: str) -> float:
         """Hard VMAF floor (0-100 scale) below which the item scores 0 for `track`.

@@ -355,6 +355,26 @@ class LpipsVgg:
             return float(self._net(ta, tb).item())
 
 
+def reference_flow_maps(dis, prev_luma: np.ndarray, luma: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Sampling maps that align frame i+1 with frame i, from the REFERENCE's own DIS flow.
+
+    ``warp_with_maps(frame_i_plus_1, mx, my)`` then lands on frame i wherever the motion is
+    explained by the flow; the remaining absolute difference is the warp error. The flow is
+    always computed on the reference, so it is the same for every candidate of an item."""
+    # DIS needs contiguous inputs; a crop of a memory-mapped plane is not
+    flow = dis.calc(np.ascontiguousarray(prev_luma), np.ascontiguousarray(luma), None)
+    h, w = flow.shape[:2]
+    gy, gx = np.mgrid[0:h, 0:w].astype(np.float32)
+    return gx + flow[..., 0], gy + flow[..., 1]
+
+
+def warp_with_maps(image: np.ndarray, mx: np.ndarray, my: np.ndarray) -> np.ndarray:
+    """``image`` resampled at the maps of :func:`reference_flow_maps` (bilinear, reflect)."""
+    import cv2
+
+    return cv2.remap(image, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+
+
 def region_metrics(
     candidate: Y4MReader,
     reference: Y4MReader,
@@ -441,16 +461,9 @@ def region_metrics(
             mm = masks[i - 1] & m
             if mm.any():
                 y0, y1, x0, x1 = _bbox(masks[i - 1] | m, 48)
-                # DIS needs contiguous inputs; a crop of a memory-mapped plane is not
-                flow = dis.calc(
-                    np.ascontiguousarray(prev_luma[y0:y1, x0:x1]),
-                    np.ascontiguousarray(luma[y0:y1, x0:x1]),
-                    None,
-                )
-                gy, gx = np.mgrid[0 : y1 - y0, 0 : x1 - x0].astype(np.float32)
-                mx, my = gx + flow[..., 0], gy + flow[..., 1]
-                wc = cv2.remap(c[y0:y1, x0:x1], mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
-                wr = cv2.remap(r[y0:y1, x0:x1], mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+                mx, my = reference_flow_maps(dis, prev_luma[y0:y1, x0:x1], luma[y0:y1, x0:x1])
+                wc = warp_with_maps(c[y0:y1, x0:x1], mx, my)
+                wr = warp_with_maps(r[y0:y1, x0:x1], mx, my)
                 sel = mm[y0:y1, x0:x1]
                 warp_c.append(float(np.abs(wc.astype(np.float32) - prev_c[y0:y1, x0:x1].astype(np.float32))[sel].mean()))
                 warp_r.append(float(np.abs(wr.astype(np.float32) - prev_r[y0:y1, x0:x1].astype(np.float32))[sel].mean()))

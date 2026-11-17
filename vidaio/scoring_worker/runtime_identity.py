@@ -31,6 +31,7 @@ from typing import Any, Mapping
 
 from vidaio.audit.canonical import canonical_json_bytes
 from vidaio.autoupdater.integrity import runtime_digest, verify_runtime_manifest
+from vidaio.scoring.generative_weights import generative_weights_digest
 from vidaio.scoring.backends_real import (
     PIEAPP_WEIGHTS_SHA256,
     CpuPerceptualCheckBackend,
@@ -84,6 +85,8 @@ _REQUIRED_PAYOUT_BACKENDS = frozenset(
         "removal_metrics",
         "interpolation_metrics",
         "upscaling_faithful_metrics",
+        "upscaling_generative_metrics",
+        "generative_weights",
         "streaming_packets",
         "lpips",
         "python",
@@ -109,6 +112,7 @@ def _distribution_version(*names: str) -> str:
 REMOVAL_METRICS_VERSION = "removal-metrics/2"
 INTERPOLATION_METRICS_VERSION = "interpolation-metrics/1"
 UPSCALING_FAITHFUL_METRICS_VERSION = "upscaling-faithful-metrics/1"
+UPSCALING_GENERATIVE_METRICS_VERSION = "upscaling-generative-metrics/1"
 STREAMING_PACKETS_VERSION = "streaming-packets/1"
 
 
@@ -148,6 +152,11 @@ def complete_payout_backend_versions(
             "interpolation_metrics": INTERPOLATION_METRICS_VERSION,
             # faithful upscaling (competitions): frame metrics vs the sealed original
             "upscaling_faithful_metrics": UPSCALING_FAITHFUL_METRICS_VERSION,
+            # generative upscaling (competitions): DISTS + LPIPS + CLIP-IQA on sampled full
+            # frames, warp error, low-resolution consistency and CIEDE2000, with the pinned
+            # VGG16 / DISTS / CLIP RN50 weight files named by one digest
+            "upscaling_generative_metrics": UPSCALING_GENERATIVE_METRICS_VERSION,
+            "generative_weights": f"sha256:{generative_weights_digest()}",
             "streaming_packets": STREAMING_PACKETS_VERSION,
             "lpips": f"lpips/{_distribution_version('lpips')}",
             "python": (
